@@ -1,0 +1,109 @@
+cmake_minimum_required(VERSION 3.24)
+
+project(
+  onnx_world_model
+  VERSION 0.1.0
+  DESCRIPTION "Runtime engine for Mobius-exported ONNX world models"
+  LANGUAGES CXX
+)
+
+option(ONNX_WORLD_MODEL_BUILD_CLI "Build the world-model CLI" OFF)
+option(ONNX_WORLD_MODEL_BUILD_PYTHON "Build the Python extension" OFF)
+option(ONNX_WORLD_MODEL_BUILD_TESTS "Build C++ tests" OFF)
+set(ONNX_RUNTIME_VERSION "1.28.0" CACHE STRING "ONNX Runtime header version")
+set(
+  ONNXRUNTIME_INCLUDE_DIR
+  ""
+  CACHE PATH
+  "Existing directory containing ONNX Runtime C/C++ API headers"
+)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(FetchOrtHeaders)
+onnx_world_model_resolve_ort_headers(ORT_INCLUDE_DIR)
+
+add_library(
+  onnx_world_model
+  src/dynamic_library.cpp
+  src/ort_backend.cpp
+  src/tensor.cpp
+  src/world_model.cpp
+)
+add_library(onnx_world_model::onnx_world_model ALIAS onnx_world_model)
+
+target_compile_features(onnx_world_model PUBLIC cxx_std_20)
+set_target_properties(
+  onnx_world_model
+  PROPERTIES
+    CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+target_compile_definitions(
+  onnx_world_model
+  PRIVATE
+    ORT_API_MANUAL_INIT
+)
+target_include_directories(
+  onnx_world_model
+  PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:include>"
+  PRIVATE
+    "${ORT_INCLUDE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+if(MSVC)
+  target_compile_options(onnx_world_model PRIVATE /W4 /permissive- /EHsc)
+  target_compile_definitions(onnx_world_model PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+else()
+  target_compile_options(onnx_world_model PRIVATE -Wall -Wextra -Wpedantic)
+  target_link_libraries(onnx_world_model PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+if(ONNX_WORLD_MODEL_BUILD_CLI)
+  add_executable(onnx-world-model cli/main.cpp)
+  target_link_libraries(onnx-world-model PRIVATE onnx_world_model)
+  target_compile_features(onnx-world-model PRIVATE cxx_std_20)
+endif()
+
+if(ONNX_WORLD_MODEL_BUILD_PYTHON)
+  find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+    OUTPUT_VARIABLE pybind11_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(_native MODULE bindings/python_module.cpp)
+  target_link_libraries(_native PRIVATE onnx_world_model)
+  target_compile_features(_native PRIVATE cxx_std_20)
+  install(TARGETS _native LIBRARY DESTINATION onnx_world_model)
+endif()
+
+if(ONNX_WORLD_MODEL_BUILD_TESTS)
+  enable_testing()
+  add_executable(tensor_test tests/cpp/tensor_test.cpp)
+  target_link_libraries(tensor_test PRIVATE onnx_world_model)
+  target_compile_features(tensor_test PRIVATE cxx_std_20)
+  add_test(NAME tensor_test COMMAND tensor_test)
+endif()
+
+include(GNUInstallDirs)
+install(
+  TARGETS onnx_world_model
+  EXPORT onnx_world_model_targets
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+if(ONNX_WORLD_MODEL_BUILD_CLI)
+  install(TARGETS onnx-world-model RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
+install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+install(
+  EXPORT onnx_world_model_targets
+  NAMESPACE onnx_world_model::
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/onnx_world_model"
+)
