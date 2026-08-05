@@ -13,12 +13,12 @@ function(onnx_world_model_resolve_ort_headers output_variable)
 
   set(
     destination
-    "${CMAKE_BINARY_DIR}/_deps/onnxruntime-${ONNX_RUNTIME_VERSION}/include"
+    "${CMAKE_BINARY_DIR}/_deps/onnxruntime-${ONNX_RUNTIME_HEADER_VERSION}/include"
   )
   file(MAKE_DIRECTORY "${destination}")
   set(
     base_url
-    "https://raw.githubusercontent.com/microsoft/onnxruntime/v${ONNX_RUNTIME_VERSION}/include/onnxruntime/core/session"
+    "https://raw.githubusercontent.com/microsoft/onnxruntime/v${ONNX_RUNTIME_HEADER_VERSION}/include/onnxruntime/core/session"
   )
 
   set(

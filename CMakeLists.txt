@@ -10,7 +10,7 @@ project(
 option(ONNX_WORLD_MODEL_BUILD_CLI "Build the world-model CLI" OFF)
 option(ONNX_WORLD_MODEL_BUILD_PYTHON "Build the Python extension" OFF)
 option(ONNX_WORLD_MODEL_BUILD_TESTS "Build C++ tests" OFF)
-set(ONNX_RUNTIME_VERSION "1.28.0" CACHE STRING "ONNX Runtime header version")
+set(ONNX_RUNTIME_HEADER_VERSION "1.28.0")
 set(
   ONNXRUNTIME_INCLUDE_DIR
   ""
