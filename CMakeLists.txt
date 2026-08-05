@@ -79,7 +79,11 @@ if(ONNX_WORLD_MODEL_BUILD_PYTHON)
   pybind11_add_module(_native MODULE bindings/python_module.cpp)
   target_link_libraries(_native PRIVATE onnx_world_model)
   target_compile_features(_native PRIVATE cxx_std_20)
-  install(TARGETS _native LIBRARY DESTINATION onnx_world_model)
+  install(
+    TARGETS _native
+    LIBRARY DESTINATION onnx_world_model COMPONENT python
+    RUNTIME DESTINATION onnx_world_model COMPONENT python
+  )
 endif()
 
 if(ONNX_WORLD_MODEL_BUILD_TESTS)
@@ -97,16 +101,25 @@ include(GNUInstallDirs)
 install(
   TARGETS onnx_world_model
   EXPORT onnx_world_model_targets
-  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT development
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT development
+  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime
 )
 if(ONNX_WORLD_MODEL_BUILD_CLI)
-  install(TARGETS onnx-world-model RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+  install(
+    TARGETS onnx-world-model
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    COMPONENT runtime
+  )
 endif()
-install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+install(
+  DIRECTORY include/
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+  COMPONENT development
+)
 install(
   EXPORT onnx_world_model_targets
   NAMESPACE onnx_world_model::
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/onnx_world_model"
+  COMPONENT development
 )

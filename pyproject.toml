@@ -1,0 +1,40 @@
+[build-system]
+requires = [
+    "cmake>=3.24",
+    "ninja",
+    "pybind11>=2.13",
+    "scikit-build-core>=0.10",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "onnx-world-model"
+version = "0.1.0"
+description = "C++ and Python runtime for Mobius-exported ONNX world models"
+requires-python = ">=3.10"
+dependencies = [
+    "ml_dtypes>=0.4",
+    "numpy>=1.24",
+    "onnxruntime>=1.28.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+install.components = ["python"]
+wheel.packages = ["python/onnx_world_model"]
+
+[tool.scikit-build.cmake.define]
+ONNX_WORLD_MODEL_BUILD_CLI = "OFF"
+ONNX_WORLD_MODEL_BUILD_PYTHON = "ON"
+ONNX_WORLD_MODEL_BUILD_TESTS = "OFF"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests/python"]
+
+[tool.ruff]
+line-length = 95
+target-version = "py310"
