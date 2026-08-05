@@ -11,6 +11,7 @@ build-backend = "scikit_build_core.build"
 name = "onnx-world-model"
 version = "0.1.0"
 description = "C++ and Python runtime for Mobius-exported ONNX world models"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "ml_dtypes>=0.4",
