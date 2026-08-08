@@ -36,6 +36,7 @@ add_library(
   src/model.cpp
   src/ort_backend.cpp
   src/pipeline.cpp
+  src/pipeline_session.cpp
   src/tensor.cpp
   src/world_model.cpp
 )

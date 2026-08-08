@@ -1,5 +1,11 @@
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 
@@ -49,6 +55,179 @@ class IdentityBackend final : public onnx_world_model::ModelBackend {
   [[nodiscard]] onnx_world_model::NamedTensors Run(
       const onnx_world_model::NamedTensors& inputs) const override {
     return {{"y", inputs.at("x")}};
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class IncrementBackend final : public onnx_world_model::ModelBackend {
+ public:
+  IncrementBackend() {
+    metadata_.inputs.push_back({
+        .name = "state",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1},
+    });
+    metadata_.outputs.push_back({
+        .name = "next_state",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1},
+    });
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    onnx_world_model::Tensor result = inputs.at("state");
+    auto value = std::span(
+        reinterpret_cast<float*>(result.mutable_bytes().data()),
+        result.element_count());
+    value[0] += 1.0F;
+    return {{"next_state", std::move(result)}};
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class VelocityBackend final : public onnx_world_model::ModelBackend {
+ public:
+  VelocityBackend() {
+    metadata_.inputs.push_back({
+        .name = "state",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1},
+    });
+    metadata_.outputs.push_back({
+        .name = "next_state",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1},
+    });
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    (void)inputs;
+    const std::array<float, 1> velocity{1.0F};
+    return {
+        {
+            "next_state",
+            onnx_world_model::Tensor::FromValues<float>(
+                {1}, std::span(velocity)),
+        },
+    };
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class NonlinearVelocityBackend final : public onnx_world_model::ModelBackend {
+ public:
+  NonlinearVelocityBackend() {
+    metadata_.inputs.push_back({
+        .name = "state",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1},
+    });
+    metadata_.outputs.push_back({
+        .name = "next_state",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1},
+    });
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    const std::array<float, 1> velocity{
+        1.0F + 0.25F * inputs.at("state").values<float>()[0]};
+    return {
+        {
+            "next_state",
+            onnx_world_model::Tensor::FromValues<float>(
+                {1}, std::span(velocity)),
+        },
+    };
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class AutoregressiveBackend final : public onnx_world_model::ModelBackend {
+ public:
+  AutoregressiveBackend() {
+    metadata_.inputs = {
+        {
+            .name = "tokens",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {1, -1},
+        },
+        {
+            .name = "state",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {1},
+        },
+    };
+    metadata_.outputs = {
+        {
+            .name = "logits",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {1, -1, 4},
+        },
+        {
+            .name = "next_state",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {1},
+        },
+    };
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    const auto& tokens = inputs.at("tokens");
+    const float state = inputs.at("state").values<float>()[0];
+    const auto next_token =
+        static_cast<std::size_t>(std::min(state + 1.0F, 3.0F));
+    onnx_world_model::Tensor logits =
+        onnx_world_model::Tensor::Zeros(
+            onnx_world_model::DataType::float32,
+            {1, tokens.shape()[1], 4});
+    auto logits_values = std::span(
+        reinterpret_cast<float*>(logits.mutable_bytes().data()),
+        logits.element_count());
+    logits_values[
+        static_cast<std::size_t>((tokens.shape()[1] - 1) * 4) + next_token] =
+        1.0F;
+    const std::array<float, 1> next_state{state + 1.0F};
+    return {
+        {"logits", std::move(logits)},
+        {
+            "next_state",
+            onnx_world_model::Tensor::FromValues<float>(
+                {1}, std::span(next_state)),
+        },
+    };
   }
 
  private:
@@ -137,6 +316,217 @@ constexpr std::string_view kProfilelessManifest = R"json(
 }
 )json";
 
+constexpr std::string_view kStateManifest = R"json(
+{
+  "format": "mobius-pipeline",
+  "schema_version": "1.1",
+  "manifest": {
+    "schema_version": "1.1",
+    "components": [
+      {
+        "name": "counter",
+        "role": "dynamics",
+        "run_on": "step",
+        "inputs": [{"name": "state", "dtype": "FLOAT", "shape": [1]}],
+        "outputs": [{"name": "next_state", "dtype": "FLOAT", "shape": [1]}],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      }
+    ],
+    "connections": [
+      {
+        "source": "counter.next_state",
+        "target": "counter.state",
+        "recurrent": true
+      }
+    ],
+    "stages": [
+      {
+        "name": "transition",
+        "kind": "state_transition",
+        "components": ["counter"],
+        "run_on": "step",
+        "options": {"state_names": ["counter_state"]},
+        "capabilities": ["loop_carried_state"]
+      }
+    ],
+    "inputs": [
+      {
+        "port": "counter.state",
+        "kind": "generated",
+        "required": true,
+        "semantic": "state.initial",
+        "generator": {"kind": "zeros"}
+      }
+    ],
+    "outputs": [{"state": "counter_state", "alias": "value"}],
+    "profile": {"name": "counter-world", "version": "1.0"},
+    "states": [
+      {
+        "name": "counter_state",
+        "kind": "recurrent",
+        "input": "counter.state",
+        "output": "counter.next_state",
+        "lifetime": "session",
+        "release_after": "transition"
+      }
+    ],
+    "required_capabilities": ["loop_carried_state"]
+  },
+  "component_files": {"counter": "model.onnx"}
+}
+)json";
+
+constexpr std::string_view kIterativeManifest = R"json(
+{
+  "format": "mobius-pipeline",
+  "schema_version": "1.1",
+  "manifest": {
+    "schema_version": "1.1",
+    "components": [
+      {
+        "name": "counter",
+        "role": "dynamics",
+        "run_on": "step",
+        "inputs": [{"name": "state", "dtype": "FLOAT", "shape": [1]}],
+        "outputs": [{"name": "next_state", "dtype": "FLOAT", "shape": [1]}],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      }
+    ],
+    "connections": [
+      {
+        "source": "counter.next_state",
+        "target": "counter.state",
+        "recurrent": true
+      }
+    ],
+    "stages": [
+      {
+        "name": "iterate",
+        "kind": "iterative",
+        "components": ["counter"],
+        "run_on": "step",
+        "options": {
+          "scheduler": {
+            "kind": "FlowMatchEulerDiscreteScheduler",
+            "config_asset": "scheduler.json"
+          },
+          "default_steps": 3,
+          "timestep": {},
+          "state_inputs": ["counter.state"]
+        },
+        "capabilities": ["loop_carried_state"]
+      }
+    ],
+    "inputs": [
+      {
+        "port": "counter.state",
+        "kind": "generated",
+        "required": true,
+        "semantic": "state.initial",
+        "generator": {"kind": "zeros"}
+      }
+    ],
+    "outputs": [{"state": "counter_state", "alias": "value"}],
+    "profile": {"name": "counter-world", "version": "1.0"},
+    "states": [
+      {
+        "name": "counter_state",
+        "kind": "recurrent",
+        "input": "counter.state",
+        "output": "counter.next_state",
+        "lifetime": "request",
+        "release_after": "iterate"
+      }
+    ],
+    "assets": [{"path": "scheduler.json"}],
+    "required_capabilities": ["loop_carried_state"]
+  },
+  "component_files": {"counter": "model.onnx"}
+}
+)json";
+
+constexpr std::string_view kAutoregressiveManifest = R"json(
+{
+  "format": "mobius-pipeline",
+  "schema_version": "1.1",
+  "manifest": {
+    "schema_version": "1.1",
+    "components": [
+      {
+        "name": "decoder",
+        "role": "decoder",
+        "run_on": "decode",
+        "inputs": [
+          {"name": "tokens", "dtype": "INT64", "shape": [1, "sequence"]},
+          {"name": "state", "dtype": "FLOAT", "shape": [1]}
+        ],
+        "outputs": [
+          {"name": "logits", "dtype": "FLOAT", "shape": [1, "sequence", 4]},
+          {"name": "next_state", "dtype": "FLOAT", "shape": [1]}
+        ],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      }
+    ],
+    "connections": [
+      {
+        "source": "decoder.next_state",
+        "target": "decoder.state",
+        "recurrent": true
+      }
+    ],
+    "stages": [
+      {
+        "name": "decode",
+        "kind": "autoregressive",
+        "components": ["decoder"],
+        "run_on": "decode",
+        "options": {
+          "tokenizer_asset": "tokenizer.json",
+          "sampling": {"do_sample": false},
+          "stop": {"kind": "token_ids", "eos_token_ids": [3]},
+          "max_tokens": {"default": 4, "limit": 4},
+          "state_names": ["cache"]
+        },
+        "capabilities": ["loop_carried_state"]
+      }
+    ],
+    "inputs": [
+      {
+        "port": "decoder.state",
+        "kind": "generated",
+        "required": true,
+        "semantic": "kv_cache.initial",
+        "generator": {"kind": "zeros"}
+      },
+      {
+        "port": "decoder.tokens",
+        "kind": "external",
+        "required": true,
+        "semantic": "text.token_ids"
+      }
+    ],
+    "outputs": [{"port": "decoder.logits"}],
+    "profile": {"name": "decoder-world", "version": "1.0"},
+    "states": [
+      {
+        "name": "cache",
+        "kind": "kv_cache",
+        "input": "decoder.state",
+        "output": "decoder.next_state",
+        "lifetime": "sequence",
+        "release_after": "decode"
+      }
+    ],
+    "assets": [{"path": "tokenizer.json"}],
+    "required_capabilities": ["loop_carried_state"]
+  },
+  "component_files": {"decoder": "model.onnx"}
+}
+)json";
+
 }  // namespace
 
 int main(int argument_count, char** arguments) {
@@ -162,6 +552,189 @@ int main(int argument_count, char** arguments) {
   Check(
       package.Component("identity").metadata().inputs[0].name == "x",
       "component lookup");
+  onnx_world_model::Pipeline pipeline(std::move(package));
+  onnx_world_model::PipelineSession pipeline_session =
+      pipeline.CreateSession();
+  const std::array<float, 2> input_values{3.0F, 4.0F};
+  auto stage_outputs = pipeline_session.RunStage(
+      "step",
+      {
+          {
+              "input",
+              onnx_world_model::Tensor::FromValues<float>(
+                  {1, 2}, std::span(input_values)),
+          },
+      });
+  Check(
+      stage_outputs.at("output").values<float>()[1] == 4.0F,
+      "single-pass pipeline execution");
+
+  PipelineManifest state_manifest =
+      PipelineManifest::Parse(kStateManifest);
+  std::unordered_map<std::string, Model> state_models;
+  state_models.emplace(
+      "counter", Model(std::make_shared<IncrementBackend>()));
+  onnx_world_model::Pipeline state_pipeline(
+      PipelinePackage({}, state_manifest, std::move(state_models)));
+  auto state_session = state_pipeline.CreateSession();
+  auto first_state = state_session.RunStage("transition");
+  auto second_state = state_session.RunStage("transition");
+  Check(
+      first_state.at("value").values<float>()[0] == 1.0F,
+      "generated initial state");
+  Check(
+      second_state.at("value").values<float>()[0] == 2.0F,
+      "recurrent state update");
+  state_session.ReleaseStage("transition");
+  Check(!state_session.state("counter_state").has_value(), "state release");
+
+  PipelineManifest iterative_manifest =
+      PipelineManifest::Parse(kIterativeManifest);
+  std::unordered_map<std::string, Model> iterative_models;
+  iterative_models.emplace(
+      "counter", Model(std::make_shared<IncrementBackend>()));
+  onnx_world_model::Pipeline iterative_pipeline(
+      PipelinePackage({}, iterative_manifest, std::move(iterative_models)));
+  auto iterative_session = iterative_pipeline.CreateSession();
+  auto iterative_output = iterative_session.RunStage("iterate");
+  Check(
+      iterative_output.at("value").values<float>()[0] == 3.0F,
+      "iterative stage loop");
+  iterative_session.ReleaseStage("iterate");
+  auto restarted_output = iterative_session.RunStage("iterate");
+  Check(
+      restarted_output.at("value").values<float>()[0] == 3.0F,
+      "iterative cursor reset");
+
+  std::string scheduled_document(kIterativeManifest);
+  const std::string recurrent = R"json("recurrent": true)json";
+  scheduled_document.replace(
+      scheduled_document.find(recurrent),
+      recurrent.size(),
+      R"json("recurrent": true,
+        "transform": "scheduler_step",
+        "parameters": {
+          "scheduler_asset": "scheduler.json",
+          "stage": "iterate",
+          "state": "counter_state"
+        })json");
+  const std::string capabilities = R"json(["loop_carried_state"])json";
+  scheduled_document.replace(
+      scheduled_document.rfind(capabilities),
+      capabilities.size(),
+      R"json(["iterative_scheduler", "loop_carried_state"])json");
+  PipelineManifest scheduled_manifest =
+      PipelineManifest::Parse(scheduled_document);
+  const auto scheduler_root =
+      std::filesystem::temp_directory_path() /
+      "onnx-world-model-scheduler-test";
+  std::filesystem::remove_all(scheduler_root);
+  std::filesystem::create_directories(scheduler_root);
+  {
+    std::ofstream scheduler(scheduler_root / "scheduler.json");
+    scheduler << R"json({
+      "_class_name":"FlowMatchEulerDiscreteScheduler",
+      "num_train_timesteps":1000,
+      "shift":1.0
+    })json";
+  }
+  std::unordered_map<std::string, Model> scheduled_models;
+  scheduled_models.emplace(
+      "counter", Model(std::make_shared<VelocityBackend>()));
+  onnx_world_model::Pipeline scheduled_pipeline(PipelinePackage(
+      scheduler_root, scheduled_manifest, std::move(scheduled_models)));
+  auto scheduled_session = scheduled_pipeline.CreateSession();
+  auto scheduled_output = scheduled_session.RunStage("iterate");
+  Check(
+      std::abs(scheduled_output.at("value").values<float>()[0] + 1.0F) <
+          1e-5F,
+      "flow-match scheduler steps");
+
+  std::string unipc_document = scheduled_document;
+  const std::string flow_scheduler = "FlowMatchEulerDiscreteScheduler";
+  unipc_document.replace(
+      unipc_document.find(flow_scheduler),
+      flow_scheduler.size(),
+      "UniPCMultistepScheduler");
+  PipelineManifest unipc_manifest =
+      PipelineManifest::Parse(unipc_document);
+  {
+    std::ofstream scheduler(scheduler_root / "scheduler.json");
+    scheduler << R"json({
+      "_class_name":"UniPCMultistepScheduler",
+      "num_train_timesteps":1000,
+      "flow_shift":1.0,
+      "use_flow_sigmas":true,
+      "use_karras_sigmas":false,
+      "prediction_type":"flow_prediction",
+      "predict_x0":true,
+      "solver_order":2,
+      "solver_type":"bh2",
+      "lower_order_final":true,
+      "thresholding":false,
+      "final_sigmas_type":"zero"
+    })json";
+  }
+  std::unordered_map<std::string, Model> unipc_models;
+  unipc_models.emplace(
+      "counter", Model(std::make_shared<NonlinearVelocityBackend>()));
+  onnx_world_model::Pipeline unipc_pipeline(PipelinePackage(
+      scheduler_root, unipc_manifest, std::move(unipc_models)));
+  auto unipc_session = unipc_pipeline.CreateSession();
+  auto unipc_output = unipc_session.RunStage("iterate");
+  Check(
+      std::abs(
+          unipc_output.at("value").values<float>()[0] -
+          (-0.913395524F)) < 1e-4F,
+      "UniPC scheduler steps");
+  std::filesystem::remove_all(scheduler_root);
+
+  PipelineManifest autoregressive_manifest =
+      PipelineManifest::Parse(kAutoregressiveManifest);
+  std::unordered_map<std::string, Model> autoregressive_models;
+  autoregressive_models.emplace(
+      "decoder", Model(std::make_shared<AutoregressiveBackend>()));
+  onnx_world_model::Pipeline autoregressive_pipeline(PipelinePackage(
+      {}, autoregressive_manifest, std::move(autoregressive_models)));
+  auto autoregressive_session = autoregressive_pipeline.CreateSession();
+  const std::array<std::int64_t, 2> prompt{10, 11};
+  auto autoregressive_output = autoregressive_session.RunStage(
+      "decode",
+      {
+          {
+              "text.token_ids",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {1, 2}, std::span(prompt)),
+          },
+      });
+  const auto generated =
+      autoregressive_output.at("generated_token_ids")
+          .values<std::int64_t>();
+  Check(generated.size() == 3, "autoregressive stop length");
+  Check(generated[0] == 1 && generated[2] == 3, "greedy token loop");
+  auto sampled_session = autoregressive_pipeline.CreateSession();
+  onnx_world_model::PipelineRunOptions sampling_options;
+  sampling_options.integers = {
+      {"do_sample", 1},
+      {"top_k", 1},
+      {"seed", 7},
+  };
+  auto sampled_output = sampled_session.RunStage(
+      "decode",
+      {
+          {
+              "text.token_ids",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {1, 2}, std::span(prompt)),
+          },
+      },
+      {},
+      sampling_options);
+  Check(
+      sampled_output.at("generated_token_ids")
+              .values<std::int64_t>()
+              .back() == 3,
+      "top-k sampling loop");
 
   std::string unsafe(kManifest);
   unsafe.replace(
@@ -224,6 +797,35 @@ int main(int argument_count, char** arguments) {
       Check(
           !loaded.Component(component).metadata().inputs.empty(),
           "loaded package model");
+      if (component == "model") {
+        onnx_world_model::Pipeline loaded_pipeline(std::move(loaded));
+        auto loaded_session = loaded_pipeline.CreateSession();
+        const std::array<float, 4> observation{};
+        const std::array<float, 2> action{};
+        const std::array<float, 3> state{};
+        auto outputs = loaded_session.RunStage(
+            "step",
+            {
+                {
+                    "observation",
+                    onnx_world_model::Tensor::FromValues<float>(
+                        {1, 4}, std::span(observation)),
+                },
+                {
+                    "action",
+                    onnx_world_model::Tensor::FromValues<float>(
+                        {1, 2}, std::span(action)),
+                },
+                {
+                    "state",
+                    onnx_world_model::Tensor::FromValues<float>(
+                        {1, 3}, std::span(state)),
+                },
+            });
+        Check(
+            outputs.at("next_state").values<float>()[0] == 0.1F,
+            "loaded package execution");
+      }
     } catch (const std::exception& error) {
       std::cerr << "FAILED: package load: " << error.what() << '\n';
       ++failures;

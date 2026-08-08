@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -159,6 +160,64 @@ class PipelinePackage {
   std::filesystem::path root_;
   PipelineManifest manifest_;
   std::unordered_map<std::string, Model> components_;
+};
+
+struct PipelineRunOptions {
+  std::unordered_map<std::string, std::string> strings;
+  std::unordered_map<std::string, std::int64_t> integers;
+  std::unordered_map<std::string, double> numbers;
+};
+
+class PipelineSession;
+
+class Pipeline {
+ public:
+  explicit Pipeline(PipelinePackage package);
+
+  static Pipeline Load(
+      const std::filesystem::path& directory,
+      const RuntimeOptions& options = {});
+
+  [[nodiscard]] const PipelineManifest& manifest() const noexcept;
+  [[nodiscard]] PipelineSession CreateSession() const;
+
+ private:
+  std::shared_ptr<const PipelinePackage> package_;
+
+  friend class PipelineSession;
+};
+
+class PipelineSession {
+ public:
+  PipelineSession(PipelineSession&&) noexcept;
+  PipelineSession& operator=(PipelineSession&&) noexcept;
+  ~PipelineSession();
+
+  PipelineSession(const PipelineSession&) = delete;
+  PipelineSession& operator=(const PipelineSession&) = delete;
+
+  [[nodiscard]] NamedTensors RunStage(
+      std::string_view stage,
+      const NamedTensors& inputs = {},
+      const NamedTensors& overrides = {},
+      const PipelineRunOptions& options = {});
+  [[nodiscard]] NamedTensors StepStage(
+      std::string_view stage,
+      const NamedTensors& inputs = {},
+      const NamedTensors& overrides = {},
+      const PipelineRunOptions& options = {});
+  [[nodiscard]] NamedTensors outputs() const;
+  [[nodiscard]] std::optional<Tensor> state(std::string_view name) const;
+  void ReleaseStage(std::string_view stage);
+  void Reset();
+
+ private:
+  struct Impl;
+  explicit PipelineSession(std::shared_ptr<const PipelinePackage> package);
+
+  std::unique_ptr<Impl> impl_;
+
+  friend class Pipeline;
 };
 
 }  // namespace onnx_world_model
