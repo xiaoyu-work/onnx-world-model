@@ -18,6 +18,9 @@ using onnx_world_model::DataType;
 using onnx_world_model::Model;
 using onnx_world_model::ModelMetadata;
 using onnx_world_model::NamedTensors;
+using onnx_world_model::Pipeline;
+using onnx_world_model::PipelineRunOptions;
+using onnx_world_model::PipelineSession;
 using onnx_world_model::Rollout;
 using onnx_world_model::RuntimeOptions;
 using onnx_world_model::StepOutput;
@@ -183,6 +186,36 @@ using onnx_world_model::WorldModel;
   return result;
 }
 
+[[nodiscard]] PipelineRunOptions PipelineOptionsFromDictionary(
+    const py::dict& values) {
+  PipelineRunOptions result;
+  for (const auto& item : values) {
+    if (!py::isinstance<py::str>(item.first)) {
+      throw py::type_error("Pipeline option names must be strings");
+    }
+    const std::string name =
+        py::str(item.first).cast<std::string>();
+    if (py::isinstance<py::bool_>(item.second)) {
+      result.integers.emplace(
+          name, py::cast<bool>(item.second) ? 1 : 0);
+    } else if (py::isinstance<py::int_>(item.second)) {
+      result.integers.emplace(
+          name, py::cast<std::int64_t>(item.second));
+    } else if (py::isinstance<py::float_>(item.second)) {
+      result.numbers.emplace(
+          name, py::cast<double>(item.second));
+    } else if (py::isinstance<py::str>(item.second)) {
+      result.strings.emplace(
+          name, py::str(item.second).cast<std::string>());
+    } else {
+      throw py::type_error(
+          "Pipeline option '" + name +
+          "' must be bool, int, float, or str");
+    }
+  }
+  return result;
+}
+
 [[nodiscard]] py::tuple StepOutputToTuple(const StepOutput& output) {
   return py::make_tuple(
       TensorToNumpy(output.next_state),
@@ -293,6 +326,114 @@ PYBIND11_MODULE(_native, module) {
           [](const WorldModel& model) {
             return std::make_unique<Rollout>(model);
           });
+
+  py::class_<Pipeline>(module, "Pipeline")
+      .def(
+          py::init([](
+                       const std::string& package_path,
+                       const std::string& ort_library_path,
+                       int intra_op_threads,
+                       int inter_op_threads,
+                       int log_severity) {
+            const RuntimeOptions options{
+                .ort_library_path = ort_library_path,
+                .intra_op_threads = intra_op_threads,
+                .inter_op_threads = inter_op_threads,
+                .log_severity = log_severity,
+            };
+            py::gil_scoped_release release;
+            return Pipeline::Load(package_path, options);
+          }),
+          py::arg("package_path"),
+          py::arg("ort_library_path"),
+          py::arg("intra_op_threads") = 0,
+          py::arg("inter_op_threads") = 0,
+          py::arg("log_severity") = 3)
+      .def(
+          "create_session",
+          [](const Pipeline& pipeline) {
+            return std::make_unique<PipelineSession>(
+                pipeline.CreateSession());
+          });
+
+  py::class_<PipelineSession>(module, "PipelineSession")
+      .def(
+          "run_stage",
+          [](PipelineSession& session,
+             const std::string& stage,
+             const py::dict& inputs,
+             const py::dict& overrides,
+             const py::dict& options) {
+            NamedTensors input_tensors =
+                NamedTensorsFromDictionary(inputs);
+            NamedTensors override_tensors =
+                NamedTensorsFromDictionary(overrides);
+            PipelineRunOptions run_options =
+                PipelineOptionsFromDictionary(options);
+            NamedTensors outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = session.RunStage(
+                  stage,
+                  input_tensors,
+                  override_tensors,
+                  run_options);
+            }
+            return NamedTensorsToDictionary(outputs);
+          },
+          py::arg("stage"),
+          py::arg("inputs") = py::dict(),
+          py::arg("overrides") = py::dict(),
+          py::arg("options") = py::dict())
+      .def(
+          "step_stage",
+          [](PipelineSession& session,
+             const std::string& stage,
+             const py::dict& inputs,
+             const py::dict& overrides,
+             const py::dict& options) {
+            NamedTensors input_tensors =
+                NamedTensorsFromDictionary(inputs);
+            NamedTensors override_tensors =
+                NamedTensorsFromDictionary(overrides);
+            PipelineRunOptions run_options =
+                PipelineOptionsFromDictionary(options);
+            NamedTensors outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = session.StepStage(
+                  stage,
+                  input_tensors,
+                  override_tensors,
+                  run_options);
+            }
+            return NamedTensorsToDictionary(outputs);
+          },
+          py::arg("stage"),
+          py::arg("inputs") = py::dict(),
+          py::arg("overrides") = py::dict(),
+          py::arg("options") = py::dict())
+      .def_property_readonly(
+          "outputs",
+          [](const PipelineSession& session) {
+            return NamedTensorsToDictionary(session.outputs());
+          })
+      .def(
+          "state",
+          [](const PipelineSession& session,
+             const std::string& name) -> py::object {
+            const auto value = session.state(name);
+            if (!value.has_value()) {
+              return py::none();
+            }
+            return TensorToNumpy(*value);
+          },
+          py::arg("name"))
+      .def(
+          "release_stage",
+          &PipelineSession::ReleaseStage,
+          py::arg("stage"))
+      .def("reset", &PipelineSession::Reset);
 
   py::class_<Rollout>(module, "Rollout")
       .def("reset", py::overload_cast<>(&Rollout::Reset))

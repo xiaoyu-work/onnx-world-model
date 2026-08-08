@@ -3,8 +3,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import onnx_ir as ir
 import torch
-from mobius import MLPWorldModel, WorldModelConfig, build_from_module
+from mobius import (
+    MLPWorldModel,
+    PipelineBuilder,
+    WorldModelConfig,
+    build_from_module,
+)
 
 
 def export_test_model(output_dir: Path) -> Path:
@@ -40,6 +46,35 @@ def export_test_model(output_dir: Path) -> Path:
     package.apply_weights(weights)
     package.save(str(output_dir), progress_bar=False)
     return output_dir / "model.onnx"
+
+
+def export_test_pipeline(output_dir: Path) -> Path:
+    model = ir.load(export_test_model(output_dir / "source"))
+    builder = PipelineBuilder()
+    builder.add_model(
+        "dynamics",
+        model,
+        role="dynamics",
+        run_on="step",
+        preferred_execution_providers=["cpu"],
+        parameter_dtype="FLOAT",
+    )
+    for value in model.graph.inputs:
+        builder.declare_external(
+            f"dynamics.{value.name}",
+            alias=value.name,
+            semantic=f"latent_dynamics.{value.name}",
+        )
+    builder.add_stage("step", "single_pass", ["dynamics"], run_on="step")
+    for value in model.graph.outputs:
+        builder.add_public_output(f"dynamics.{value.name}", alias=value.name)
+    builder.set_profile("latent-dynamics", "1.0")
+    builder.set_metadata("profile", "world-model")
+    builder.set_metadata("model_type", "test_latent_dynamics")
+
+    package_path = output_dir / "package"
+    builder.build().save(str(package_path), progress_bar=False)
+    return package_path
 
 
 def main() -> None:
