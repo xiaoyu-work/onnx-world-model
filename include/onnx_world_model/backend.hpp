@@ -22,6 +22,8 @@ struct ModelMetadata {
   [[nodiscard]] const TensorSpec& Output(std::string_view name) const;
 };
 
+void ValidateTensor(const Tensor& tensor, const TensorSpec& spec);
+
 struct StepInput {
   Tensor observation;
   Tensor action;

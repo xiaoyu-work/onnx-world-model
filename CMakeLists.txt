@@ -25,6 +25,7 @@ onnx_world_model_resolve_ort_headers(ORT_INCLUDE_DIR)
 add_library(
   onnx_world_model
   src/dynamic_library.cpp
+  src/model.cpp
   src/ort_backend.cpp
   src/tensor.cpp
   src/world_model.cpp
@@ -88,10 +89,12 @@ endif()
 
 if(ONNX_WORLD_MODEL_BUILD_TESTS)
   enable_testing()
-  add_executable(tensor_test tests/cpp/tensor_test.cpp)
-  target_link_libraries(tensor_test PRIVATE onnx_world_model)
-  target_compile_features(tensor_test PRIVATE cxx_std_20)
-  add_test(NAME tensor_test COMMAND tensor_test)
+  foreach(test_name IN ITEMS tensor model)
+    add_executable(${test_name}_test tests/cpp/${test_name}_test.cpp)
+    target_link_libraries(${test_name}_test PRIVATE onnx_world_model)
+    target_compile_features(${test_name}_test PRIVATE cxx_std_20)
+    add_test(NAME ${test_name}_test COMMAND ${test_name}_test)
+  endforeach()
   if(ONNX_WORLD_MODEL_BUILD_CLI)
     add_test(NAME cli_help_test COMMAND onnx-world-model --help)
   endif()

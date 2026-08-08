@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from onnx_world_model import WorldModel, WorldModelError
+from onnx_world_model import OnnxModel, WorldModel, WorldModelError
 
 
 def _inputs(batch_size: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -30,6 +30,35 @@ def test_loads_mobius_contract(world_model_path: Path):
         "continuation",
     ]
     assert model.metadata.inputs[0].shape == (-1, 4)
+
+
+def test_generic_named_tensor_model(world_model_path: Path):
+    model = OnnxModel(world_model_path)
+    observation, action, state = _inputs(batch_size=2)
+
+    output = model.run(
+        {
+            "observation": observation,
+            "action": action,
+            "state": state,
+        }
+    )
+
+    assert set(output) == {
+        "next_state",
+        "observation_prediction",
+        "reward",
+        "continuation",
+    }
+    np.testing.assert_allclose(output["next_state"], [[0.1, 0.2, 0.3]] * 2)
+
+
+def test_generic_model_rejects_missing_input(world_model_path: Path):
+    model = OnnxModel(world_model_path)
+    observation, action, _ = _inputs()
+
+    with pytest.raises(WorldModelError, match="missing input tensor 'state'"):
+        model.run({"observation": observation, "action": action})
 
 
 def test_stateless_step_matches_reference(world_model_path: Path):

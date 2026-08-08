@@ -30,6 +30,8 @@ namespace {
 
 }  // namespace
 
+Tensor::Tensor() : Tensor(DataType::float32, {}) {}
+
 std::string_view ToString(DataType data_type) noexcept {
   switch (data_type) {
     case DataType::float32:

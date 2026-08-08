@@ -34,6 +34,10 @@ int main() {
   using onnx_world_model::DataType;
   using onnx_world_model::Tensor;
 
+  Tensor scalar;
+  Check(scalar.element_count() == 1, "default scalar element count");
+  Check(scalar.size_bytes() == sizeof(float), "default scalar byte count");
+
   Tensor zeros = Tensor::Zeros(DataType::float32, {2, 3});
   Check(zeros.element_count() == 6, "element count");
   Check(zeros.size_bytes() == 6 * sizeof(float), "byte count");

@@ -38,33 +38,6 @@ constexpr std::array<std::string_view, 4> kOutputNames{
       });
 }
 
-void ValidateTensor(const Tensor& tensor, const TensorSpec& spec) {
-  if (tensor.data_type() != spec.data_type) {
-    throw Error(
-        ErrorCode::invalid_argument,
-        "Tensor '" + spec.name + "' has data type " +
-            std::string(ToString(tensor.data_type())) + ", expected " +
-            std::string(ToString(spec.data_type)));
-  }
-  if (tensor.shape().size() != spec.shape.size()) {
-    throw Error(
-        ErrorCode::invalid_argument,
-        "Tensor '" + spec.name + "' has rank " +
-            std::to_string(tensor.shape().size()) + ", expected " +
-            std::to_string(spec.shape.size()));
-  }
-  for (std::size_t axis = 0; axis < spec.shape.size(); ++axis) {
-    if (spec.shape[axis] >= 0 && tensor.shape()[axis] != spec.shape[axis]) {
-      throw Error(
-          ErrorCode::invalid_argument,
-          "Tensor '" + spec.name + "' has invalid dimension " +
-              std::to_string(axis) + ": " +
-              std::to_string(tensor.shape()[axis]) + ", expected " +
-              std::to_string(spec.shape[axis]));
-    }
-  }
-}
-
 void ValidateBatch(
     const Tensor& observation,
     const Tensor& action,
@@ -166,27 +139,34 @@ void ValidateOutput(
   }
 }
 
+class ModelBackendAdapter final : public Backend {
+ public:
+  explicit ModelBackendAdapter(Model model) : model_(std::move(model)) {}
+
+  [[nodiscard]] const ModelMetadata& metadata() const noexcept override {
+    return model_.metadata();
+  }
+
+  [[nodiscard]] StepOutput Run(const StepInput& input) const override {
+    NamedTensors outputs = model_.Run({
+        {"observation", input.observation},
+        {"action", input.action},
+        {"state", input.state},
+    });
+    return {
+        .next_state = std::move(outputs.at("next_state")),
+        .observation_prediction =
+            std::move(outputs.at("observation_prediction")),
+        .reward = std::move(outputs.at("reward")),
+        .continuation = std::move(outputs.at("continuation")),
+    };
+  }
+
+ private:
+  Model model_;
+};
+
 }  // namespace
-
-const TensorSpec& ModelMetadata::Input(std::string_view name) const {
-  const auto found = std::ranges::find(inputs, name, &TensorSpec::name);
-  if (found == inputs.end()) {
-    throw Error(
-        ErrorCode::model_contract,
-        "World model is missing required input '" + std::string(name) + "'");
-  }
-  return *found;
-}
-
-const TensorSpec& ModelMetadata::Output(std::string_view name) const {
-  const auto found = std::ranges::find(outputs, name, &TensorSpec::name);
-  if (found == outputs.end()) {
-    throw Error(
-        ErrorCode::model_contract,
-        "World model is missing required output '" + std::string(name) + "'");
-  }
-  return *found;
-}
 
 WorldModel::WorldModel(BackendPtr backend) : backend_(std::move(backend)) {
   if (backend_ == nullptr) {
@@ -198,7 +178,8 @@ WorldModel::WorldModel(BackendPtr backend) : backend_(std::move(backend)) {
 WorldModel WorldModel::Load(
     const std::filesystem::path& model_path,
     const RuntimeOptions& options) {
-  return WorldModel(detail::CreateOrtBackend(model_path, options));
+  return WorldModel(
+      std::make_shared<ModelBackendAdapter>(Model::Load(model_path, options)));
 }
 
 const ModelMetadata& WorldModel::metadata() const noexcept {

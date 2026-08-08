@@ -1,29 +1,12 @@
 #pragma once
 
 #include <cstdint>
-#include <filesystem>
 #include <mutex>
 #include <optional>
-#include <string>
 
-#include "onnx_world_model/backend.hpp"
+#include "onnx_world_model/model.hpp"
 
 namespace onnx_world_model {
-
-enum class GraphOptimizationLevel {
-  disabled,
-  basic,
-  extended,
-  all,
-};
-
-struct RuntimeOptions {
-  std::filesystem::path ort_library_path;
-  int intra_op_threads{0};
-  int inter_op_threads{0};
-  int log_severity{3};
-  GraphOptimizationLevel graph_optimization{GraphOptimizationLevel::all};
-};
 
 class WorldModel {
  public:

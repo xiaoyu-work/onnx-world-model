@@ -88,7 +88,7 @@ struct DataTypeOf<std::uint8_t> {
 
 class Tensor {
  public:
-  Tensor() = default;
+  Tensor();
   Tensor(DataType data_type, std::vector<std::int64_t> shape);
 
   static Tensor FromBytes(

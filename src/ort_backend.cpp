@@ -1,6 +1,5 @@
 #include "ort_backend.hpp"
 
-#include <array>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -45,7 +44,7 @@ namespace {
     default:
       throw Error(
           ErrorCode::model_contract,
-          "World-model tensor uses unsupported ONNX data type " +
+          "Model tensor uses unsupported ONNX data type " +
               std::to_string(static_cast<int>(data_type)));
   }
 }
@@ -109,7 +108,7 @@ namespace {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     throw Error(
         ErrorCode::model_contract,
-        "World-model value '" + std::string(name.get()) + "' must be a tensor");
+        "Model value '" + std::string(name.get()) + "' must be a tensor");
   }
   const auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
   return TensorSpec{
@@ -152,7 +151,7 @@ namespace {
   return tensor;
 }
 
-class OrtBackend final : public Backend {
+class OrtBackend final : public ModelBackend {
  public:
   OrtBackend(const std::filesystem::path& model_path, const RuntimeOptions& options)
       : env_(
@@ -191,25 +190,22 @@ class OrtBackend final : public Backend {
     return metadata_;
   }
 
-  [[nodiscard]] StepOutput Run(const StepInput& input) const override {
+  [[nodiscard]] NamedTensors Run(const NamedTensors& inputs) const override {
     try {
       std::vector<Ort::Value> input_values;
-      input_values.reserve(3);
-      input_values.push_back(MakeOrtTensor(input.observation, memory_info_));
-      input_values.push_back(MakeOrtTensor(input.action, memory_info_));
-      input_values.push_back(MakeOrtTensor(input.state, memory_info_));
+      input_values.reserve(metadata_.inputs.size());
+      std::vector<const char*> input_names;
+      input_names.reserve(metadata_.inputs.size());
+      for (const auto& spec : metadata_.inputs) {
+        input_names.push_back(spec.name.c_str());
+        input_values.push_back(MakeOrtTensor(inputs.at(spec.name), memory_info_));
+      }
 
-      constexpr std::array<const char*, 3> input_names{
-          "observation",
-          "action",
-          "state",
-      };
-      constexpr std::array<const char*, 4> output_names{
-          "next_state",
-          "observation_prediction",
-          "reward",
-          "continuation",
-      };
+      std::vector<const char*> output_names;
+      output_names.reserve(metadata_.outputs.size());
+      for (const auto& spec : metadata_.outputs) {
+        output_names.push_back(spec.name.c_str());
+      }
       auto outputs = session_.Run(
           Ort::RunOptions{nullptr},
           input_names.data(),
@@ -222,12 +218,14 @@ class OrtBackend final : public Backend {
             ErrorCode::runtime_execution,
             "ONNX Runtime returned an unexpected number of outputs");
       }
-      return StepOutput{
-          .next_state = CopyOrtTensor(outputs[0]),
-          .observation_prediction = CopyOrtTensor(outputs[1]),
-          .reward = CopyOrtTensor(outputs[2]),
-          .continuation = CopyOrtTensor(outputs[3]),
-      };
+      NamedTensors result;
+      result.reserve(outputs.size());
+      for (std::size_t index = 0; index < outputs.size(); ++index) {
+        result.emplace(
+            metadata_.outputs[index].name,
+            CopyOrtTensor(outputs[index]));
+      }
+      return result;
     } catch (const Ort::Exception& exception) {
       throw Error(
           ErrorCode::runtime_execution,
@@ -245,7 +243,7 @@ class OrtBackend final : public Backend {
 
 }  // namespace
 
-BackendPtr CreateOrtBackend(
+ModelBackendPtr CreateOrtBackend(
     const std::filesystem::path& model_path,
     const RuntimeOptions& options) {
   if (model_path.empty()) {

@@ -15,7 +15,9 @@ namespace py = pybind11;
 namespace {
 
 using onnx_world_model::DataType;
+using onnx_world_model::Model;
 using onnx_world_model::ModelMetadata;
+using onnx_world_model::NamedTensors;
 using onnx_world_model::Rollout;
 using onnx_world_model::RuntimeOptions;
 using onnx_world_model::StepOutput;
@@ -154,6 +156,33 @@ using onnx_world_model::WorldModel;
   return result;
 }
 
+[[nodiscard]] NamedTensors NamedTensorsFromDictionary(const py::dict& values) {
+  NamedTensors result;
+  result.reserve(values.size());
+  for (const auto& item : values) {
+    if (!py::isinstance<py::str>(item.first)) {
+      throw py::type_error("Model input names must be strings");
+    }
+    if (!py::isinstance<py::array>(item.second)) {
+      throw py::type_error(
+          "Model input '" + py::str(item.first).cast<std::string>() +
+          "' must be a NumPy array");
+    }
+    result.emplace(
+        py::str(item.first).cast<std::string>(),
+        TensorFromNumpy(py::reinterpret_borrow<py::array>(item.second)));
+  }
+  return result;
+}
+
+[[nodiscard]] py::dict NamedTensorsToDictionary(const NamedTensors& values) {
+  py::dict result;
+  for (const auto& [name, tensor] : values) {
+    result[py::str(name)] = TensorToNumpy(tensor);
+  }
+  return result;
+}
+
 [[nodiscard]] py::tuple StepOutputToTuple(const StepOutput& output) {
   return py::make_tuple(
       TensorToNumpy(output.next_state),
@@ -169,6 +198,46 @@ PYBIND11_MODULE(_native, module) {
   py::register_exception<onnx_world_model::Error>(
       module,
       "WorldModelError");
+
+  py::class_<Model>(module, "Model")
+      .def(
+          py::init([](
+                       const std::string& model_path,
+                       const std::string& ort_library_path,
+                       int intra_op_threads,
+                       int inter_op_threads,
+                       int log_severity) {
+            const RuntimeOptions options{
+                .ort_library_path = ort_library_path,
+                .intra_op_threads = intra_op_threads,
+                .inter_op_threads = inter_op_threads,
+                .log_severity = log_severity,
+            };
+            py::gil_scoped_release release;
+            return Model::Load(model_path, options);
+          }),
+          py::arg("model_path"),
+          py::arg("ort_library_path"),
+          py::arg("intra_op_threads") = 0,
+          py::arg("inter_op_threads") = 0,
+          py::arg("log_severity") = 3)
+      .def_property_readonly(
+          "metadata",
+          [](const Model& model) {
+            return MetadataToDictionary(model.metadata());
+          })
+      .def(
+          "run",
+          [](const Model& model, const py::dict& inputs) {
+            NamedTensors input_tensors = NamedTensorsFromDictionary(inputs);
+            NamedTensors outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = model.Run(input_tensors);
+            }
+            return NamedTensorsToDictionary(outputs);
+          },
+          py::arg("inputs"));
 
   py::class_<WorldModel>(module, "WorldModel")
       .def(
