@@ -12,6 +12,7 @@ enum class ErrorCode {
   runtime_load,
   runtime_execution,
   state,
+  pipeline_manifest,
 };
 
 class Error : public std::runtime_error {

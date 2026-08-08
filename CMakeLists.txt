@@ -17,16 +17,25 @@ set(
   CACHE PATH
   "Existing directory containing ONNX Runtime C/C++ API headers"
 )
+set(
+  NLOHMANN_JSON_INCLUDE_DIR
+  ""
+  CACHE PATH
+  "Existing include directory containing nlohmann/json.hpp"
+)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(FetchOrtHeaders)
 onnx_world_model_resolve_ort_headers(ORT_INCLUDE_DIR)
+include(FetchJsonHeader)
+onnx_world_model_resolve_json_header(JSON_INCLUDE_DIR)
 
 add_library(
   onnx_world_model
   src/dynamic_library.cpp
   src/model.cpp
   src/ort_backend.cpp
+  src/pipeline.cpp
   src/tensor.cpp
   src/world_model.cpp
 )
@@ -51,6 +60,7 @@ target_include_directories(
     "$<INSTALL_INTERFACE:include>"
   PRIVATE
     "${ORT_INCLUDE_DIR}"
+    "${JSON_INCLUDE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
@@ -89,7 +99,7 @@ endif()
 
 if(ONNX_WORLD_MODEL_BUILD_TESTS)
   enable_testing()
-  foreach(test_name IN ITEMS tensor model)
+  foreach(test_name IN ITEMS tensor model pipeline)
     add_executable(${test_name}_test tests/cpp/${test_name}_test.cpp)
     target_link_libraries(${test_name}_test PRIVATE onnx_world_model)
     target_compile_features(${test_name}_test PRIVATE cxx_std_20)
