@@ -82,6 +82,13 @@ wheel does not ship `libonnxruntime`.
 pip install -e ".[test]"
 ```
 
+`Pipeline` is a tensor runtime, not a raw-media processor. The caller must
+tokenize text, apply the exported image/video processor, expand multimodal
+placeholder tokens, and create packed diffusion latents before calling a
+stage. Inspect `pipeline.inputs`, `pipeline.stages`, `pipeline.metadata`, and
+the packaged processor/tokenizer assets instead of hard-coding one
+checkpoint's shapes.
+
 ```python
 import numpy as np
 
@@ -94,22 +101,28 @@ print(pipeline.stages)
 
 session = pipeline.create_session()
 
-# Supplying a semantic name can feed multiple compatible component ports.
-inputs = {
-    "text.token_ids": np.asarray([[1, 42, 7]], dtype=np.int64),
+# All values below are already tokenized, normalized, or packed by the host.
+# A semantic name can feed multiple compatible component ports.
+reasoner_inputs = {
+    "text.token_ids": reasoner_input_ids,
     "vision.pixel_values": pixel_values,
-    "diffusion.initial_vision_latent": vision_noise,
-    "diffusion.initial_action_latent": action_noise,
 }
 
-session.run_stage("reasoner_prompt", inputs)
+session.run_stage("reasoner_prompt", reasoner_inputs)
 reasoning = session.run_stage(
     "reasoner_decode",
     options={"max_tokens": 64, "seed": 1234},
 )
 session.release_stage("reasoner_decode")
+
+world_inputs = {
+    "text.token_ids": generator_input_ids,
+    "diffusion.initial_vision_latent": packed_vision_noise,
+    "diffusion.initial_action_latent": packed_action_noise,
+}
 world = session.run_stage(
     "world_generation",
+    world_inputs,
     options={
         "mode": "action",
         "action_domain": "droid_lerobot",
@@ -134,6 +147,20 @@ frames = video["video"]
 session.release_stage("decode_video")
 ```
 
+`reasoning["generated_token_ids"]` contains token IDs, not decoded text.
+Likewise, component outputs retain their model boundary representation:
+Cosmos3 Edge action state remains padded to width 64 and must be sliced using
+`pipeline.metadata["action"]["raw_dimensions"]`; decoded video is float NCTHW
+and still needs the deployment's clipping/range and frame conversion.
+
+For the tested Cosmos3 Edge export, the fixed vision encoder consumes
+normalized NCHW `[1, 3, 256, 256]` pixels and produces 64 feature rows. The
+reasoner token sequence must therefore contain 64 image-placeholder tokens,
+one per feature row. Its chat template emits one `<|image_pad|>` marker; the
+host processor must expand that marker before inference. These values are
+checkpoint-specific—read the component signatures and processor config for
+other exports.
+
 `run_stage()` executes the strategy declared by the manifest: one pass,
 autoregressive decoding, or all iterative scheduler steps. `step_stage()`
 executes exactly one pass for applications that manage loops themselves.
@@ -141,11 +168,13 @@ Generated tensors or transformed targets can be supplied through `overrides`
 using their semantic or qualified port name.
 
 `PipelineSession.run()` executes a selected stage list in declaration order and
-releases state according to the manifest:
+releases state according to the manifest. It is primarily a convenience for
+pipelines whose selected stages share one prepared input set; heterogeneous
+Cosmos flows are clearer as explicit `run_stage()` calls:
 
 ```python
 result = session.run(
-    inputs,
+    world_inputs,
     stages=["world_generation", "decode_video"],
     options={
         "num_inference_steps": 50,
@@ -158,6 +187,30 @@ result = session.run(
 
 Model loading and inference release the Python GIL. Inputs and outputs are
 copied between NumPy and engine-owned storage.
+
+## Cosmos3 Edge verification status
+
+The runtime was exercised against an actual 23.35 GB
+`cosmos3-edge-f32-export` package on ONNX Runtime CPU:
+
+| Check | Result |
+|---|---|
+| Parse and validate Mobius schema 1.1 | Passed |
+| Load all six ONNX component sessions | Passed, approximately 25–30 seconds |
+| Text-only Reasoner control (`2 + 2`) | Passed, generated `4` |
+| Vision encoder, embedding, and Reasoner execution | Passed without runtime or non-finite tensor errors |
+| One-step Generator and action state | Passed |
+| UniPC scheduler and packed state update | Passed |
+| Wan VAE decoder micro-run | Passed, produced `[1, 3, 5, 32, 32]` |
+| Cosmos3 Edge image-description semantic parity | **Not established** |
+
+The image path executes, but a natural cat-image prompt did not produce a
+correct description. The same decoder succeeds on text-only inference, and
+Mobius currently documents its Cosmos3 Edge visual implementation as L1
+graph-build only: projector pixel-shuffle ordering and numerical parity have
+not been verified against an authoritative NVIDIA implementation. Therefore
+the runtime is proven to load and execute this package, but the README does not
+claim that Cosmos3 Edge visual semantics are correct.
 
 ## Generic ONNX API
 
@@ -220,7 +273,8 @@ NamedTensors outputs = session.RunStage(
 
 ## Current scope
 
-- ONNX Runtime CPU execution provider; a profiled component must permit CPU.
+- ONNX Runtime CPU execution provider only; a profiled component must permit
+  CPU. All component sessions are loaded eagerly.
 - Dense tensor inputs and outputs, including FP16 and BF16 host transforms.
 - Single-pass, on-demand, state-transition, iterative, and autoregressive
   stages.
@@ -231,5 +285,13 @@ NamedTensors outputs = session.RunStage(
   action-domain generated-input programs.
 - Scheduler, cast, reshape, packed video finalization, and audio finalization
   transforms.
-- Fixed-step stochastic FlowMatch schedules are rejected until their SDE
-  sampler is implemented.
+- Fixed-square, single-image visual mRoPE positioning; general multi-image,
+  variable-grid media processing remains a host responsibility.
+- No built-in raw text tokenizer, image/video decoder, resize/normalize
+  processor, or diffusion-noise initializer.
+- Conditioning handoffs recorded only in manifest metadata are not executed
+  automatically; callers must supply the corresponding packed initial latent.
+- Unsupported general transforms require an explicit target `override`.
+- Fixed-step stochastic FlowMatch and FlowMatch beta-sigma schedules are
+  rejected rather than approximated. UniPC support is limited to the
+  flow-prediction order-1/order-2 contract exercised by Cosmos3 Edge.
