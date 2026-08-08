@@ -663,6 +663,8 @@ struct PipelineSession::Impl {
   std::unordered_map<std::string, std::size_t> stage_iterations;
   mutable std::unordered_map<std::string, SchedulerHistory>
       scheduler_histories;
+  mutable std::unordered_map<std::string, std::vector<std::int64_t>>
+      position_cursors;
   std::mt19937_64 random_engine{0};
 
   [[nodiscard]] const PipelineManifest& manifest() const noexcept {
@@ -1568,6 +1570,42 @@ struct PipelineSession::Impl {
       const NamedTensors& overrides,
       const PipelineRunOptions& options) const {
     if (const Tensor* value = Override(overrides, input)) {
+      if (input.generator_kind == "multimodal_position_ids") {
+        if (value->data_type() != DataType::int64 ||
+            (value->shape().size() != 2 &&
+             value->shape().size() != 3)) {
+          ExecutionError(
+              "Overridden multimodal position IDs must be an int64 rank-2 "
+              "or rank-3 tensor");
+        }
+        const std::size_t axes =
+            static_cast<std::size_t>(value->shape()[0]);
+        const std::size_t batch =
+            value->shape().size() == 3
+                ? static_cast<std::size_t>(value->shape()[1])
+                : 1;
+        const std::size_t length =
+            static_cast<std::size_t>(value->shape().back());
+        const std::size_t axis_stride = batch * length;
+        const auto positions = value->values<std::int64_t>();
+        std::vector<std::int64_t> cursors(batch, 0);
+        for (std::size_t batch_index = 0;
+             batch_index < batch;
+             ++batch_index) {
+          std::int64_t maximum = -1;
+          for (std::size_t axis = 0; axis < axes; ++axis) {
+            for (std::size_t index = 0; index < length; ++index) {
+              maximum = std::max(
+                  maximum,
+                  positions[axis * axis_stride +
+                            batch_index * length + index]);
+            }
+          }
+          cursors[batch_index] = maximum + 1;
+        }
+        position_cursors.insert_or_assign(
+            input.port.qualified(), std::move(cursors));
+      }
       return *value;
     }
     const Json parameters = Json::parse(input.generator_json);
@@ -1639,6 +1677,88 @@ struct PipelineSession::Impl {
                    batch_index * length + index] =
                 static_cast<std::int64_t>(past_length + index);
           }
+        }
+      }
+      if (sequence->shape().size() == 2 && axes >= 3 &&
+          sequence->data_type() == DataType::int64) {
+        auto& cursors = position_cursors[input.port.qualified()];
+        if (cursors.size() != batch) {
+          cursors.assign(
+              batch, static_cast<std::int64_t>(past_length));
+        }
+        const auto ids = sequence->values<std::int64_t>();
+        const auto image_features =
+            endpoint_values.find("reasoner_vision_encoder.image_features");
+        for (std::size_t batch_index = 0;
+             batch_index < batch;
+             ++batch_index) {
+          const std::size_t batch_offset = batch_index * length;
+          if (past_length != 0) {
+            const std::int64_t start = cursors[batch_index];
+            for (std::int64_t axis = 0; axis < axes; ++axis) {
+              for (std::size_t index = 0; index < length; ++index) {
+                values[static_cast<std::size_t>(axis) * axis_stride +
+                       batch_offset + index] =
+                    start + static_cast<std::int64_t>(index);
+              }
+            }
+            cursors[batch_index] += static_cast<std::int64_t>(length);
+            continue;
+          }
+
+          std::size_t visual_count = 0;
+          if (image_features != endpoint_values.end() &&
+              !image_features->second.shape().empty()) {
+            visual_count = static_cast<std::size_t>(
+                image_features->second.shape()[0]);
+          }
+          std::size_t visual_start = length;
+          if (visual_count > 0 && visual_count <= length) {
+            for (std::size_t candidate = 0;
+                 candidate + visual_count <= length;
+                 ++candidate) {
+              const std::int64_t token = ids[batch_offset + candidate];
+              const bool repeated = std::ranges::all_of(
+                  ids.begin() +
+                      static_cast<std::ptrdiff_t>(batch_offset + candidate),
+                  ids.begin() + static_cast<std::ptrdiff_t>(
+                                    batch_offset + candidate + visual_count),
+                  [token](std::int64_t value) { return value == token; });
+              if (repeated) {
+                visual_start = candidate;
+                break;
+              }
+            }
+          }
+          const auto grid = static_cast<std::size_t>(
+              std::sqrt(static_cast<double>(visual_count)));
+          if (visual_start == length || grid * grid != visual_count) {
+            cursors[batch_index] = static_cast<std::int64_t>(length);
+            continue;
+          }
+
+          const std::int64_t visual_base =
+              static_cast<std::int64_t>(visual_start);
+          for (std::size_t token = 0; token < visual_count; ++token) {
+            const std::size_t position = visual_start + token;
+            values[batch_offset + position] = visual_base;
+            values[axis_stride + batch_offset + position] =
+                visual_base + static_cast<std::int64_t>(token / grid);
+            values[2 * axis_stride + batch_offset + position] =
+                visual_base + static_cast<std::int64_t>(token % grid);
+          }
+          const std::size_t visual_end = visual_start + visual_count;
+          std::int64_t next =
+              visual_base + static_cast<std::int64_t>(grid);
+          for (std::size_t position = visual_end;
+               position < length;
+               ++position, ++next) {
+            for (std::int64_t axis = 0; axis < axes; ++axis) {
+              values[static_cast<std::size_t>(axis) * axis_stride +
+                     batch_offset + position] = next;
+            }
+          }
+          cursors[batch_index] = next;
         }
       }
       if (sequence->shape().size() != 2 && axes >= 3 &&
@@ -2706,6 +2826,27 @@ void PipelineSession::ReleaseStage(std::string_view stage) {
     }
     impl_->state_values.erase(state.name);
     impl_->scheduler_histories.erase(state.name);
+    if (state.kind == "kv_cache") {
+      for (const auto& input : impl_->manifest().inputs()) {
+        if (input.generator_kind != "multimodal_position_ids") {
+          continue;
+        }
+        const Json parameters = Json::parse(input.generator_json);
+        if (!parameters.contains("past_state") ||
+            !parameters.at("past_state").is_array()) {
+          continue;
+        }
+        const bool depends_on_state = std::ranges::any_of(
+            parameters.at("past_state"),
+            [&state](const Json& value) {
+              return value.is_string() &&
+                     value.get<std::string>() == state.name;
+            });
+        if (depends_on_state) {
+          impl_->position_cursors.erase(input.port.qualified());
+        }
+      }
+    }
     impl_->external_values.erase(state.input.qualified());
     impl_->endpoint_values.erase(state.input.qualified());
     impl_->endpoint_values.erase(state.output.qualified());
@@ -2727,6 +2868,7 @@ void PipelineSession::Reset() {
   impl_->state_values.clear();
   impl_->stage_iterations.clear();
   impl_->scheduler_histories.clear();
+  impl_->position_cursors.clear();
 }
 
 }  // namespace onnx_world_model
