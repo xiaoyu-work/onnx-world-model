@@ -514,7 +514,12 @@ class PackedVideoPreprocessor(PackedImagePreprocessor):
         if num_frames is not None:
             if num_frames <= 0:
                 raise ValueError("num_frames must be positive")
-            count = min(num_frames, total_frames)
+            if num_frames > total_frames:
+                raise ValueError(
+                    f"num_frames={num_frames} exceeds source frame count "
+                    f"{total_frames}"
+                )
+            count = num_frames
         else:
             target_fps = self.fps if fps is None else fps
             if target_fps <= 0:

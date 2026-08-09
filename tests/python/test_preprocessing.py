@@ -624,6 +624,10 @@ def test_prepares_video_understanding_input(
     )
     assert from_path.sampled_frames == 4
     assert from_path.grid_thw.tolist() == [4, 4, 4]
+    with pytest.raises(ValueError, match="exceeds source frame count"):
+        preprocessor.prepare_video_reasoner(
+            "cat", frames[:2], source_fps=2, num_frames=4
+        )
 
 
 class _FakeSession:

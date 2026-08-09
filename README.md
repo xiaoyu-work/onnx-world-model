@@ -101,6 +101,7 @@ print(answer.text)
 summary = model.llm.generate(
     "Summarize what happens in this video.",
     video="clip.mp4",
+    video_sample_fps=2,
     max_tokens=128,
 )
 print(summary.text)
@@ -145,6 +146,20 @@ Reasoner. `video=` accepts a video path, a frame sequence, or a
 understanding contract apply frame sampling, timestamps, packed patchification,
 video-token expansion, and `grid_thw` automatically. `image` and `video` are
 mutually exclusive in one request.
+
+Video sampling options:
+
+- `video_fps`: source FPS when an array/frame sequence has no container
+  metadata;
+- `video_sample_fps`: target sampling rate, defaulting to the package contract;
+- `video_num_frames`: exact uniform sample count, mutually exclusive with
+  `video_sample_fps`.
+
+Video understanding requires a package that declares
+`metadata.vision_understanding.routing.video` and exposes
+`reasoner_embedding.video_features`. Older Cosmos3 Edge exports without this
+contract must be re-exported with a current Mobius version; the runtime does
+not silently reinterpret video frames as images.
 
 World generation currently starts from packed Gaussian noise, or from
 explicitly supplied initial latent tensors. Image-to-video conditioning is not
@@ -466,7 +481,7 @@ NamedTensors outputs = session.RunStage(
 - All component sessions are loaded eagerly. Pipeline scheduling and host
   transforms currently operate on CPU tensors; ORT performs device transfers
   at component boundaries.
-- The high-level Python layer supports exported chat templates, fast
+- The generation API supports exported chat templates, fast
   tokenizers, fixed NCHW and variable-resolution packed image preprocessing,
   video path/array decoding, frame sampling, image/video placeholder
   expansion, text decoding, packed Gaussian world-state initialization,
@@ -481,12 +496,13 @@ NamedTensors outputs = session.RunStage(
   action-domain generated-input programs.
 - Scheduler, cast, reshape, packed video finalization, and audio finalization
   transforms.
-- Fixed-square, single-image visual mRoPE positioning; general multi-image,
-  variable-grid media processing remains a host responsibility.
-- The low-level API accepts tensors. The high-level Python layer adds raw text
-  tokenization, fixed/packed image resize-normalize-patchify, and diffusion-
-  noise initialization; it does not yet provide raw video understanding,
-  general video decoding/encoding, or arbitrary model-specific media
+- Frame-level image/video mRoPE positioning for fixed-square and
+  variable-resolution Cosmos3 Edge contracts. Multiple independent images or
+  videos in one prompt are not yet supported.
+- The low-level API accepts tensors. The generation API adds raw text
+  tokenization, fixed/packed image preprocessing, video container/array
+  decoding and sampling, and diffusion-noise initialization. It does not
+  encode output video files or implement arbitrary undeclared media
   processors.
 - Conditioning handoffs recorded only in manifest metadata are not executed
   automatically; callers must supply the corresponding packed initial latent.
