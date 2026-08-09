@@ -7,7 +7,6 @@ project(
   LANGUAGES CXX
 )
 
-option(ONNX_WORLD_MODEL_BUILD_CLI "Build the world-model CLI" OFF)
 option(ONNX_WORLD_MODEL_BUILD_PYTHON "Build the Python extension" OFF)
 option(ONNX_WORLD_MODEL_BUILD_TESTS "Build C++ tests" OFF)
 set(ONNX_RUNTIME_HEADER_VERSION "1.28.0")
@@ -73,12 +72,6 @@ else()
   target_link_libraries(onnx_world_model PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
-if(ONNX_WORLD_MODEL_BUILD_CLI)
-  add_executable(onnx-world-model cli/main.cpp)
-  target_link_libraries(onnx-world-model PRIVATE onnx_world_model)
-  target_compile_features(onnx-world-model PRIVATE cxx_std_20)
-endif()
-
 if(ONNX_WORLD_MODEL_BUILD_PYTHON)
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
   execute_process(
@@ -106,9 +99,6 @@ if(ONNX_WORLD_MODEL_BUILD_TESTS)
     target_compile_features(${test_name}_test PRIVATE cxx_std_20)
     add_test(NAME ${test_name}_test COMMAND ${test_name}_test)
   endforeach()
-  if(ONNX_WORLD_MODEL_BUILD_CLI)
-    add_test(NAME cli_help_test COMMAND onnx-world-model --help)
-  endif()
 endif()
 
 include(GNUInstallDirs)
@@ -119,13 +109,6 @@ install(
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT development
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime
 )
-if(ONNX_WORLD_MODEL_BUILD_CLI)
-  install(
-    TARGETS onnx-world-model
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-    COMPONENT runtime
-  )
-endif()
 install(
   DIRECTORY include/
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"

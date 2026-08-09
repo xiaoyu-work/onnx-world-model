@@ -13,7 +13,6 @@
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build/dev",
       "cacheVariables": {
-        "ONNX_WORLD_MODEL_BUILD_CLI": "ON",
         "ONNX_WORLD_MODEL_BUILD_PYTHON": "OFF",
         "ONNX_WORLD_MODEL_BUILD_TESTS": "ON"
       }

@@ -39,7 +39,7 @@ silently selecting a fallback.
 ```text
 Python API ── pybind11 ─┐
                        ├─ Pipeline ─ PipelineSession ─ named ONNX Model sessions
-C++ API / CLI ─────────┤                  │
+C++ API ───────────────┤                  │
                        │                  ├─ generated-input programs
                        │                  ├─ stage strategies and schedulers
                        │                  └─ per-trajectory recurrent state
@@ -52,6 +52,8 @@ C++ API / CLI ─────────┤                  │
   action state, outputs, and stage cursors.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
+- Generic ONNX and latent-dynamics APIs are documented in
+  [Low-level APIs](docs/low-level-apis.md).
 - `Tensor` has value semantics with copy-on-write storage.
 - ORT is loaded dynamically, so the library does not link to one ORT binary.
 
@@ -154,46 +156,6 @@ yet supported.
 Low-level tensor and stage execution is documented in the
 [Pipeline API](docs/pipeline-api.md). Cosmos3 Edge results are in
 [Cosmos3 Edge validation](docs/cosmos3-edge-validation.md).
-
-## Generic ONNX API
-
-```python
-from onnx_world_model import OnnxModel
-
-model = OnnxModel("component/model.onnx")
-outputs = model.run({"input_ids": input_ids, "attention_mask": attention_mask})
-```
-
-## Latent-dynamics compatibility API
-
-Single-graph exports with this fixed contract remain supported:
-
-```text
-observation + action + state
-  -> next_state + observation_prediction + reward + continuation
-```
-
-```python
-from onnx_world_model import LatentDynamicsModel
-
-model = LatentDynamicsModel("model.onnx")
-result = model.step(observation, action, state)
-
-rollout = model.create_rollout()
-result = rollout.step(observation, action)
-rollout.reset(batch_size=1)
-```
-
-`LegacyWorldModel` is an explicit compatibility alias for
-`LatentDynamicsModel`; `WorldModel` now consistently means the generation
-package API.
-
-The CLI continues to inspect and execute this compatibility contract:
-
-```bash
-onnx-world-model inspect model.onnx --ort-library /path/to/onnxruntime.dll
-onnx-world-model step model.onnx --observation "0,0,0,0" --action "0,0"
-```
 
 ## Current scope
 

@@ -32,7 +32,6 @@ install.components = ["python"]
 wheel.packages = ["python/onnx_world_model"]
 
 [tool.scikit-build.cmake.define]
-ONNX_WORLD_MODEL_BUILD_CLI = "OFF"
 ONNX_WORLD_MODEL_BUILD_PYTHON = "ON"
 ONNX_WORLD_MODEL_BUILD_TESTS = "OFF"
 
