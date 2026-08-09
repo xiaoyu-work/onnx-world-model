@@ -22,3 +22,8 @@ graph-build only. Projector pixel-shuffle ordering and numerical parity have
 not been verified against an authoritative NVIDIA implementation. The runtime
 is therefore proven to load and execute this package, but visual semantic
 correctness is not yet established.
+
+The tested export uses a fixed vision encoder input of normalized NCHW
+`[1, 3, 256, 256]` and produces 64 feature rows. Its reasoner input therefore
+contains 64 image-placeholder tokens. These values describe that test artifact
+only; newer exports may use variable-resolution packed vision inputs.
