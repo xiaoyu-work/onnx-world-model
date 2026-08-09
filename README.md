@@ -82,6 +82,55 @@ wheel does not ship `libonnxruntime`.
 pip install -e ".[test]"
 ```
 
+### Execution providers
+
+`providers` is an ordered preference list. Provider names are
+case-insensitive and may use short names such as `cuda`, `dml`, `qnn`, and
+`cpu`, or ORT names such as `CUDAExecutionProvider`. CPU must be last because
+ORT uses it as the fallback provider.
+
+```python
+from onnx_world_model import Pipeline, available_execution_providers
+
+print(available_execution_providers())
+
+pipeline = Pipeline(
+    "output/cosmos3-edge",
+    providers=["cuda", "cpu"],
+    provider_options={
+        "cuda": {
+            "device_id": 0,
+            "gpu_mem_limit": 24 * 1024**3,
+            "use_tf32": False,
+        },
+        "cpu": {"use_arena": True},
+    },
+)
+
+# Actual providers selected for each component after applying manifest hints
+# and filtering against the loaded ORT build.
+print(pipeline.execution_providers)
+```
+
+For `Pipeline`, the requested order is intersected with each component's
+`preferred_execution_providers`. When `providers` is omitted, the component's
+manifest order is used; a profileless component defaults to CPU. An unavailable
+provider is skipped only when a later requested fallback is available, so
+`["cuda"]` fails on a CPU-only ORT build while `["cuda", "cpu"]` selects CPU.
+Use an ORT build or wheel that contains the requested EP—changing
+`ort_library_path` alone does not add an EP to a CPU-only runtime.
+
+`OnnxModel` and `WorldModel` accept the same arguments and default to CPU:
+
+```python
+model = OnnxModel(
+    "model.onnx",
+    providers=["dml", "cpu"],
+    provider_options={"dml": {"performance_preference": "high_performance"}},
+)
+print(model.metadata.execution_providers)
+```
+
 `Pipeline` is a tensor runtime, not a raw-media processor. The caller must
 tokenize text, apply the exported image/video processor, expand multimodal
 placeholder tokens, and create packed diffusion latents before calling a
@@ -257,6 +306,11 @@ using namespace onnx_world_model;
 
 RuntimeOptions runtime;
 runtime.ort_library_path = "/path/to/onnxruntime.dll";
+runtime.providers = {"cuda", "cpu"};
+runtime.provider_options["cuda"] = {
+    {"device_id", "0"},
+    {"gpu_mem_limit", "25769803776"},
+};
 
 Pipeline pipeline = Pipeline::Load("output/cosmos3-edge", runtime);
 PipelineSession session = pipeline.CreateSession();
@@ -273,8 +327,14 @@ NamedTensors outputs = session.RunStage(
 
 ## Current scope
 
-- ONNX Runtime CPU execution provider only; a profiled component must permit
-  CPU. All component sessions are loaded eagerly.
+- Ordered execution-provider configuration with per-component manifest
+  selection. CUDA and TensorRT use their V2 option APIs; CPU, DML, OpenVINO,
+  VitisAI, QNN, XNNPACK, WebGPU, Azure, and CoreML use their applicable ORT
+  registration APIs. Provider availability still depends on the loaded ORT
+  build.
+- All component sessions are loaded eagerly. Pipeline scheduling and host
+  transforms currently operate on CPU tensors; ORT performs device transfers
+  at component boundaries.
 - Dense tensor inputs and outputs, including FP16 and BF16 host transforms.
 - Single-pass, on-demand, state-transition, iterative, and autoregressive
   stages.

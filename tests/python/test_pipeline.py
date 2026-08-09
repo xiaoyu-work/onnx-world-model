@@ -31,6 +31,24 @@ def test_loads_pipeline_contract(pipeline_path: Path):
         "continuation",
     }
     assert pipeline.stages[0].name == "step"
+    assert pipeline.execution_providers == {
+        "dynamics": ("CPUExecutionProvider",)
+    }
+
+
+def test_pipeline_provider_selection(pipeline_path: Path):
+    pipeline = Pipeline(
+        pipeline_path,
+        providers=["cuda", "cpu"],
+        provider_options={"cpu": {"use_arena": True}},
+    )
+
+    assert pipeline.execution_providers["dynamics"] == ("CPUExecutionProvider",)
+
+
+def test_pipeline_rejects_incompatible_provider(pipeline_path: Path):
+    with pytest.raises(WorldModelError, match="no execution provider compatible"):
+        Pipeline(pipeline_path, providers=["cuda"])
 
 
 def test_runs_pipeline_stage(pipeline_path: Path):

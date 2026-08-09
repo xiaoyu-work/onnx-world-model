@@ -11,6 +11,7 @@ from onnx_world_model._api import (
     TensorSpec,
     WorldModel,
     WorldModelPipeline,
+    available_execution_providers,
 )
 from onnx_world_model._native import WorldModelError
 
@@ -28,4 +29,5 @@ __all__ = [
     "WorldModel",
     "WorldModelError",
     "WorldModelPipeline",
+    "available_execution_providers",
 ]

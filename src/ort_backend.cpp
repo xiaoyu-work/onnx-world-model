@@ -1,8 +1,12 @@
 #include "ort_backend.hpp"
 
+#include <cctype>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -151,6 +155,220 @@ namespace {
   return tensor;
 }
 
+using ProviderOptions =
+    std::unordered_map<std::string, std::string>;
+
+struct ResolvedProvider {
+  std::string name;
+  std::string available_name;
+  ProviderOptions options;
+};
+
+[[nodiscard]] bool SupportsProviderRegistration(std::string_view name) {
+  static const std::unordered_set<std::string> supported{
+      "azure",
+      "coreml",
+      "cpu",
+      "cuda",
+      "dml",
+      "js",
+      "nvtensorrtrtx",
+      "openvino",
+      "qnn",
+      "tensorrt",
+      "vitisai",
+      "webgpu",
+      "webnn",
+      "xnnpack",
+  };
+  return supported.contains(std::string(name));
+}
+
+[[nodiscard]] std::string JoinProviders(
+    const std::vector<std::string>& providers) {
+  std::ostringstream result;
+  for (std::size_t index = 0; index < providers.size(); ++index) {
+    if (index != 0) {
+      result << ", ";
+    }
+    result << providers[index];
+  }
+  return result.str();
+}
+
+[[nodiscard]] std::unordered_map<std::string, ProviderOptions>
+NormalizeProviderOptions(const RuntimeOptions& options) {
+  std::unordered_map<std::string, ProviderOptions> normalized;
+  normalized.reserve(options.provider_options.size());
+  for (const auto& [name, values] : options.provider_options) {
+    const std::string key = NormalizeExecutionProviderName(name);
+    if (!normalized.emplace(key, values).second) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "Provider options were supplied more than once for '" + key + "'");
+    }
+  }
+  return normalized;
+}
+
+[[nodiscard]] std::vector<ResolvedProvider> ResolveProviders(
+    const RuntimeOptions& options) {
+  const std::vector<std::string> available =
+      Ort::GetAvailableProviders();
+  std::unordered_map<std::string, std::string> available_by_name;
+  available_by_name.reserve(available.size());
+  for (const auto& name : available) {
+    available_by_name.emplace(
+        NormalizeExecutionProviderName(name), name);
+  }
+
+  std::vector<std::string> requested = options.providers;
+  if (requested.empty()) {
+    requested.emplace_back("cpu");
+  }
+  const auto provider_options = NormalizeProviderOptions(options);
+  std::unordered_set<std::string> seen;
+  std::vector<ResolvedProvider> resolved;
+  std::vector<std::string> unsupported;
+  for (const auto& requested_name : requested) {
+    const std::string name =
+        NormalizeExecutionProviderName(requested_name);
+    if (!seen.insert(name).second) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "Execution provider '" + name + "' was requested more than once");
+    }
+    const auto available_provider = available_by_name.find(name);
+    if (available_provider == available_by_name.end()) {
+      continue;
+    }
+    if (!SupportsProviderRegistration(name)) {
+      unsupported.push_back(available_provider->second);
+      continue;
+    }
+    const auto values = provider_options.find(name);
+    resolved.push_back({
+        .name = name,
+        .available_name = available_provider->second,
+        .options =
+            values == provider_options.end() ? ProviderOptions{} : values->second,
+    });
+  }
+  for (const auto& [name, values] : provider_options) {
+    (void)values;
+    if (!seen.contains(name)) {
+        throw Error(
+            ErrorCode::invalid_argument,
+            "Provider options were supplied for unrequested provider '" +
+                name + "'");
+    }
+  }
+  if (resolved.empty()) {
+    const std::string unsupported_message =
+        unsupported.empty()
+            ? std::string{}
+            : ". Available but unsupported by this runtime: " +
+                  JoinProviders(unsupported);
+    throw Error(
+        ErrorCode::runtime_load,
+        "None of the requested execution providers are available and "
+        "supported (" +
+            JoinProviders(requested) + "). Available providers: " +
+            JoinProviders(available) + unsupported_message);
+  }
+  const auto cpu = std::ranges::find(
+      resolved, std::string("cpu"), &ResolvedProvider::name);
+  if (cpu != resolved.end() && std::next(cpu) != resolved.end()) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "The CPU execution provider must be last because ONNX Runtime uses "
+        "it as the fallback provider");
+  }
+  return resolved;
+}
+
+[[nodiscard]] bool ParseBooleanOption(
+    std::string_view value,
+    std::string_view option,
+    std::string_view provider) {
+  std::string normalized;
+  normalized.reserve(value.size());
+  for (const unsigned char character : value) {
+    normalized.push_back(
+        static_cast<char>(std::tolower(character)));
+  }
+  if (normalized == "1" || normalized == "true" ||
+      normalized == "on") {
+    return true;
+  }
+  if (normalized == "0" || normalized == "false" ||
+      normalized == "off") {
+    return false;
+  }
+  throw Error(
+      ErrorCode::invalid_argument,
+      "Provider option '" + std::string(option) + "' for '" +
+          std::string(provider) + "' must be true or false");
+}
+
+[[nodiscard]] std::string GenericProviderName(
+    const ResolvedProvider& provider) {
+  static const std::unordered_map<std::string, std::string> names{
+      {"dml", "DML"},
+      {"nvtensorrtrtx", "NvTensorRtRtx"},
+  };
+  const auto known = names.find(provider.name);
+  if (known != names.end()) {
+    return known->second;
+  }
+  return provider.available_name;
+}
+
+void AppendProvider(
+    Ort::SessionOptions& session_options,
+    const ResolvedProvider& provider) {
+  try {
+    if (provider.name == "cpu") {
+      bool use_arena = true;
+      for (const auto& [name, value] : provider.options) {
+        if (name != "use_arena") {
+          throw Error(
+              ErrorCode::invalid_argument,
+              "Unknown CPU provider option '" + name + "'");
+        }
+        use_arena = ParseBooleanOption(value, name, provider.name);
+      }
+      if (use_arena) {
+        session_options.EnableCpuMemArena();
+      } else {
+        session_options.DisableCpuMemArena();
+      }
+    } else if (provider.name == "cuda") {
+      Ort::CUDAProviderOptions cuda_options;
+      cuda_options.Update(provider.options);
+      session_options.AppendExecutionProvider_CUDA_V2(*cuda_options);
+    } else if (provider.name == "tensorrt") {
+      Ort::TensorRTProviderOptions tensorrt_options;
+      tensorrt_options.Update(provider.options);
+      session_options.AppendExecutionProvider_TensorRT_V2(*tensorrt_options);
+    } else if (provider.name == "openvino") {
+      session_options.AppendExecutionProvider_OpenVINO_V2(provider.options);
+    } else if (provider.name == "vitisai") {
+      session_options.AppendExecutionProvider_VitisAI(provider.options);
+    } else {
+      session_options.AppendExecutionProvider(
+          GenericProviderName(provider), provider.options);
+    }
+  } catch (const Error&) {
+    throw;
+  } catch (const Ort::Exception& exception) {
+    throw Error(
+        ErrorCode::runtime_load,
+        "Failed to configure execution provider '" +
+            provider.available_name + "': " + exception.what());
+  }
+}
+
 class OrtBackend final : public ModelBackend {
  public:
   OrtBackend(const std::filesystem::path& model_path, const RuntimeOptions& options)
@@ -173,6 +391,17 @@ class OrtBackend final : public ModelBackend {
     }
     session_options_.SetGraphOptimizationLevel(
         ToOrtGraphOptimizationLevel(options.graph_optimization));
+    const auto providers = ResolveProviders(options);
+    bool has_cpu_fallback = false;
+    for (const auto& provider : providers) {
+      AppendProvider(session_options_, provider);
+      metadata_.execution_providers.push_back(provider.available_name);
+      has_cpu_fallback = has_cpu_fallback || provider.name == "cpu";
+    }
+    if (!has_cpu_fallback) {
+      session_options_.AddConfigEntry(
+          "session.disable_cpu_ep_fallback", "1");
+    }
     session_ = Ort::Session(env_, model_path.c_str(), session_options_);
 
     Ort::AllocatorWithDefaultOptions allocator;
@@ -270,6 +499,19 @@ ModelBackendPtr CreateOrtBackend(
     throw Error(
         ErrorCode::runtime_load,
         "Failed to create ONNX Runtime session: " +
+            std::string(exception.what()));
+  }
+}
+
+std::vector<std::string> GetAvailableOrtProviders(
+    const std::filesystem::path& library_path) {
+  InitializeOrtApi(library_path);
+  try {
+    return Ort::GetAvailableProviders();
+  } catch (const Ort::Exception& exception) {
+    throw Error(
+        ErrorCode::runtime_load,
+        "Failed to query ONNX Runtime execution providers: " +
             std::string(exception.what()));
   }
 }

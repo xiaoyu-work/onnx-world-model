@@ -17,6 +17,7 @@ struct TensorSpec {
 struct ModelMetadata {
   std::vector<TensorSpec> inputs;
   std::vector<TensorSpec> outputs;
+  std::vector<std::string> execution_providers;
 
   [[nodiscard]] const TensorSpec& Input(std::string_view name) const;
   [[nodiscard]] const TensorSpec& Output(std::string_view name) const;

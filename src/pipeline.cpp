@@ -1360,6 +1360,57 @@ void ValidateModelMetadata(
   validate(component.metadata.outputs, actual.outputs, "output");
 }
 
+RuntimeOptions ComponentRuntimeOptions(
+    const RuntimeOptions& requested,
+    const PipelineComponent& component) {
+  RuntimeOptions resolved = requested;
+  std::unordered_set<std::string> allowed;
+  for (const auto& provider :
+       component.preferred_execution_providers) {
+    allowed.insert(NormalizeExecutionProviderName(provider));
+  }
+
+  const std::vector<std::string>& candidates =
+      requested.providers.empty()
+          ? component.preferred_execution_providers
+          : requested.providers;
+  resolved.providers.clear();
+  for (const auto& provider : candidates) {
+    const std::string normalized =
+        NormalizeExecutionProviderName(provider);
+    if (allowed.empty() || allowed.contains(normalized)) {
+      resolved.providers.push_back(provider);
+    }
+  }
+  if (resolved.providers.empty()) {
+    if (requested.providers.empty() && allowed.empty()) {
+      resolved.providers.emplace_back("cpu");
+    } else {
+      std::ostringstream message;
+      message << "Component '" << component.name
+              << "' has no execution provider compatible with ";
+      if (requested.providers.empty()) {
+        message << "its manifest preferences";
+      } else {
+        message << "the requested provider order";
+      }
+      throw Error(ErrorCode::runtime_load, message.str());
+    }
+  }
+
+  std::unordered_set<std::string> selected;
+  for (const auto& provider : resolved.providers) {
+    selected.insert(NormalizeExecutionProviderName(provider));
+  }
+  resolved.provider_options.clear();
+  for (const auto& [provider, values] : requested.provider_options) {
+    if (selected.contains(NormalizeExecutionProviderName(provider))) {
+      resolved.provider_options.emplace(provider, values);
+    }
+  }
+  return resolved;
+}
+
 }  // namespace
 
 Endpoint Endpoint::Parse(std::string_view value) {
@@ -1968,27 +2019,15 @@ PipelinePackage PipelinePackage::Load(
   std::unordered_map<std::string, Model> components;
   components.reserve(manifest.components().size());
   for (const auto& component : manifest.components()) {
-    const bool has_provider_hint =
-        !component.preferred_execution_providers.empty();
-    const bool supports_cpu =
-        !has_provider_hint ||
-        std::ranges::any_of(
-            component.preferred_execution_providers,
-            [](const std::string& provider) {
-              return Lower(provider) == "cpu";
-            });
-    if (!supports_cpu) {
-      throw Error(
-          ErrorCode::runtime_load,
-          "Component '" + component.name +
-              "' does not permit the runtime's currently available CPU "
-              "execution provider");
-    }
     const auto model_path = ResolveInside(
         root,
         manifest.component_files().at(component.name),
         "Component '" + component.name + "'");
-    components.emplace(component.name, Model::Load(model_path, options));
+    components.emplace(
+        component.name,
+        Model::Load(
+            model_path,
+            ComponentRuntimeOptions(options, component)));
   }
   for (const auto& asset : manifest.assets()) {
     const auto path = root / asset.path;
@@ -2019,6 +2058,16 @@ const Model& PipelinePackage::Component(std::string_view name) const {
         "Pipeline has no loaded component '" + std::string(name) + "'");
   }
   return found->second;
+}
+
+std::unordered_map<std::string, std::vector<std::string>>
+PipelinePackage::execution_providers() const {
+  std::unordered_map<std::string, std::vector<std::string>> result;
+  result.reserve(components_.size());
+  for (const auto& [name, component] : components_) {
+    result.emplace(name, component.metadata().execution_providers);
+  }
+  return result;
 }
 
 }  // namespace onnx_world_model

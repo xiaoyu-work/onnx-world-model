@@ -1,6 +1,7 @@
 #include "onnx_world_model/model.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <string>
 #include <utility>
 
@@ -8,6 +9,40 @@
 #include "ort_backend.hpp"
 
 namespace onnx_world_model {
+
+std::string NormalizeExecutionProviderName(std::string_view name) {
+  std::string normalized;
+  normalized.reserve(name.size());
+  for (const unsigned char character : name) {
+    if (std::isalnum(character) != 0) {
+      normalized.push_back(
+          static_cast<char>(std::tolower(character)));
+    }
+  }
+  constexpr std::string_view suffix = "executionprovider";
+  if (normalized.ends_with(suffix)) {
+    normalized.resize(normalized.size() - suffix.size());
+  }
+  if (normalized == "directml") {
+    normalized = "dml";
+  } else if (normalized == "trtrtx" ||
+             normalized == "nvtensorrtx") {
+    normalized = "nvtensorrtrtx";
+  } else if (normalized == "tensortrt") {
+    normalized = "tensorrt";
+  }
+  if (normalized.empty()) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Execution provider name cannot be empty");
+  }
+  return normalized;
+}
+
+std::vector<std::string> AvailableExecutionProviders(
+    const std::filesystem::path& ort_library_path) {
+  return detail::GetAvailableOrtProviders(ort_library_path);
+}
 
 void ValidateTensor(const Tensor& tensor, const TensorSpec& spec) {
   if (tensor.data_type() != spec.data_type) {

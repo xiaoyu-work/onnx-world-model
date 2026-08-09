@@ -4,7 +4,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from onnx_world_model import OnnxModel, WorldModel, WorldModelError
+from onnx_world_model import (
+    OnnxModel,
+    WorldModel,
+    WorldModelError,
+    available_execution_providers,
+)
 
 
 def _inputs(batch_size: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -51,6 +56,51 @@ def test_generic_named_tensor_model(world_model_path: Path):
         "continuation",
     }
     np.testing.assert_allclose(output["next_state"], [[0.1, 0.2, 0.3]] * 2)
+    assert model.metadata.execution_providers == ("CPUExecutionProvider",)
+
+
+def test_configures_cpu_execution_provider(world_model_path: Path):
+    model = OnnxModel(
+        world_model_path,
+        providers=["cpu"],
+        provider_options={"cpu": {"use_arena": False}},
+    )
+
+    assert model.metadata.execution_providers == ("CPUExecutionProvider",)
+
+
+def test_explicit_provider_fallback(world_model_path: Path):
+    model = OnnxModel(world_model_path, providers=["cuda", "cpu"])
+
+    assert model.metadata.execution_providers == ("CPUExecutionProvider",)
+
+
+def test_rejects_unavailable_provider(world_model_path: Path):
+    with pytest.raises(WorldModelError, match="requested execution providers"):
+        OnnxModel(world_model_path, providers=["cuda"])
+
+
+def test_lists_available_execution_providers():
+    providers = available_execution_providers()
+
+    assert "CPUExecutionProvider" in providers
+
+
+def test_registers_available_non_cpu_provider(world_model_path: Path):
+    if "AzureExecutionProvider" not in available_execution_providers():
+        pytest.skip("Azure execution provider is unavailable")
+
+    model = OnnxModel(world_model_path, providers=["azure", "cpu"])
+    observation, action, state = _inputs()
+    output = model.run(
+        {"observation": observation, "action": action, "state": state}
+    )
+
+    assert model.metadata.execution_providers == (
+        "AzureExecutionProvider",
+        "CPUExecutionProvider",
+    )
+    np.testing.assert_allclose(output["next_state"], [[0.1, 0.2, 0.3]])
 
 
 def test_generic_model_rejects_missing_input(world_model_path: Path):

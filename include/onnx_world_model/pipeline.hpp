@@ -155,6 +155,8 @@ class PipelinePackage {
   [[nodiscard]] const std::filesystem::path& root() const noexcept;
   [[nodiscard]] const PipelineManifest& manifest() const noexcept;
   [[nodiscard]] const Model& Component(std::string_view name) const;
+  [[nodiscard]] std::unordered_map<std::string, std::vector<std::string>>
+  execution_providers() const;
 
  private:
   std::filesystem::path root_;
@@ -179,6 +181,8 @@ class Pipeline {
       const RuntimeOptions& options = {});
 
   [[nodiscard]] const PipelineManifest& manifest() const noexcept;
+  [[nodiscard]] std::unordered_map<std::string, std::vector<std::string>>
+  execution_providers() const;
   [[nodiscard]] PipelineSession CreateSession() const;
 
  private:

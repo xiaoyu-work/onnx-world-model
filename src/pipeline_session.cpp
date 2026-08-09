@@ -2770,6 +2770,11 @@ const PipelineManifest& Pipeline::manifest() const noexcept {
   return package_->manifest();
 }
 
+std::unordered_map<std::string, std::vector<std::string>>
+Pipeline::execution_providers() const {
+  return package_->execution_providers();
+}
+
 PipelineSession Pipeline::CreateSession() const {
   return PipelineSession(package_);
 }

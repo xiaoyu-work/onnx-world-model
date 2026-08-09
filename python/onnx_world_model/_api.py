@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ class TensorSpec:
 class ModelMetadata:
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
+    execution_providers: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ def _metadata_from_native(value: dict[str, Any]) -> ModelMetadata:
     return ModelMetadata(
         inputs=tuple(convert(spec) for spec in value["inputs"]),
         outputs=tuple(convert(spec) for spec in value["outputs"]),
+        execution_providers=tuple(value["execution_providers"]),
     )
 
 
@@ -118,6 +120,33 @@ def _find_ort_library() -> Path:
     )
 
 
+ProviderOptionValue = str | bool | int | float
+ProviderOptions = Mapping[str, Mapping[str, ProviderOptionValue]]
+
+
+def _provider_arguments(
+    providers: Sequence[str] | None,
+    provider_options: ProviderOptions | None,
+) -> tuple[list[str], dict[str, dict[str, ProviderOptionValue]]]:
+    return (
+        list(providers or ()),
+        {
+            provider: dict(options)
+            for provider, options in (provider_options or {}).items()
+        },
+    )
+
+
+def available_execution_providers(
+    *,
+    ort_library_path: str | os.PathLike[str] | None = None,
+) -> tuple[str, ...]:
+    library_path = (
+        Path(ort_library_path) if ort_library_path is not None else _find_ort_library()
+    )
+    return tuple(_native.available_execution_providers(os.fspath(library_path)))
+
+
 class OnnxModel:
     """A generic named-tensor ONNX model session."""
 
@@ -129,16 +158,21 @@ class OnnxModel:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        providers: Sequence[str] | None = None,
+        provider_options: ProviderOptions | None = None,
     ) -> None:
         library_path = (
             Path(ort_library_path) if ort_library_path is not None else _find_ort_library()
         )
+        provider_names, options = _provider_arguments(providers, provider_options)
         self._core = _native.Model(
             os.fspath(model_path),
             os.fspath(library_path),
             intra_op_threads,
             inter_op_threads,
             log_severity,
+            provider_names,
+            options,
         )
         self._metadata = _metadata_from_native(self._core.metadata)
 
@@ -164,6 +198,8 @@ class Pipeline:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        providers: Sequence[str] | None = None,
+        provider_options: ProviderOptions | None = None,
     ) -> None:
         package = Path(package_path)
         with (package / "pipeline.json").open(encoding="utf-8") as file:
@@ -171,12 +207,15 @@ class Pipeline:
         library_path = (
             Path(ort_library_path) if ort_library_path is not None else _find_ort_library()
         )
+        provider_names, options = _provider_arguments(providers, provider_options)
         self._core = _native.Pipeline(
             os.fspath(package),
             os.fspath(library_path),
             intra_op_threads,
             inter_op_threads,
             log_severity,
+            provider_names,
+            options,
         )
         self._manifest: dict[str, Any] = self._document["manifest"]
         components = {
@@ -252,6 +291,13 @@ class Pipeline:
     @property
     def required_capabilities(self) -> tuple[str, ...]:
         return tuple(self._manifest.get("required_capabilities", ()))
+
+    @property
+    def execution_providers(self) -> Mapping[str, tuple[str, ...]]:
+        return {
+            component: tuple(providers)
+            for component, providers in self._core.execution_providers.items()
+        }
 
     def create_session(self) -> PipelineSession:
         return PipelineSession(self, self._core.create_session())
@@ -381,16 +427,21 @@ class WorldModel:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        providers: Sequence[str] | None = None,
+        provider_options: ProviderOptions | None = None,
     ) -> None:
         library_path = (
             Path(ort_library_path) if ort_library_path is not None else _find_ort_library()
         )
+        provider_names, options = _provider_arguments(providers, provider_options)
         self._core = _native.WorldModel(
             os.fspath(model_path),
             os.fspath(library_path),
             intra_op_threads,
             inter_op_threads,
             log_severity,
+            provider_names,
+            options,
         )
         self._metadata = _metadata_from_native(self._core.metadata)
 

@@ -3,7 +3,9 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "onnx_world_model/backend.hpp"
 
@@ -22,7 +24,17 @@ struct RuntimeOptions {
   int inter_op_threads{0};
   int log_severity{3};
   GraphOptimizationLevel graph_optimization{GraphOptimizationLevel::all};
+  std::vector<std::string> providers;
+  std::unordered_map<
+      std::string,
+      std::unordered_map<std::string, std::string>>
+      provider_options;
 };
+
+[[nodiscard]] std::string NormalizeExecutionProviderName(
+    std::string_view name);
+[[nodiscard]] std::vector<std::string> AvailableExecutionProviders(
+    const std::filesystem::path& ort_library_path = {});
 
 using NamedTensors = std::unordered_map<std::string, Tensor>;
 

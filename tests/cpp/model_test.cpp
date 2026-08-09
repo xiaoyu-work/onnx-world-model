@@ -72,6 +72,15 @@ int main() {
   using onnx_world_model::NamedTensors;
   using onnx_world_model::Tensor;
 
+  Check(
+      onnx_world_model::NormalizeExecutionProviderName("trt-rtx") ==
+          "nvtensorrtrtx",
+      "Mobius TRT-RTX provider alias");
+  Check(
+      onnx_world_model::NormalizeExecutionProviderName(
+          "CUDAExecutionProvider") == "cuda",
+      "ORT provider suffix normalization");
+
   Model model(std::make_shared<AddOneBackend>());
   const std::array<float, 2> values{2.0F, 4.0F};
   NamedTensors outputs = model.Run({

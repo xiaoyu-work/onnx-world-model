@@ -15,6 +15,7 @@ namespace py = pybind11;
 namespace {
 
 using onnx_world_model::DataType;
+using onnx_world_model::AvailableExecutionProviders;
 using onnx_world_model::Model;
 using onnx_world_model::ModelMetadata;
 using onnx_world_model::NamedTensors;
@@ -156,6 +157,7 @@ using onnx_world_model::WorldModel;
   py::dict result;
   result["inputs"] = std::move(inputs);
   result["outputs"] = std::move(outputs);
+  result["execution_providers"] = metadata.execution_providers;
   return result;
 }
 
@@ -216,6 +218,56 @@ using onnx_world_model::WorldModel;
   return result;
 }
 
+[[nodiscard]] RuntimeOptions RuntimeOptionsFromPython(
+    const std::string& ort_library_path,
+    int intra_op_threads,
+    int inter_op_threads,
+    int log_severity,
+    const std::vector<std::string>& providers,
+    const py::dict& provider_options) {
+  RuntimeOptions result{
+      .ort_library_path = ort_library_path,
+      .intra_op_threads = intra_op_threads,
+      .inter_op_threads = inter_op_threads,
+      .log_severity = log_severity,
+      .providers = providers,
+  };
+  for (const auto& provider : provider_options) {
+    if (!py::isinstance<py::str>(provider.first) ||
+        !py::isinstance<py::dict>(provider.second)) {
+      throw py::type_error(
+          "provider_options must map provider names to option dictionaries");
+    }
+    const std::string provider_name =
+        py::str(provider.first).cast<std::string>();
+    std::unordered_map<std::string, std::string> options;
+    for (const auto& option :
+         py::reinterpret_borrow<py::dict>(provider.second)) {
+      if (!py::isinstance<py::str>(option.first) ||
+          !(py::isinstance<py::str>(option.second) ||
+            py::isinstance<py::bool_>(option.second) ||
+            py::isinstance<py::int_>(option.second) ||
+            py::isinstance<py::float_>(option.second))) {
+        throw py::type_error(
+            "Provider option names must be strings and values must be "
+            "str, bool, int, or float");
+      }
+      std::string value;
+      if (py::isinstance<py::bool_>(option.second)) {
+        value = py::cast<bool>(option.second) ? "1" : "0";
+      } else {
+        value = py::str(option.second).cast<std::string>();
+      }
+      options.emplace(
+          py::str(option.first).cast<std::string>(),
+          std::move(value));
+    }
+    result.provider_options.emplace(
+        provider_name, std::move(options));
+  }
+  return result;
+}
+
 [[nodiscard]] py::tuple StepOutputToTuple(const StepOutput& output) {
   return py::make_tuple(
       TensorToNumpy(output.next_state),
@@ -231,6 +283,13 @@ PYBIND11_MODULE(_native, module) {
   py::register_exception<onnx_world_model::Error>(
       module,
       "WorldModelError");
+  module.def(
+      "available_execution_providers",
+      [](const std::string& ort_library_path) {
+        py::gil_scoped_release release;
+        return AvailableExecutionProviders(ort_library_path);
+      },
+      py::arg("ort_library_path"));
 
   py::class_<Model>(module, "Model")
       .def(
@@ -239,13 +298,16 @@ PYBIND11_MODULE(_native, module) {
                        const std::string& ort_library_path,
                        int intra_op_threads,
                        int inter_op_threads,
-                       int log_severity) {
-            const RuntimeOptions options{
-                .ort_library_path = ort_library_path,
-                .intra_op_threads = intra_op_threads,
-                .inter_op_threads = inter_op_threads,
-                .log_severity = log_severity,
-            };
+                       int log_severity,
+                       const std::vector<std::string>& providers,
+                       const py::dict& provider_options) {
+            RuntimeOptions options = RuntimeOptionsFromPython(
+                ort_library_path,
+                intra_op_threads,
+                inter_op_threads,
+                log_severity,
+                providers,
+                provider_options);
             py::gil_scoped_release release;
             return Model::Load(model_path, options);
           }),
@@ -253,7 +315,9 @@ PYBIND11_MODULE(_native, module) {
           py::arg("ort_library_path"),
           py::arg("intra_op_threads") = 0,
           py::arg("inter_op_threads") = 0,
-          py::arg("log_severity") = 3)
+          py::arg("log_severity") = 3,
+          py::arg("providers") = std::vector<std::string>{},
+          py::arg("provider_options") = py::dict())
       .def_property_readonly(
           "metadata",
           [](const Model& model) {
@@ -279,13 +343,16 @@ PYBIND11_MODULE(_native, module) {
                        const std::string& ort_library_path,
                        int intra_op_threads,
                        int inter_op_threads,
-                       int log_severity) {
-            const RuntimeOptions options{
-                .ort_library_path = ort_library_path,
-                .intra_op_threads = intra_op_threads,
-                .inter_op_threads = inter_op_threads,
-                .log_severity = log_severity,
-            };
+                       int log_severity,
+                       const std::vector<std::string>& providers,
+                       const py::dict& provider_options) {
+            RuntimeOptions options = RuntimeOptionsFromPython(
+                ort_library_path,
+                intra_op_threads,
+                inter_op_threads,
+                log_severity,
+                providers,
+                provider_options);
             py::gil_scoped_release release;
             return WorldModel::Load(model_path, options);
           }),
@@ -293,7 +360,9 @@ PYBIND11_MODULE(_native, module) {
           py::arg("ort_library_path"),
           py::arg("intra_op_threads") = 0,
           py::arg("inter_op_threads") = 0,
-          py::arg("log_severity") = 3)
+          py::arg("log_severity") = 3,
+          py::arg("providers") = std::vector<std::string>{},
+          py::arg("provider_options") = py::dict())
       .def_property_readonly(
           "metadata",
           [](const WorldModel& model) {
@@ -334,13 +403,16 @@ PYBIND11_MODULE(_native, module) {
                        const std::string& ort_library_path,
                        int intra_op_threads,
                        int inter_op_threads,
-                       int log_severity) {
-            const RuntimeOptions options{
-                .ort_library_path = ort_library_path,
-                .intra_op_threads = intra_op_threads,
-                .inter_op_threads = inter_op_threads,
-                .log_severity = log_severity,
-            };
+                       int log_severity,
+                       const std::vector<std::string>& providers,
+                       const py::dict& provider_options) {
+            RuntimeOptions options = RuntimeOptionsFromPython(
+                ort_library_path,
+                intra_op_threads,
+                inter_op_threads,
+                log_severity,
+                providers,
+                provider_options);
             py::gil_scoped_release release;
             return Pipeline::Load(package_path, options);
           }),
@@ -348,7 +420,12 @@ PYBIND11_MODULE(_native, module) {
           py::arg("ort_library_path"),
           py::arg("intra_op_threads") = 0,
           py::arg("inter_op_threads") = 0,
-          py::arg("log_severity") = 3)
+          py::arg("log_severity") = 3,
+          py::arg("providers") = std::vector<std::string>{},
+          py::arg("provider_options") = py::dict())
+      .def_property_readonly(
+          "execution_providers",
+          &Pipeline::execution_providers)
       .def(
           "create_session",
           [](const Pipeline& pipeline) {
