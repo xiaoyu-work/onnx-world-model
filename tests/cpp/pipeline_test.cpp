@@ -234,6 +234,304 @@ class AutoregressiveBackend final : public onnx_world_model::ModelBackend {
   onnx_world_model::ModelMetadata metadata_;
 };
 
+class VideoVisionBackend final : public onnx_world_model::ModelBackend {
+ public:
+  VideoVisionBackend() {
+    metadata_.inputs = {
+        {
+            .name = "pixel_values",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {8, 1},
+        },
+        {
+            .name = "grid_thw",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {3},
+        },
+    };
+    metadata_.outputs = {{
+        .name = "image_features",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {4, 2},
+    }};
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    const auto grid = inputs.at("grid_thw").values<std::int64_t>();
+    Check(
+        grid[0] == 2 && grid[1] == 2 && grid[2] == 4,
+        "video vision grid");
+    return {{
+        "image_features",
+        onnx_world_model::Tensor::Zeros(
+            onnx_world_model::DataType::float32, {4, 2}),
+    }};
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class VideoEmbeddingBackend final : public onnx_world_model::ModelBackend {
+ public:
+  VideoEmbeddingBackend() {
+    metadata_.inputs = {
+        {
+            .name = "input_ids",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {1, 7},
+        },
+        {
+            .name = "image_features",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {-1, 2},
+        },
+        {
+            .name = "video_features",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {-1, 2},
+        },
+    };
+    metadata_.outputs = {{
+        .name = "inputs_embeds",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1, 7, 2},
+    }};
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    Check(
+        inputs.at("image_features").shape()[0] == 0,
+        "video route leaves image features empty");
+    Check(
+        inputs.at("video_features").shape()[0] == 4,
+        "video route receives projected features");
+    return {{
+        "inputs_embeds",
+        onnx_world_model::Tensor::Zeros(
+            onnx_world_model::DataType::float32, {1, 7, 2}),
+    }};
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class VideoPositionBackend final : public onnx_world_model::ModelBackend {
+ public:
+  VideoPositionBackend() {
+    metadata_.inputs = {
+        {
+            .name = "inputs_embeds",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {1, 7, 2},
+        },
+        {
+            .name = "position_ids",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {3, 1, 7},
+        },
+    };
+    metadata_.outputs = {{
+        .name = "logits",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1, 7, 1},
+    }};
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    const auto positions =
+        inputs.at("position_ids").values<std::int64_t>();
+    constexpr std::array<std::int64_t, 21> expected{
+        0, 1, 1, 3, 4, 4, 6,
+        0, 1, 1, 3, 4, 4, 6,
+        0, 1, 2, 3, 4, 5, 6,
+    };
+    Check(
+        std::ranges::equal(positions, expected),
+        "frame-level video mRoPE positions");
+    return {{
+        "logits",
+        onnx_world_model::Tensor::Zeros(
+            onnx_world_model::DataType::float32, {1, 7, 1}),
+    }};
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+constexpr std::string_view kVideoRouteManifest = R"json(
+{
+  "format": "mobius-pipeline",
+  "schema_version": "1.1",
+  "manifest": {
+    "schema_version": "1.1",
+    "components": [
+      {
+        "name": "reasoner_vision_encoder",
+        "role": "encoder",
+        "run_on": "prefill",
+        "inputs": [
+          {"name": "pixel_values", "dtype": "FLOAT", "shape": [8, 1]},
+          {"name": "grid_thw", "dtype": "INT64", "shape": [3]}
+        ],
+        "outputs": [
+          {"name": "image_features", "dtype": "FLOAT", "shape": [4, 2]}
+        ],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      },
+      {
+        "name": "reasoner_embedding",
+        "role": "embedding",
+        "run_on": "always",
+        "inputs": [
+          {"name": "input_ids", "dtype": "INT64", "shape": [1, 7]},
+          {"name": "image_features", "dtype": "FLOAT", "shape": ["image", 2]},
+          {"name": "video_features", "dtype": "FLOAT", "shape": ["video", 2]}
+        ],
+        "outputs": [
+          {"name": "inputs_embeds", "dtype": "FLOAT", "shape": [1, 7, 2]}
+        ],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      },
+      {
+        "name": "reasoner_decoder",
+        "role": "decoder",
+        "run_on": "decode",
+        "inputs": [
+          {"name": "inputs_embeds", "dtype": "FLOAT", "shape": [1, 7, 2]},
+          {"name": "position_ids", "dtype": "INT64", "shape": [3, 1, 7]}
+        ],
+        "outputs": [
+          {"name": "logits", "dtype": "FLOAT", "shape": [1, 7, 1]}
+        ],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      }
+    ],
+    "connections": [
+      {
+        "source": "reasoner_vision_encoder.image_features",
+        "target": "reasoner_embedding.image_features"
+      },
+      {
+        "source": "reasoner_embedding.inputs_embeds",
+        "target": "reasoner_decoder.inputs_embeds"
+      }
+    ],
+    "stages": [
+      {
+        "name": "reasoner_prompt",
+        "kind": "single_pass",
+        "components": [
+          "reasoner_vision_encoder",
+          "reasoner_embedding"
+        ],
+        "run_on": "prefill"
+      },
+      {
+        "name": "reasoner_decode",
+        "kind": "autoregressive",
+        "components": [
+          "reasoner_embedding",
+          "reasoner_decoder"
+        ],
+        "run_on": "decode",
+        "options": {
+          "tokenizer_asset": "tokenizer.json",
+          "sampling": {"do_sample": false},
+          "stop": {"kind": "token_ids", "eos_token_ids": [0]},
+          "max_tokens": {"default": 1, "limit": 1},
+          "state_names": []
+        }
+      }
+    ],
+    "inputs": [
+      {
+        "port": "reasoner_vision_encoder.pixel_values",
+        "kind": "external",
+        "semantic": "vision.pixel_values",
+        "required": true
+      },
+      {
+        "port": "reasoner_vision_encoder.grid_thw",
+        "kind": "external",
+        "semantic": "vision.grid_thw",
+        "required": true
+      },
+      {
+        "port": "reasoner_embedding.input_ids",
+        "kind": "external",
+        "semantic": "text.token_ids",
+        "required": true
+      },
+      {
+        "port": "reasoner_embedding.video_features",
+        "kind": "external",
+        "semantic": "vision.video_features",
+        "required": false,
+        "presence": "video_understanding"
+      },
+      {
+        "port": "reasoner_decoder.position_ids",
+        "kind": "generated",
+        "semantic": "position.multimodal",
+        "generator": {
+          "kind": "multimodal_position_ids",
+          "parameters": {
+            "source": "reasoner_embedding.input_ids",
+            "axes": 3
+          }
+        }
+      }
+    ],
+    "outputs": [{"port": "reasoner_decoder.logits"}],
+    "profile": {"name": "video-test", "version": "1.0"},
+    "required_capabilities": ["position_program"],
+    "assets": [{"path": "tokenizer.json"}],
+    "metadata": {
+      "vision_understanding": {
+        "encoder": "reasoner_vision_encoder",
+        "tokens": {"image": 19, "video": 18},
+        "routing": {
+          "image": "reasoner_embedding.image_features",
+          "video": "reasoner_embedding.video_features"
+        },
+        "preprocessing": {
+          "patchify": {"merge_size": 2}
+        }
+      }
+    }
+  },
+  "component_files": {
+    "reasoner_decoder": "reasoner_decoder/model.onnx",
+    "reasoner_embedding": "reasoner_embedding/model.onnx",
+    "reasoner_vision_encoder": "reasoner_vision_encoder/model.onnx"
+  }
+}
+)json";
+
 constexpr std::string_view kManifest = R"json(
 {
   "format": "mobius-pipeline",
@@ -568,6 +866,73 @@ int main(int argument_count, char** arguments) {
   Check(
       stage_outputs.at("output").values<float>()[1] == 4.0F,
       "single-pass pipeline execution");
+
+  PipelineManifest video_manifest =
+      PipelineManifest::Parse(kVideoRouteManifest);
+  std::unordered_map<std::string, Model> video_models;
+  video_models.emplace(
+      "reasoner_vision_encoder",
+      Model(std::make_shared<VideoVisionBackend>()));
+  video_models.emplace(
+      "reasoner_embedding",
+      Model(std::make_shared<VideoEmbeddingBackend>()));
+  video_models.emplace(
+      "reasoner_decoder",
+      Model(std::make_shared<VideoPositionBackend>()));
+  onnx_world_model::Pipeline video_pipeline(
+      PipelinePackage({}, video_manifest, std::move(video_models)));
+  auto video_session = video_pipeline.CreateSession();
+  const std::array<std::int64_t, 3> video_grid{2, 2, 4};
+  const std::array<std::int64_t, 7> video_ids{
+      100, 18, 18, 101, 18, 18, 102};
+  onnx_world_model::PipelineRunOptions video_options;
+  video_options.strings.emplace("vision_modality", "video");
+  (void)video_session.RunStage(
+      "reasoner_prompt",
+      {
+          {
+              "vision.pixel_values",
+              onnx_world_model::Tensor::Zeros(
+                  onnx_world_model::DataType::float32, {8, 1}),
+          },
+          {
+              "vision.grid_thw",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {3}, std::span(video_grid)),
+          },
+          {
+              "text.token_ids",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {1, 7}, std::span(video_ids)),
+          },
+      },
+      {
+          {
+              "reasoner_embedding.image_features",
+              onnx_world_model::Tensor::Zeros(
+                  onnx_world_model::DataType::float32, {0, 2}),
+          },
+      },
+      video_options);
+  auto video_outputs = video_session.RunStage(
+      "reasoner_decode",
+      {},
+      {
+          {
+              "reasoner_embedding.image_features",
+              onnx_world_model::Tensor::Zeros(
+                  onnx_world_model::DataType::float32, {0, 2}),
+          },
+          {
+              "reasoner_embedding.video_features",
+              onnx_world_model::Tensor::Zeros(
+                  onnx_world_model::DataType::float32, {0, 2}),
+          },
+      });
+  Check(
+      video_outputs.at("logits").shape() ==
+          std::vector<std::int64_t>({1, 7, 1}),
+      "video understanding stage output");
 
   PipelineManifest state_manifest =
       PipelineManifest::Parse(kStateManifest);

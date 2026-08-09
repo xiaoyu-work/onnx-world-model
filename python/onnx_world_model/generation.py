@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ._api import Pipeline, ProviderOptions
-from .preprocessing import RawImage, WorldModelPreprocessor
+from .preprocessing import RawImage, RawVideo, WorldModelPreprocessor
 
 
 @dataclass(frozen=True)
@@ -114,6 +114,7 @@ class LLM:
         prompt: str,
         image: RawImage | None = None,
         *,
+        video: RawVideo | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 64,
         do_sample: bool = False,
@@ -123,7 +124,12 @@ class LLM:
         repetition_penalty: float = 1.0,
         seed: int | None = None,
         thinking: bool = False,
+        video_fps: float | None = None,
+        video_num_frames: int | None = None,
+        video_sample_fps: float | None = None,
     ) -> LLMOutput:
+        if image is not None and video is not None:
+            raise ValueError("image and video are mutually exclusive")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if temperature <= 0:
@@ -147,9 +153,13 @@ class LLM:
         return self._runtime.generate_text(
             prompt,
             image,
+            video,
             system_prompt=system_prompt,
             thinking=thinking,
             options=options,
+            video_fps=video_fps,
+            video_num_frames=video_num_frames,
+            video_sample_fps=video_sample_fps,
         )
 
 
@@ -296,40 +306,98 @@ class _GenerationRuntime:
         self,
         prompt: str,
         image: RawImage | None,
+        video: RawVideo | None,
         *,
         system_prompt: str | None,
         thinking: bool,
         options: Mapping[str, bool | int | float | str],
+        video_fps: float | None,
+        video_num_frames: int | None,
+        video_sample_fps: float | None,
     ) -> LLMOutput:
         if self.reasoner_decode_stage is None:
             raise RuntimeError("This package has no LLM generation stage")
         session = self.pipeline.create_session()
         timings: dict[str, float] = {}
-        prepared = self.preprocessor.prepare_reasoner(
-            prompt,
-            image,
-            system_prompt=system_prompt,
-            enable_thinking=thinking,
-        )
+        if video is not None:
+            if self.reasoner_prompt_stage is None:
+                raise RuntimeError("This package has no visual LLM prefill stage")
+            prepared_video = self.preprocessor.prepare_video_reasoner(
+                prompt,
+                video,
+                system_prompt=system_prompt,
+                enable_thinking=thinking,
+                source_fps=video_fps,
+                num_frames=video_num_frames,
+                fps=video_sample_fps,
+            )
+            started = time.perf_counter()
+            overrides: dict[str, NDArray[Any]] = {}
+            empty_image = self.preprocessor.empty_image_features()
+            if empty_image is not None:
+                overrides["reasoner_embedding.image_features"] = empty_image
+            session.run_stage(
+                self.reasoner_prompt_stage,
+                prepared_video.pipeline_inputs(),
+                overrides=overrides,
+                options={"vision_modality": "video"},
+            )
+            timings["prefill"] = time.perf_counter() - started
+            decode_inputs = None
+            overrides = {}
+            empty_image = self.preprocessor.empty_image_features()
+            empty_video = self.preprocessor.empty_video_features()
+            if empty_image is not None:
+                overrides["reasoner_embedding.image_features"] = empty_image
+            if empty_video is not None:
+                overrides["reasoner_embedding.video_features"] = empty_video
+            if not overrides:
+                overrides = None
+        else:
+            prepared = self.preprocessor.prepare_reasoner(
+                prompt,
+                image,
+                system_prompt=system_prompt,
+                enable_thinking=thinking,
+            )
         if image is not None:
             if self.reasoner_prompt_stage is None:
                 raise RuntimeError("This package has no visual LLM prefill stage")
             started = time.perf_counter()
+            empty_video = self.preprocessor.empty_video_features()
             session.run_stage(
                 self.reasoner_prompt_stage,
                 prepared.pipeline_inputs(),
+                overrides=(
+                    None
+                    if empty_video is None
+                    else {
+                        "reasoner_embedding.video_features": empty_video
+                    }
+                ),
             )
             timings["prefill"] = time.perf_counter() - started
             decode_inputs = None
-            overrides = None
-        else:
+            overrides = {}
+            empty_image = self.preprocessor.empty_image_features()
+            empty_video = self.preprocessor.empty_video_features()
+            if empty_image is not None:
+                overrides["reasoner_embedding.image_features"] = empty_image
+            if empty_video is not None:
+                overrides["reasoner_embedding.video_features"] = empty_video
+            if not overrides:
+                overrides = None
+        elif video is None:
             decode_inputs = {"text.token_ids": prepared.input_ids}
-            empty_features = self.preprocessor.empty_image_features()
-            overrides = (
-                None
-                if empty_features is None
-                else {"reasoner_embedding.image_features": empty_features}
-            )
+            overrides = {}
+            empty_image = self.preprocessor.empty_image_features()
+            empty_video = self.preprocessor.empty_video_features()
+            if empty_image is not None:
+                overrides["reasoner_embedding.image_features"] = empty_image
+            if empty_video is not None:
+                overrides["reasoner_embedding.video_features"] = empty_video
+            if not overrides:
+                overrides = None
         started = time.perf_counter()
         generated = session.run_stage(
             self.reasoner_decode_stage,

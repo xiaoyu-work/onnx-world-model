@@ -1706,6 +1706,115 @@ struct PipelineSession::Impl {
             continue;
           }
 
+          const Json metadata = Json::parse(manifest().metadata_json());
+          const auto grid_value =
+              endpoint_values.find("reasoner_vision_encoder.grid_thw");
+          if (metadata.contains("vision_understanding") &&
+              metadata.at("vision_understanding").contains("tokens") &&
+              metadata.at("vision_understanding").contains("preprocessing") &&
+              metadata.at("vision_understanding")
+                  .at("preprocessing")
+                  .contains("patchify") &&
+              grid_value != endpoint_values.end() &&
+              grid_value->second.data_type() == DataType::int64 &&
+              grid_value->second.element_count() == 3) {
+            const Json& understanding =
+                metadata.at("vision_understanding");
+            const Json& tokens = understanding.at("tokens");
+            const std::int64_t image_token =
+                tokens.value("image", std::int64_t{-1});
+            const std::int64_t video_token =
+                tokens.value("video", std::int64_t{-1});
+            const std::int64_t merge =
+                understanding.at("preprocessing")
+                    .at("patchify")
+                    .value("merge_size", 1);
+            const auto raw_grid =
+                grid_value->second.values<std::int64_t>();
+            if (merge <= 0 || raw_grid[0] <= 0 || raw_grid[1] <= 0 ||
+                raw_grid[2] <= 0 || raw_grid[1] % merge != 0 ||
+                raw_grid[2] % merge != 0) {
+              ExecutionError("Vision grid_thw is incompatible with merge size");
+            }
+            const std::size_t grid_time =
+                static_cast<std::size_t>(raw_grid[0]);
+            const std::size_t grid_height =
+                static_cast<std::size_t>(raw_grid[1] / merge);
+            const std::size_t grid_width =
+                static_cast<std::size_t>(raw_grid[2] / merge);
+            const std::size_t spatial_tokens = grid_height * grid_width;
+            std::size_t position = 0;
+            std::int64_t current_position = 0;
+            std::size_t video_spans = 0;
+            while (position < length) {
+              const std::int64_t token_id =
+                  ids[batch_offset + position];
+              const bool is_image = token_id == image_token;
+              const bool is_video = token_id == video_token;
+              if (!is_image && !is_video) {
+                const std::size_t start = position;
+                while (position < length) {
+                  const std::int64_t next_id =
+                      ids[batch_offset + position];
+                  if (next_id == image_token || next_id == video_token) {
+                    break;
+                  }
+                  ++position;
+                }
+                for (std::size_t index = start; index < position; ++index) {
+                  for (std::int64_t axis = 0; axis < axes; ++axis) {
+                    values[static_cast<std::size_t>(axis) * axis_stride +
+                           batch_offset + index] =
+                        current_position +
+                        static_cast<std::int64_t>(index - start);
+                  }
+                }
+                current_position +=
+                    static_cast<std::int64_t>(position - start);
+                continue;
+              }
+
+              const std::size_t start = position;
+              while (position < length &&
+                     ids[batch_offset + position] == token_id) {
+                ++position;
+              }
+              const std::size_t count = position - start;
+              if (spatial_tokens == 0 || count % spatial_tokens != 0) {
+                ExecutionError(
+                    "Visual token span does not match vision grid_thw");
+              }
+              const std::size_t span_time = count / spatial_tokens;
+              if (is_video && span_time != 1) {
+                ExecutionError(
+                    "Video position indexing requires one token span per frame");
+              }
+              if (is_video) {
+                ++video_spans;
+              }
+              for (std::size_t index = 0; index < count; ++index) {
+                const std::size_t time = index / spatial_tokens;
+                const std::size_t spatial = index % spatial_tokens;
+                values[batch_offset + start + index] =
+                    current_position + static_cast<std::int64_t>(time);
+                values[axis_stride + batch_offset + start + index] =
+                    current_position +
+                    static_cast<std::int64_t>(spatial / grid_width);
+                values[2 * axis_stride + batch_offset + start + index] =
+                    current_position +
+                    static_cast<std::int64_t>(spatial % grid_width);
+              }
+              current_position += static_cast<std::int64_t>(
+                  std::max({span_time, grid_height, grid_width}));
+            }
+            if (video_spans != 0 && video_spans != grid_time) {
+              ExecutionError(
+                  "Video token span count does not match vision grid time");
+            }
+            cursors[batch_index] = current_position;
+            continue;
+          }
+
           std::size_t visual_count = 0;
           if (image_features != endpoint_values.end() &&
               !image_features->second.shape().empty()) {
@@ -1734,14 +1843,13 @@ struct PipelineSession::Impl {
           std::size_t grid_height = static_cast<std::size_t>(
               std::sqrt(static_cast<double>(visual_count)));
           std::size_t grid_width = grid_height;
-          const auto grid_value =
+          const auto fallback_grid_value =
               endpoint_values.find("reasoner_vision_encoder.grid_thw");
-          if (grid_value != endpoint_values.end() &&
-              grid_value->second.data_type() == DataType::int64 &&
-              grid_value->second.element_count() == 3) {
+          if (fallback_grid_value != endpoint_values.end() &&
+              fallback_grid_value->second.data_type() == DataType::int64 &&
+              fallback_grid_value->second.element_count() == 3) {
             const auto raw_grid =
-                grid_value->second.values<std::int64_t>();
-            const Json metadata = Json::parse(manifest().metadata_json());
+                fallback_grid_value->second.values<std::int64_t>();
             const std::int64_t merge =
                 metadata.contains("vision_understanding")
                     ? metadata.at("vision_understanding")
@@ -2068,7 +2176,7 @@ struct PipelineSession::Impl {
               for (std::int64_t patch_y = 0; patch_y < patch; ++patch_y) {
                 for (std::int64_t channel = 0; channel < channels; ++channel) {
                   const std::int64_t packed_channel =
-                      (patch_x * patch + patch_y) * channels + channel;
+                      (patch_y * patch + patch_x) * channels + channel;
                   const std::size_t source_index =
                       static_cast<std::size_t>(
                           token * packed.shape()[1] + packed_channel);
@@ -2299,6 +2407,29 @@ struct PipelineSession::Impl {
       case PipelineInputKind::external: {
         const auto found = external_values.find(endpoint.qualified());
         if (found == external_values.end()) {
+          const auto modality = options.strings.find("vision_modality");
+          if (modality != options.strings.end()) {
+            const Json metadata = Json::parse(manifest().metadata_json());
+            if (metadata.contains("vision_understanding")) {
+              const Json& understanding =
+                  metadata.at("vision_understanding");
+              const Json& routing = understanding.at("routing");
+              const auto target = routing.find(modality->second);
+              if (target != routing.end() && target->is_string() &&
+                  target->get<std::string>() == endpoint.qualified()) {
+                const std::string encoder =
+                    understanding.at("encoder").get<std::string>();
+                const auto features =
+                    endpoint_values.find(encoder + ".image_features");
+                if (features == endpoint_values.end()) {
+                  ExecutionError(
+                      "Vision feature route is unavailable for modality '" +
+                      modality->second + "'");
+                }
+                return features->second;
+              }
+            }
+          }
           if (!declaration->required) {
             const TensorSpec& spec = manifest().Input(endpoint);
             std::vector<std::int64_t> shape = spec.shape;
@@ -2368,6 +2499,20 @@ struct PipelineSession::Impl {
       const PipelineComponent& component =
           manifest().Component(component_name);
       if (!ComponentPresent(component)) {
+        continue;
+      }
+      const bool reuse_prefill_embedding =
+          stage.kind == "autoregressive" &&
+          stage_iterations[stage.name] == 0 &&
+          inputs.empty() &&
+          component.role == "embedding" &&
+          std::ranges::all_of(
+              component.metadata.outputs,
+              [this, &component](const TensorSpec& output) {
+                return endpoint_values.contains(
+                    component.name + "." + output.name);
+              });
+      if (reuse_prefill_embedding) {
         continue;
       }
       NamedTensors model_inputs;

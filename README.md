@@ -97,6 +97,14 @@ answer = model.llm.generate(
 )
 print(answer.text)
 
+# Video understanding uses the same LLM interface.
+summary = model.llm.generate(
+    "Summarize what happens in this video.",
+    video="clip.mp4",
+    max_tokens=128,
+)
+print(summary.text)
+
 # Video generation.
 video = model.video.generate(
     "A robot moves the red block to the left.",
@@ -132,9 +140,15 @@ The modality objects are also public (`LLM`, `ImageGenerator`,
 loaded `WorldModel` so component sessions and preprocessing assets are shared.
 
 Raw `image=` belongs to `model.llm.generate()` and conditions the visual
-Reasoner. World generation currently starts from packed Gaussian noise, or
-from explicitly supplied initial latent tensors. Image-to-video conditioning
-is not silently inferred from an image; it requires the model-specific VAE
+Reasoner. `video=` accepts a video path, a frame sequence, or a
+`[T,H,W,C]`/`[T,C,H,W]` NumPy array. Packages with a declared video-
+understanding contract apply frame sampling, timestamps, packed patchification,
+video-token expansion, and `grid_thw` automatically. `image` and `video` are
+mutually exclusive in one request.
+
+World generation currently starts from packed Gaussian noise, or from
+explicitly supplied initial latent tensors. Image-to-video conditioning is not
+silently inferred from an image; it requires the model-specific VAE
 conditioning/masking contract.
 
 Results retain model-boundary array layouts:
@@ -178,11 +192,11 @@ print(world.options)
 ```
 
 `TextPreprocessor`, `ImagePreprocessor`, `PackedImagePreprocessor`,
-`PreparedReasonerInputs`, and `PreparedWorldInputs` are also public for
-applications that want to replace only part of the preprocessing stack. The
-processor supports both fixed NCHW vision graphs and Mobius's variable-
-resolution Cosmos3 Edge contract (`smart_resize` + block-major patchification
-+ `grid_thw`).
+`PackedVideoPreprocessor`, `PreparedReasonerInputs`, `PreparedVideo`, and
+`PreparedWorldInputs` are also public for applications that want to replace
+only part of the preprocessing stack. The processor supports fixed NCHW image
+graphs and Mobius's variable-resolution Cosmos3 Edge image/video contract
+(`smart_resize` + frame sampling + block-major patchification + `grid_thw`).
 
 ## Python pipeline API
 
@@ -454,9 +468,9 @@ NamedTensors outputs = session.RunStage(
   at component boundaries.
 - The high-level Python layer supports exported chat templates, fast
   tokenizers, fixed NCHW and variable-resolution packed image preprocessing,
-  one-image placeholder expansion, text decoding, packed Gaussian world-state
-  initialization, domain-aware action slicing, and automatic stage/state
-  lifecycle.
+  video path/array decoding, frame sampling, image/video placeholder
+  expansion, text decoding, packed Gaussian world-state initialization,
+  domain-aware action slicing, and automatic stage/state lifecycle.
 - Dense tensor inputs and outputs, including FP16 and BF16 host transforms.
 - Single-pass, on-demand, state-transition, iterative, and autoregressive
   stages.

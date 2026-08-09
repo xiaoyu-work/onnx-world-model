@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import imageio.v3 as iio
 import ml_dtypes
 import numpy as np
 import pytest
@@ -116,6 +117,11 @@ def preprocessing_package(tmp_path: Path) -> Path:
                             "name": "image_features",
                             "dtype": "FLOAT",
                             "shape": ["features", 8],
+                        },
+                        {
+                            "name": "video_features",
+                            "dtype": "FLOAT",
+                            "shape": ["video_features", 8],
                         },
                     ],
                     "outputs": [],
@@ -498,6 +504,128 @@ def test_prepares_supported_packed_vision_input(
     assert "vision.grid_thw" in prepared.pipeline_inputs()
 
 
+def test_prepares_video_understanding_input(
+    preprocessing_package: Path,
+) -> None:
+    path = preprocessing_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    vision = next(
+        component
+        for component in document["manifest"]["components"]
+        if component["name"] == "reasoner_vision_encoder"
+    )
+    vision["inputs"] = [
+        {"name": "pixel_values", "dtype": "FLOAT", "shape": ["patches", 48]},
+        {"name": "grid_thw", "dtype": "INT64", "shape": [3]},
+    ]
+    vision["outputs"][0]["shape"] = ["features", 8]
+    document["manifest"]["inputs"].append(
+        {
+            "port": "reasoner_vision_encoder.grid_thw",
+            "kind": "external",
+            "semantic": "vision.grid_thw",
+        }
+    )
+    document["manifest"]["metadata"]["vision_understanding"] = {
+        "routing": {
+            "image": "reasoner_embedding.image_features",
+            "video": "reasoner_embedding.video_features",
+        },
+        "preprocessing": {
+            "image_processor_asset": "preprocessor_config.json",
+            "video_processor_asset": "video_preprocessor_config.json",
+            "resize": (
+                "smart_resize_area_bounded_multiple_of_patch_times_merge"
+            ),
+            "normalize": {
+                "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5],
+            },
+            "video_frame_sampling": {
+                "fps": 2,
+                "min_frames": 4,
+                "max_frames": 8,
+            },
+            "patchify": {
+                "layout": "time_major_block_major",
+                "patch_value_order": "patch_height_patch_width_channel",
+                "patch_size": 4,
+                "merge_size": 2,
+                "temporal_patch_size": 1,
+            },
+        },
+    }
+    for filename, shortest, longest in (
+        ("preprocessor_config.json", 16 * 16, 64 * 64),
+        ("video_preprocessor_config.json", 4 * 16 * 16, 8 * 64 * 64),
+    ):
+        (preprocessing_package / filename).write_text(
+            json.dumps(
+                {
+                    "size": {
+                        "shortest_edge": shortest,
+                        "longest_edge": longest,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    (preprocessing_package / "config.json").write_text(
+        json.dumps(
+            {
+                "image_token_id": 4,
+                "video_token_id": 10,
+                "vision_start_token_id": 3,
+                "vision_end_token_id": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer = Tokenizer.from_file(
+        str(preprocessing_package / "tokenizer.json")
+    )
+    tokenizer.add_tokens(["<|video_pad|>", "<0.0 seconds>"])
+    tokenizer.save(str(preprocessing_package / "tokenizer.json"))
+    template = (
+        preprocessing_package / "chat_template.jinja"
+    ).read_text(encoding="utf-8")
+    template = template.replace(
+        "{% if messages[-1].content is string %}",
+        "{% if messages[-1].content is string %}",
+    ).replace(
+        "{% if item.type == 'image' %}<|vision_start|><|image_pad|>"
+        "<|vision_end|>{% elif item.type == 'text' %}",
+        "{% if item.type == 'image' %}<|vision_start|><|image_pad|>"
+        "<|vision_end|>{% elif item.type == 'video' %}"
+        "<|vision_start|><|video_pad|><|vision_end|>"
+        "{% elif item.type == 'text' %}",
+    )
+    (preprocessing_package / "chat_template.jinja").write_text(
+        template, encoding="utf-8"
+    )
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(preprocessing_package)
+    frames = np.zeros((4, 16, 16, 3), dtype=np.uint8)
+
+    prepared = preprocessor.prepare_video_reasoner(
+        "cat", frames, source_fps=2, num_frames=4
+    )
+
+    assert prepared.sampled_frames == 4
+    assert prepared.grid_thw.tolist() == [4, 4, 4]
+    assert prepared.pixel_values.shape == (64, 48)
+    assert prepared.token_count == 16
+    assert prepared.features_target == "reasoner_embedding.video_features"
+
+    video_path = preprocessing_package / "test.mp4"
+    iio.imwrite(video_path, frames, fps=2)
+    from_path = preprocessor.prepare_video_reasoner(
+        "cat", video_path, num_frames=4
+    )
+    assert from_path.sampled_frames == 4
+    assert from_path.grid_thw.tolist() == [4, 4, 4]
+
+
 class _FakeSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -631,6 +759,38 @@ def test_llm_generate_preprocesses_and_decodes(
     assert fake.session.released == ["reasoner_decode"]
     reasoner_inputs = fake.session.calls[0][1]["inputs"]
     assert reasoner_inputs["vision.pixel_values"].shape == (1, 3, 32, 32)
+
+
+def test_llm_generate_accepts_video(
+    preprocessing_package: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reuse the packed video contract fixture setup.
+    test_prepares_video_understanding_input(preprocessing_package)
+    monkeypatch.setattr(generation, "Pipeline", _FakePipeline)
+    model = WorldModel(preprocessing_package)
+    frames = np.zeros((4, 16, 16, 3), dtype=np.uint8)
+
+    output = model.llm.generate(
+        "cat",
+        video=frames,
+        video_fps=2,
+        video_num_frames=4,
+        max_tokens=2,
+    )
+
+    assert output.text == "answer"
+    fake = _FakePipeline.last_instance
+    assert fake is not None
+    prefill = fake.session.calls[0]
+    assert prefill[0] == "reasoner_prompt"
+    assert prefill[1]["inputs"]["vision.pixel_values"].shape == (64, 48)
+    assert prefill[1]["inputs"]["vision.grid_thw"].tolist() == [4, 4, 4]
+    assert (
+        prefill[1]["overrides"]["reasoner_embedding.image_features"].shape
+        == (0, 8)
+    )
+    assert prefill[1]["options"] == {"vision_modality": "video"}
 
 
 def test_video_and_action_generators_return_modality_outputs(
