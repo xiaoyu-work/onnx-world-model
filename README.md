@@ -43,14 +43,15 @@ C++ API / CLI ─────────┤                  │
                        │                  ├─ generated-input programs
                        │                  ├─ stage strategies and schedulers
                        │                  └─ per-trajectory recurrent state
-                       └─ WorldModel / Rollout compatibility API
+                       └─ LatentDynamicsModel / Rollout compatibility API
 ```
 
 - `Model` runs any ONNX graph using named tensors.
 - `Pipeline` owns immutable component sessions and can be shared by callers.
 - `PipelineSession` owns one request/trajectory's KV cache, diffusion latent,
   action state, outputs, and stage cursors.
-- `WorldModel` and `Rollout` preserve the original latent-dynamics API.
+- `LatentDynamicsModel` and `Rollout` preserve the original fixed
+  latent-dynamics API.
 - `Tensor` has value semantics with copy-on-write storage.
 - ORT is loaded dynamically, so the library does not link to one ORT binary.
 
@@ -72,85 +73,78 @@ The build SHA256-verifies downloaded ONNX Runtime 1.28 and nlohmann/json
 headers. Offline builds can set `ONNXRUNTIME_INCLUDE_DIR` and
 `NLOHMANN_JSON_INCLUDE_DIR`.
 
-## High-level Python API
+## Generation API
 
-The high-level API accepts raw text and images, applies the package's
-tokenizer/chat template and image processor, manages stages and recurrent
-state, and returns structured results. It is intentionally a separate layer
-over the tensor-oriented `Pipeline` API:
+`WorldModel` is the public generation entry point. APIs are grouped by
+modality; each modality uses `generate()` and returns its own output type:
 
 ```python
-from onnx_world_model.high_level import (
-    TextGenerationConfig,
-    WorldGenerationConfig,
-    WorldModel,
-)
+from onnx_world_model import WorldModel
 
-model = WorldModel.load(
+model = WorldModel.from_pretrained(
     "output/cosmos3-edge",
     providers=["cuda", "cpu"],
     provider_options={"cuda": {"device_id": 0}},
 )
+print(model.capabilities)  # ("llm", "image", "video", "action")
 
-# Raw prompt -> tokenizer/chat template -> Reasoner -> decoded text.
-answer = model.respond(
+# LLM / visual-language generation.
+answer = model.llm.generate(
     "What is shown in this image?",
     image="frame.png",
-    config=TextGenerationConfig(
-        max_tokens=64,
-        do_sample=False,
-    ),
+    max_tokens=64,
+    do_sample=False,
 )
 print(answer.text)
 
-# Raw prompt -> packed noise -> iterative scheduler -> VAE -> NCTHW video.
-prediction = model.generate_world(
+# Video generation.
+video = model.video.generate(
     "A robot moves the red block to the left.",
-    outputs=("action", "video"),
-    config=WorldGenerationConfig(
-        frames=17,
-        height=256,
-        width=256,
-        num_inference_steps=50,
-        action_steps=16,
-        action_domain="droid_lerobot",
-        seed=1234,
-    ),
+    frames=17,
+    height=256,
+    width=256,
+    num_inference_steps=50,
+    seed=1234,
 )
-print(prediction.action.shape)
-print(prediction.video.shape)
-print(prediction.timings)
-```
+print(video.video.shape)
 
-The top-level alias is `HighLevelWorldModel`; the existing top-level
-`WorldModel` remains the backward-compatible latent-dynamics class:
-
-```python
-from onnx_world_model import HighLevelWorldModel
-```
-
-`WorldModel.generate()` can request `"text"`, `"action"`, and/or `"video"`:
-
-```python
-result = model.generate(
-    "Explain what happens next.",
-    outputs=("text",),
+# Action generation.
+action = model.action.generate(
+    "Move the red block to the left.",
+    domain="droid_lerobot",
+    steps=16,
+    num_inference_steps=50,
+    seed=1234,
 )
+print(action.actions.shape)
+
+# Image generation for packages whose VAE supports one latent frame.
+image = model.image.generate(
+    "A red robot on a white background.",
+    height=256,
+    width=256,
+)
+print(image.images.shape)
 ```
 
-Raw `image=` currently conditions only the visual Reasoner. It is not silently
-used as image-to-video or policy conditioning: requesting world/action output
-with `image=` raises until the model-specific VAE conditioning/masking contract
-is implemented. World generation currently starts from packed Gaussian noise,
-or from explicitly supplied `initial_vision_tokens` and
-`initial_action_tokens`.
+The modality objects are also public (`LLM`, `ImageGenerator`,
+`VideoGenerator`, and `ActionGenerator`), but they normally come from one
+loaded `WorldModel` so component sessions and preprocessing assets are shared.
+
+Raw `image=` belongs to `model.llm.generate()` and conditions the visual
+Reasoner. World generation currently starts from packed Gaussian noise, or
+from explicitly supplied initial latent tensors. Image-to-video conditioning
+is not silently inferred from an image; it requires the model-specific VAE
+conditioning/masking contract.
 
 Results retain model-boundary array layouts:
 
-- `text` is decoded text and `token_ids` is `[batch, generated_tokens]`;
-- `action` is sliced from the padded action state to the selected domain's raw
-  width;
-- `video` is a float NCTHW array and still needs application-specific
+- `LLMOutput.text` is decoded text and `token_ids` is
+  `[batch, generated_tokens]`;
+- `ActionOutput.actions` is sliced from padded action state to the selected
+  domain's raw width;
+- `ImageOutput.images` is float NCHW;
+- `VideoOutput.video` is float NCTHW and still needs application-specific
   clipping/range conversion and encoding.
 
 ### Standalone preprocessing
@@ -174,7 +168,9 @@ world = processor.prepare_world(
     frames=17,
     height=256,
     width=256,
+    action_steps=16,
     action_domain="droid_lerobot",
+    include_action=True,
     seed=1234,
 )
 print(world.vision_tokens.shape)
@@ -236,7 +232,8 @@ provider is skipped only when a later requested fallback is available, so
 Use an ORT build or wheel that contains the requested EP—changing
 `ort_library_path` alone does not add an EP to a CPU-only runtime.
 
-`OnnxModel` and `WorldModel` accept the same arguments and default to CPU:
+`OnnxModel` and `LatentDynamicsModel` accept the same arguments and default to
+CPU. The generation `WorldModel` follows `Pipeline` provider selection:
 
 ```python
 model = OnnxModel(
@@ -396,15 +393,19 @@ observation + action + state
 ```
 
 ```python
-from onnx_world_model import WorldModel
+from onnx_world_model import LatentDynamicsModel
 
-model = WorldModel("model.onnx")
+model = LatentDynamicsModel("model.onnx")
 result = model.step(observation, action, state)
 
 rollout = model.create_rollout()
 result = rollout.step(observation, action)
 rollout.reset(batch_size=1)
 ```
+
+`LegacyWorldModel` is an explicit compatibility alias for
+`LatentDynamicsModel`; `WorldModel` now consistently means the generation
+package API.
 
 The CLI continues to inspect and execute this compatibility contract:
 

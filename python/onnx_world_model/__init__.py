@@ -1,4 +1,6 @@
 from onnx_world_model._api import (
+    LatentDynamicsModel,
+    LegacyWorldModel,
     ModelMetadata,
     OnnxModel,
     Pipeline,
@@ -9,16 +11,20 @@ from onnx_world_model._api import (
     Rollout,
     StepResult,
     TensorSpec,
-    WorldModel,
     WorldModelPipeline,
     available_execution_providers,
 )
 from onnx_world_model._native import WorldModelError
-from onnx_world_model.high_level import (
-    HighLevelWorldModel,
-    TextGenerationConfig,
-    WorldGenerationConfig,
-    WorldModelResult,
+from onnx_world_model.generation import (
+    LLM,
+    ActionGenerator,
+    ActionOutput,
+    ImageGenerator,
+    ImageOutput,
+    LLMOutput,
+    VideoGenerator,
+    VideoOutput,
+    WorldModel,
 )
 from onnx_world_model.preprocessing import (
     ImagePreprocessor,
@@ -31,8 +37,15 @@ from onnx_world_model.preprocessing import (
 )
 
 __all__ = [
-    "HighLevelWorldModel",
+    "LLM",
+    "ActionGenerator",
+    "ActionOutput",
+    "ImageGenerator",
+    "ImageOutput",
     "ImagePreprocessor",
+    "LLMOutput",
+    "LatentDynamicsModel",
+    "LegacyWorldModel",
     "ModelMetadata",
     "OnnxModel",
     "PackedImage",
@@ -47,13 +60,12 @@ __all__ = [
     "Rollout",
     "StepResult",
     "TensorSpec",
-    "TextGenerationConfig",
     "TextPreprocessor",
-    "WorldGenerationConfig",
+    "VideoGenerator",
+    "VideoOutput",
     "WorldModel",
     "WorldModelError",
     "WorldModelPipeline",
     "WorldModelPreprocessor",
-    "WorldModelResult",
     "available_execution_providers",
 ]

@@ -418,7 +418,7 @@ def _port_spec(
     )
 
 
-class WorldModel:
+class LatentDynamicsModel:
     def __init__(
         self,
         model_path: str | os.PathLike[str],
@@ -464,6 +464,9 @@ class WorldModel:
 
     def create_rollout(self) -> Rollout:
         return Rollout(self._core.create_rollout())
+
+
+LegacyWorldModel = LatentDynamicsModel
 
 
 class Rollout:

@@ -10,10 +10,8 @@ import numpy as np
 import pytest
 from jinja2.exceptions import SecurityError
 from onnx_world_model import (
-    HighLevelWorldModel,
-    TextGenerationConfig,
-    WorldGenerationConfig,
-    high_level,
+    WorldModel,
+    generation,
 )
 from onnx_world_model.preprocessing import (
     ImagePreprocessor,
@@ -534,7 +532,13 @@ class _FakeSession:
                 "vision_velocity": np.ones((12, 16), dtype=np.float32),
             }
         if stage == "decode_video":
-            return {"video": np.zeros((1, 3, 5, 32, 32), dtype=np.float32)}
+            latent_frames = int((options or {}).get("video_latent_frames", 3))
+            frames = (latent_frames - 1) * 2 + 1
+            return {
+                "video": np.zeros(
+                    (1, 3, frames, 32, 32), dtype=np.float32
+                )
+            }
         raise AssertionError(f"Unexpected stage {stage}")
 
     def release_stage(self, stage: str) -> None:
@@ -596,31 +600,30 @@ class _FakeWorldOnlyPipeline(_FakePipeline):
 
 
 @pytest.fixture
-def high_level_model(
+def world_model(
     preprocessing_package: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> HighLevelWorldModel:
-    monkeypatch.setattr(high_level, "Pipeline", _FakePipeline)
-    return HighLevelWorldModel(
+) -> WorldModel:
+    monkeypatch.setattr(generation, "Pipeline", _FakePipeline)
+    return WorldModel(
         preprocessing_package,
         providers=["cpu"],
         provider_options={"cpu": {"use_arena": False}},
     )
 
 
-def test_high_level_respond_preprocesses_and_decodes(
-    high_level_model: HighLevelWorldModel,
+def test_llm_generate_preprocesses_and_decodes(
+    world_model: WorldModel,
 ) -> None:
     image = np.zeros((32, 32, 3), dtype=np.uint8)
 
-    result = high_level_model.respond(
+    result = world_model.llm.generate(
         "cat",
         image,
-        config=TextGenerationConfig(max_tokens=2),
+        max_tokens=2,
     )
 
     assert result.text == "answer"
-    assert result.token_ids is not None
     assert result.token_ids.tolist() == [[9]]
     fake = _FakePipeline.last_instance
     assert fake is not None
@@ -630,58 +633,71 @@ def test_high_level_respond_preprocesses_and_decodes(
     assert reasoner_inputs["vision.pixel_values"].shape == (1, 3, 32, 32)
 
 
-def test_high_level_world_generation_returns_structured_outputs(
-    high_level_model: HighLevelWorldModel,
+def test_video_and_action_generators_return_modality_outputs(
+    world_model: WorldModel,
 ) -> None:
-    result = high_level_model.generate_world(
+    video = world_model.video.generate(
         "cat",
-        outputs=("action", "video"),
-        config=WorldGenerationConfig(
-            frames=5,
-            height=32,
-            width=32,
-            num_inference_steps=2,
-            action_steps=1,
-            action_domain="robot",
-            seed=7,
-        ),
+        frames=5,
+        height=32,
+        width=32,
+        num_inference_steps=2,
+        seed=7,
+    )
+    action = world_model.action.generate(
+        "cat",
+        domain="robot",
+        steps=1,
+        video_frames=5,
+        video_height=32,
+        video_width=32,
+        num_inference_steps=2,
+        seed=7,
     )
 
-    assert result.action is not None
-    assert result.action.shape == (1, 3)
-    assert result.video is not None
-    assert result.video.shape == (1, 3, 5, 32, 32)
+    assert video.video.shape == (1, 3, 5, 32, 32)
+    assert action.actions.shape == (1, 3)
     fake = _FakePipeline.last_instance
     assert fake is not None
-    assert fake.session.released == ["world_generation", "decode_video"]
+    assert fake.session.released == [
+        "world_generation",
+        "decode_video",
+        "world_generation",
+    ]
 
 
-def test_high_level_rejects_implicit_image_world_conditioning(
-    high_level_model: HighLevelWorldModel,
+def test_image_generator_returns_one_frame(
+    world_model: WorldModel,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="image conditioning"):
-        high_level_model.generate(
-            "cat",
-            np.zeros((32, 32, 3), dtype=np.uint8),
-            outputs=("video",),
-        )
+    image = world_model.image.generate(
+        "cat",
+        height=32,
+        width=32,
+        num_inference_steps=1,
+    )
+
+    assert image.images.shape == (1, 3, 32, 32)
+
+
+def test_public_api_uses_modality_names(world_model: WorldModel) -> None:
+    assert world_model.capabilities == ("llm", "image", "video", "action")
+    assert not hasattr(world_model, "respond")
+    assert not hasattr(world_model, "generate_world")
 
 
 def test_world_only_pipeline_loads_without_reasoner_stages(
     preprocessing_package: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(high_level, "Pipeline", _FakeWorldOnlyPipeline)
+    monkeypatch.setattr(generation, "Pipeline", _FakeWorldOnlyPipeline)
 
-    model = HighLevelWorldModel(preprocessing_package)
-    result = model.generate_world(
+    model = WorldModel(preprocessing_package)
+    result = model.video.generate(
         "cat",
-        config=WorldGenerationConfig(
-            frames=5,
-            height=32,
-            width=32,
-            num_inference_steps=1,
-        ),
+        frames=5,
+        height=32,
+        width=32,
+        num_inference_steps=1,
     )
 
-    assert result.video is not None
+    assert result.video.shape == (1, 3, 5, 32, 32)

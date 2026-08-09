@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 from onnx_world_model import (
+    LatentDynamicsModel,
     OnnxModel,
-    WorldModel,
     WorldModelError,
     available_execution_providers,
 )
@@ -21,7 +21,7 @@ def _inputs(batch_size: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def test_loads_mobius_contract(world_model_path: Path):
-    model = WorldModel(world_model_path)
+    model = LatentDynamicsModel(world_model_path)
 
     assert [spec.name for spec in model.metadata.inputs] == [
         "observation",
@@ -112,7 +112,7 @@ def test_generic_model_rejects_missing_input(world_model_path: Path):
 
 
 def test_stateless_step_matches_reference(world_model_path: Path):
-    model = WorldModel(world_model_path)
+    model = LatentDynamicsModel(world_model_path)
     observation, action, state = _inputs(batch_size=2)
 
     output = model.step(observation, action, state)
@@ -133,7 +133,7 @@ def test_stateless_step_matches_reference(world_model_path: Path):
 
 
 def test_rollout_preserves_and_resets_state(world_model_path: Path):
-    model = WorldModel(world_model_path)
+    model = LatentDynamicsModel(world_model_path)
     rollout = model.create_rollout()
     observation, action, _ = _inputs()
 
@@ -151,7 +151,7 @@ def test_rollout_preserves_and_resets_state(world_model_path: Path):
 
 
 def test_rejects_incorrect_input_dtype(world_model_path: Path):
-    model = WorldModel(world_model_path)
+    model = LatentDynamicsModel(world_model_path)
     observation, action, state = _inputs()
 
     with pytest.raises(WorldModelError, match="data type"):
