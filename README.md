@@ -136,82 +136,10 @@ image = model.image.generate(
 print(image.images.shape)
 ```
 
-The modality objects are also public (`TextGenerator`, `ImageGenerator`,
-`VideoGenerator`, and `ActionGenerator`), but they normally come from one
-loaded `WorldModel` so component sessions and preprocessing assets are shared.
-
-Raw `image=` belongs to `model.text.generate()` and conditions the visual
-Reasoner. `video=` accepts a video path, a frame sequence, or a
-`[T,H,W,C]`/`[T,C,H,W]` NumPy array. Packages with a declared video-
-understanding contract apply frame sampling, timestamps, packed patchification,
-video-token expansion, and `grid_thw` automatically. `image` and `video` are
-mutually exclusive in one request.
-
-Video sampling options:
-
-- `video_fps`: source FPS when an array/frame sequence has no container
-  metadata;
-- `video_sample_fps`: target sampling rate, defaulting to the package contract;
-- `video_num_frames`: exact uniform sample count, mutually exclusive with
-  `video_sample_fps`.
-
-Video understanding requires a package that declares
-`metadata.vision_understanding.routing.video` and exposes
-`reasoner_embedding.video_features`. Older Cosmos3 Edge exports without this
-contract must be re-exported with a current Mobius version; the runtime does
-not silently reinterpret video frames as images.
-
-World generation currently starts from packed Gaussian noise, or from
-explicitly supplied initial latent tensors. Image-to-video conditioning is not
-silently inferred from an image; it requires the model-specific VAE
-conditioning/masking contract.
-
-Results retain model-boundary array layouts:
-
-- `TextOutput.text` is decoded text and `token_ids` is
-  `[batch, generated_tokens]`;
-- `ActionOutput.actions` is sliced from padded action state to the selected
-  domain's raw width;
-- `ImageOutput.images` is float NCHW;
-- `VideoOutput.video` is float NCTHW and still needs application-specific
-  clipping/range conversion and encoding.
-
-### Standalone preprocessing
-
-Preprocessing is public and can be used without loading any ONNX sessions:
-
-```python
-from onnx_world_model.preprocessing import WorldModelPreprocessor
-
-processor = WorldModelPreprocessor("output/cosmos3-edge")
-
-reasoner = processor.prepare_reasoner(
-    "Describe this image.",
-    image="frame.png",
-)
-print(reasoner.input_ids.shape)
-print(reasoner.pixel_values.shape)
-
-world = processor.prepare_world(
-    "Predict what happens next.",
-    frames=17,
-    height=256,
-    width=256,
-    action_steps=16,
-    action_domain="droid_lerobot",
-    include_action=True,
-    seed=1234,
-)
-print(world.vision_tokens.shape)
-print(world.options)
-```
-
-`TextPreprocessor`, `ImagePreprocessor`, `PackedImagePreprocessor`,
-`PackedVideoPreprocessor`, `PreparedReasonerInputs`, `PreparedVideo`, and
-`PreparedWorldInputs` are also public for applications that want to replace
-only part of the preprocessing stack. The processor supports fixed NCHW image
-graphs and Mobius's variable-resolution Cosmos3 Edge image/video contract
-(`smart_resize` + frame sampling + block-major patchification + `grid_thw`).
+`image=` accepts an image path, PIL image, or NumPy array. `video=` accepts a
+video path, frame sequence, or THWC/TCHW NumPy array. They are mutually
+exclusive in one text-generation request. Image-to-video conditioning is not
+yet supported.
 
 ## Python pipeline API
 
