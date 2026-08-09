@@ -14,20 +14,46 @@ from onnx_world_model._api import (
     available_execution_providers,
 )
 from onnx_world_model._native import WorldModelError
+from onnx_world_model.high_level import (
+    HighLevelWorldModel,
+    TextGenerationConfig,
+    WorldGenerationConfig,
+    WorldModelResult,
+)
+from onnx_world_model.preprocessing import (
+    ImagePreprocessor,
+    PackedImage,
+    PackedImagePreprocessor,
+    PreparedReasonerInputs,
+    PreparedWorldInputs,
+    TextPreprocessor,
+    WorldModelPreprocessor,
+)
 
 __all__ = [
+    "HighLevelWorldModel",
+    "ImagePreprocessor",
     "ModelMetadata",
     "OnnxModel",
+    "PackedImage",
+    "PackedImagePreprocessor",
     "Pipeline",
     "PipelineInputSpec",
     "PipelineOutputSpec",
     "PipelineSession",
     "PipelineStageSpec",
+    "PreparedReasonerInputs",
+    "PreparedWorldInputs",
     "Rollout",
     "StepResult",
     "TensorSpec",
+    "TextGenerationConfig",
+    "TextPreprocessor",
+    "WorldGenerationConfig",
     "WorldModel",
     "WorldModelError",
     "WorldModelPipeline",
+    "WorldModelPreprocessor",
+    "WorldModelResult",
     "available_execution_providers",
 ]

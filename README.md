@@ -72,6 +72,122 @@ The build SHA256-verifies downloaded ONNX Runtime 1.28 and nlohmann/json
 headers. Offline builds can set `ONNXRUNTIME_INCLUDE_DIR` and
 `NLOHMANN_JSON_INCLUDE_DIR`.
 
+## High-level Python API
+
+The high-level API accepts raw text and images, applies the package's
+tokenizer/chat template and image processor, manages stages and recurrent
+state, and returns structured results. It is intentionally a separate layer
+over the tensor-oriented `Pipeline` API:
+
+```python
+from onnx_world_model.high_level import (
+    TextGenerationConfig,
+    WorldGenerationConfig,
+    WorldModel,
+)
+
+model = WorldModel.load(
+    "output/cosmos3-edge",
+    providers=["cuda", "cpu"],
+    provider_options={"cuda": {"device_id": 0}},
+)
+
+# Raw prompt -> tokenizer/chat template -> Reasoner -> decoded text.
+answer = model.respond(
+    "What is shown in this image?",
+    image="frame.png",
+    config=TextGenerationConfig(
+        max_tokens=64,
+        do_sample=False,
+    ),
+)
+print(answer.text)
+
+# Raw prompt -> packed noise -> iterative scheduler -> VAE -> NCTHW video.
+prediction = model.generate_world(
+    "A robot moves the red block to the left.",
+    outputs=("action", "video"),
+    config=WorldGenerationConfig(
+        frames=17,
+        height=256,
+        width=256,
+        num_inference_steps=50,
+        action_steps=16,
+        action_domain="droid_lerobot",
+        seed=1234,
+    ),
+)
+print(prediction.action.shape)
+print(prediction.video.shape)
+print(prediction.timings)
+```
+
+The top-level alias is `HighLevelWorldModel`; the existing top-level
+`WorldModel` remains the backward-compatible latent-dynamics class:
+
+```python
+from onnx_world_model import HighLevelWorldModel
+```
+
+`WorldModel.generate()` can request `"text"`, `"action"`, and/or `"video"`:
+
+```python
+result = model.generate(
+    "Explain what happens next.",
+    outputs=("text",),
+)
+```
+
+Raw `image=` currently conditions only the visual Reasoner. It is not silently
+used as image-to-video or policy conditioning: requesting world/action output
+with `image=` raises until the model-specific VAE conditioning/masking contract
+is implemented. World generation currently starts from packed Gaussian noise,
+or from explicitly supplied `initial_vision_tokens` and
+`initial_action_tokens`.
+
+Results retain model-boundary array layouts:
+
+- `text` is decoded text and `token_ids` is `[batch, generated_tokens]`;
+- `action` is sliced from the padded action state to the selected domain's raw
+  width;
+- `video` is a float NCTHW array and still needs application-specific
+  clipping/range conversion and encoding.
+
+### Standalone preprocessing
+
+Preprocessing is public and can be used without loading any ONNX sessions:
+
+```python
+from onnx_world_model.preprocessing import WorldModelPreprocessor
+
+processor = WorldModelPreprocessor("output/cosmos3-edge")
+
+reasoner = processor.prepare_reasoner(
+    "Describe this image.",
+    image="frame.png",
+)
+print(reasoner.input_ids.shape)
+print(reasoner.pixel_values.shape)
+
+world = processor.prepare_world(
+    "Predict what happens next.",
+    frames=17,
+    height=256,
+    width=256,
+    action_domain="droid_lerobot",
+    seed=1234,
+)
+print(world.vision_tokens.shape)
+print(world.options)
+```
+
+`TextPreprocessor`, `ImagePreprocessor`, `PackedImagePreprocessor`,
+`PreparedReasonerInputs`, and `PreparedWorldInputs` are also public for
+applications that want to replace only part of the preprocessing stack. The
+processor supports both fixed NCHW vision graphs and Mobius's variable-
+resolution Cosmos3 Edge contract (`smart_resize` + block-major patchification
++ `grid_thw`).
+
 ## Python pipeline API
 
 The Python package locates the shared library from an installed `onnxruntime`
@@ -335,6 +451,11 @@ NamedTensors outputs = session.RunStage(
 - All component sessions are loaded eagerly. Pipeline scheduling and host
   transforms currently operate on CPU tensors; ORT performs device transfers
   at component boundaries.
+- The high-level Python layer supports exported chat templates, fast
+  tokenizers, fixed NCHW and variable-resolution packed image preprocessing,
+  one-image placeholder expansion, text decoding, packed Gaussian world-state
+  initialization, domain-aware action slicing, and automatic stage/state
+  lifecycle.
 - Dense tensor inputs and outputs, including FP16 and BF16 host transforms.
 - Single-pass, on-demand, state-transition, iterative, and autoregressive
   stages.
@@ -347,8 +468,11 @@ NamedTensors outputs = session.RunStage(
   transforms.
 - Fixed-square, single-image visual mRoPE positioning; general multi-image,
   variable-grid media processing remains a host responsibility.
-- No built-in raw text tokenizer, image/video decoder, resize/normalize
-  processor, or diffusion-noise initializer.
+- The low-level API accepts tensors. The high-level Python layer adds raw text
+  tokenization, fixed/packed image resize-normalize-patchify, and diffusion-
+  noise initialization; it does not yet provide raw video understanding,
+  general video decoding/encoding, or arbitrary model-specific media
+  processors.
 - Conditioning handoffs recorded only in manifest metadata are not executed
   automatically; callers must supply the corresponding packed initial latent.
 - Unsupported general transforms require an explicit target `override`.

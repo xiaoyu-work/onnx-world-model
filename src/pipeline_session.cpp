@@ -1730,9 +1730,38 @@ struct PipelineSession::Impl {
               }
             }
           }
-          const auto grid = static_cast<std::size_t>(
+          std::size_t grid_time = 1;
+          std::size_t grid_height = static_cast<std::size_t>(
               std::sqrt(static_cast<double>(visual_count)));
-          if (visual_start == length || grid * grid != visual_count) {
+          std::size_t grid_width = grid_height;
+          const auto grid_value =
+              endpoint_values.find("reasoner_vision_encoder.grid_thw");
+          if (grid_value != endpoint_values.end() &&
+              grid_value->second.data_type() == DataType::int64 &&
+              grid_value->second.element_count() == 3) {
+            const auto raw_grid =
+                grid_value->second.values<std::int64_t>();
+            const Json metadata = Json::parse(manifest().metadata_json());
+            const std::int64_t merge =
+                metadata.contains("vision_understanding")
+                    ? metadata.at("vision_understanding")
+                          .at("preprocessing")
+                          .at("patchify")
+                          .value("merge_size", 1)
+                    : 1;
+            if (merge <= 0 || raw_grid[0] <= 0 || raw_grid[1] <= 0 ||
+                raw_grid[2] <= 0 || raw_grid[1] % merge != 0 ||
+                raw_grid[2] % merge != 0) {
+              ExecutionError("Vision grid_thw is incompatible with merge size");
+            }
+            grid_time = static_cast<std::size_t>(raw_grid[0]);
+            grid_height =
+                static_cast<std::size_t>(raw_grid[1] / merge);
+            grid_width =
+                static_cast<std::size_t>(raw_grid[2] / merge);
+          }
+          if (visual_start == length ||
+              grid_time * grid_height * grid_width != visual_count) {
             cursors[batch_index] = static_cast<std::int64_t>(length);
             continue;
           }
@@ -1741,15 +1770,24 @@ struct PipelineSession::Impl {
               static_cast<std::int64_t>(visual_start);
           for (std::size_t token = 0; token < visual_count; ++token) {
             const std::size_t position = visual_start + token;
-            values[batch_offset + position] = visual_base;
+            const std::size_t time =
+                token / (grid_height * grid_width);
+            const std::size_t spatial =
+                token % (grid_height * grid_width);
+            values[batch_offset + position] =
+                visual_base + static_cast<std::int64_t>(time);
             values[axis_stride + batch_offset + position] =
-                visual_base + static_cast<std::int64_t>(token / grid);
+                visual_base +
+                static_cast<std::int64_t>(spatial / grid_width);
             values[2 * axis_stride + batch_offset + position] =
-                visual_base + static_cast<std::int64_t>(token % grid);
+                visual_base +
+                static_cast<std::int64_t>(spatial % grid_width);
           }
           const std::size_t visual_end = visual_start + visual_count;
           std::int64_t next =
-              visual_base + static_cast<std::int64_t>(grid);
+              visual_base +
+              static_cast<std::int64_t>(
+                  std::max(grid_height, grid_width));
           for (std::size_t position = visual_end;
                position < length;
                ++position, ++next) {
