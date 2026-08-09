@@ -13,6 +13,7 @@ from onnx_world_model._api import (
     TensorSpec,
     WorldModelPipeline,
     available_execution_providers,
+    supported_pipeline_capabilities,
 )
 from onnx_world_model._native import WorldModelError
 from onnx_world_model.generation import (
@@ -27,21 +28,28 @@ from onnx_world_model.generation import (
     WorldModel,
 )
 from onnx_world_model.preprocessing import (
+    ConditioningFramePreprocessor,
+    GeneratorPromptPacker,
     ImagePreprocessor,
     PackedImage,
     PackedImagePreprocessor,
     PackedVideoPreprocessor,
+    PreparedConditioning,
     PreparedReasonerInputs,
     PreparedVideo,
     PreparedWorldInputs,
+    RawImage,
     RawVideo,
     TextPreprocessor,
     WorldModelPreprocessor,
+    pack_latent_tokens,
 )
 
 __all__ = [
     "ActionGenerator",
     "ActionOutput",
+    "ConditioningFramePreprocessor",
+    "GeneratorPromptPacker",
     "ImageGenerator",
     "ImageOutput",
     "ImagePreprocessor",
@@ -57,9 +65,11 @@ __all__ = [
     "PipelineOutputSpec",
     "PipelineSession",
     "PipelineStageSpec",
+    "PreparedConditioning",
     "PreparedReasonerInputs",
     "PreparedVideo",
     "PreparedWorldInputs",
+    "RawImage",
     "RawVideo",
     "Rollout",
     "StepResult",
@@ -74,4 +84,6 @@ __all__ = [
     "WorldModelPipeline",
     "WorldModelPreprocessor",
     "available_execution_providers",
+    "pack_latent_tokens",
+    "supported_pipeline_capabilities",
 ]

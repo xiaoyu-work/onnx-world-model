@@ -173,8 +173,14 @@ class ImageGenerator:
         *,
         height: int = 256,
         width: int = 256,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
         num_inference_steps: int | None = None,
         seed: int | None = None,
+        mode: str | None = None,
+        add_resolution_template: bool | None = None,
+        use_system_prompt: bool | None = None,
+        system_prompt: str | None = None,
         initial_latents: NDArray[np.floating[Any]] | None = None,
         input_ids: NDArray[np.integer[Any]] | None = None,
     ) -> ImageOutput:
@@ -187,6 +193,13 @@ class ImageGenerator:
             width=width,
             num_inference_steps=num_inference_steps,
             seed=seed,
+            mode=mode,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            add_resolution_template=add_resolution_template,
+            add_duration_template=False,
+            use_system_prompt=use_system_prompt,
+            system_prompt=system_prompt,
             initial_vision_tokens=initial_latents,
             generator_input_ids=input_ids,
         )
@@ -202,17 +215,32 @@ class VideoGenerator:
     def __init__(self, runtime: _GenerationRuntime) -> None:
         self._runtime = runtime
 
+    def default_negative_prompt(self, mode: str | None = None) -> str:
+        """The negative prompt this package recommends for a mode."""
+        return self._runtime.preprocessor.default_negative_prompt(mode)
+
     def generate(
         self,
         prompt: str,
         *,
-        frames: int = 5,
-        height: int = 256,
-        width: int = 256,
+        image: RawImage | None = None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
+        frames: int | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        fps: float | None = None,
         num_inference_steps: int | None = None,
         seed: int | None = None,
+        mode: str | None = None,
+        add_resolution_template: bool | None = None,
+        add_duration_template: bool | None = None,
+        use_system_prompt: bool | None = None,
+        system_prompt: str | None = None,
+        conditioned_latent_frames: Sequence[int] | None = None,
         initial_latents: NDArray[np.floating[Any]] | None = None,
         input_ids: NDArray[np.integer[Any]] | None = None,
+        negative_input_ids: NDArray[np.integer[Any]] | None = None,
     ) -> VideoOutput:
         result, timings = self._runtime.generate(
             prompt,
@@ -221,10 +249,21 @@ class VideoGenerator:
             frames=frames,
             height=height,
             width=width,
+            fps=fps,
             num_inference_steps=num_inference_steps,
             seed=seed,
+            mode=mode,
+            image=image,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            add_resolution_template=add_resolution_template,
+            add_duration_template=add_duration_template,
+            use_system_prompt=use_system_prompt,
+            system_prompt=system_prompt,
+            conditioned_latent_frames=conditioned_latent_frames,
             initial_vision_tokens=initial_latents,
             generator_input_ids=input_ids,
+            unconditional_input_ids=negative_input_ids,
         )
         return VideoOutput(video=result["video"], timings=timings)
 
@@ -420,17 +459,27 @@ class _GenerationRuntime:
         *,
         output_video: bool,
         output_action: bool,
-        frames: int,
-        height: int,
-        width: int,
+        frames: int | None,
+        height: int | None,
+        width: int | None,
         num_inference_steps: int | None,
         seed: int | None,
+        fps: float | None = None,
         action_steps: int = 0,
         action_domain: str = "no_action",
         mode: str | None = None,
+        image: RawImage | None = None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
+        add_resolution_template: bool | None = None,
+        add_duration_template: bool | None = None,
+        use_system_prompt: bool | None = None,
+        system_prompt: str | None = None,
+        conditioned_latent_frames: Sequence[int] | None = None,
         initial_vision_tokens: NDArray[np.floating[Any]] | None = None,
         initial_action_tokens: NDArray[np.floating[Any]] | None = None,
         generator_input_ids: NDArray[np.integer[Any]] | None = None,
+        unconditional_input_ids: NDArray[np.integer[Any]] | None = None,
     ) -> tuple[dict[str, NDArray[Any]], dict[str, float]]:
         if self.world_stage is None:
             raise RuntimeError("This package has no world generation stage")
@@ -439,22 +488,51 @@ class _GenerationRuntime:
             frames=frames,
             height=height,
             width=width,
+            fps=fps,
             action_steps=action_steps,
             action_domain=action_domain,
             include_action=output_action,
             num_inference_steps=num_inference_steps,
             mode=mode,
             seed=seed,
+            image=image,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            add_resolution_template=add_resolution_template,
+            add_duration_template=add_duration_template,
+            use_system_prompt=use_system_prompt,
+            system_prompt=system_prompt,
+            conditioned_latent_frames=conditioned_latent_frames,
             initial_vision_tokens=initial_vision_tokens,
             initial_action_tokens=initial_action_tokens,
             generator_input_ids=generator_input_ids,
+            unconditional_input_ids=unconditional_input_ids,
         )
         session = self.pipeline.create_session()
         timings: dict[str, float] = {}
+        if prepared.conditioning is not None:
+            conditioning = prepared.conditioning
+            started = time.perf_counter()
+            encoded = session.run_stage(
+                conditioning.encoder_stage,
+                conditioning.pipeline_inputs(),
+                options=prepared.options,
+            )
+            timings["encode"] = time.perf_counter() - started
+            if conditioning.encoder_output not in encoded:
+                raise RuntimeError(
+                    "The conditioning encoder produced no "
+                    f"{conditioning.encoder_output!r} output"
+                )
+            prepared = prepared.with_conditioning_latent(
+                np.asarray(encoded[conditioning.encoder_output])
+            )
+            session.release_stage(conditioning.encoder_stage)
         started = time.perf_counter()
         generated = session.run_stage(
             self.world_stage,
             prepared.pipeline_inputs(),
+            overrides=prepared.pipeline_overrides() or None,
             options=prepared.options,
         )
         timings["generate"] = time.perf_counter() - started

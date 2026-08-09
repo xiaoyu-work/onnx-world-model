@@ -13,6 +13,7 @@ from jinja2.exceptions import SecurityError
 from onnx_world_model import (
     WorldModel,
     generation,
+    preprocessing,
 )
 from onnx_world_model.preprocessing import (
     ImagePreprocessor,
@@ -20,184 +21,852 @@ from onnx_world_model.preprocessing import (
     WorldModelPreprocessor,
 )
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
+
+
+def _reference_packed_tokens(
+    latent: np.ndarray,
+    patch: int,
+) -> np.ndarray:
+    """Explicit transcription of the runtime's video unpatchify inverse."""
+    batch, channels, frames, height, width = latent.shape
+    grid_height = height // patch
+    grid_width = width // patch
+    tokens = np.zeros(
+        (batch * frames * grid_height * grid_width, patch * patch * channels),
+        dtype=latent.dtype,
+    )
+    for b in range(batch):
+        for frame in range(frames):
+            for gy in range(grid_height):
+                for gx in range(grid_width):
+                    token = (
+                        (b * frames + frame) * grid_height + gy
+                    ) * grid_width + gx
+                    for py in range(patch):
+                        for px in range(patch):
+                            for channel in range(channels):
+                                tokens[token, (py * patch + px) * channels + channel] = (
+                                    latent[
+                                        b,
+                                        channel,
+                                        frame,
+                                        gy * patch + py,
+                                        gx * patch + px,
+                                    ]
+                                )
+    return tokens
 
 
 @pytest.fixture
-def preprocessing_package(tmp_path: Path) -> Path:
-    vocabulary = {
-        "<unk>": 0,
-        "<|im_start|>": 1,
-        "<|im_end|>": 2,
-        "<|vision_start|>": 3,
-        "<|image_pad|>": 4,
-        "<|vision_end|>": 5,
-        "user": 6,
-        "assistant": 7,
-        "cat": 8,
-        "answer": 9,
-    }
-    tokenizer = Tokenizer(WordLevel(vocabulary, unk_token="<unk>"))
-    tokenizer.pre_tokenizer = Whitespace()
-    tokenizer.add_special_tokens(
-        [
-            "<unk>",
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|vision_start|>",
-            "<|image_pad|>",
-            "<|vision_end|>",
-        ]
-    )
-    tokenizer.save(str(tmp_path / "tokenizer.json"))
-    (tmp_path / "chat_template.jinja").write_text(
-        """<|im_start|>user
-{% if messages[-1].content is string %}{{ messages[-1].content }}{% else %}
-{% for item in messages[-1].content %}{% if item.type == 'image' %}<|vision_start|><|image_pad|><|vision_end|>{% elif item.type == 'text' %}{{ item.text }}{% endif %}{% endfor %}
-{% endif %}<|im_end|>
-<|im_start|>assistant
-""",
-        encoding="utf-8",
-    )
-    (tmp_path / "config.json").write_text(
-        json.dumps({"image_token_id": 4}),
-        encoding="utf-8",
-    )
-    (tmp_path / "preprocessor_config.json").write_text(
-        json.dumps(
-            {
-                "image_mean": [0.5, 0.5, 0.5],
-                "image_std": [0.5, 0.5, 0.5],
+def edge_contract_package(preprocessing_package: Path) -> Path:
+    """A package whose stage options mirror the exported Edge contract."""
+    path = preprocessing_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    manifest = document["manifest"]
+    for component in manifest["components"]:
+        if component["name"] == "generator":
+            component["config"] = {"patch_latent_dim": 192}
+            for value in component["inputs"]:
+                if value["name"] == "vision_tokens":
+                    value["shape"] = ["vision", 192]
+        if component["name"] == "video_encoder":
+            component["config"] = {
+                "spatial_compression": 16,
+                "temporal_compression": 4,
             }
-        ),
-        encoding="utf-8",
+            component["inputs"] = [
+                {
+                    "name": "sample",
+                    "dtype": "FLOAT",
+                    "shape": [1, 3, "frames", "height", "width"],
+                }
+            ]
+            component["outputs"] = [
+                {
+                    "name": "latent",
+                    "dtype": "FLOAT",
+                    "shape": [1, 48, "t", "h", "w"],
+                }
+            ]
+    manifest["inputs"].append(
+        {
+            "port": "video_encoder.sample",
+            "kind": "external",
+            "semantic": "video.frames",
+            "presence": "video_conditioning",
+            "required": False,
+        }
     )
-    document = {
-        "format": "mobius-pipeline",
-        "schema_version": "1.1",
-        "manifest": {
-            "schema_version": "1.1",
-            "components": [
-                {
-                    "name": "generator",
-                    "role": "dynamics",
-                    "run_on": "always",
-                    "inputs": [
-                        {
-                            "name": "input_ids",
-                            "dtype": "INT64",
-                            "shape": ["text"],
-                        },
-                        {
-                            "name": "vision_tokens",
-                            "dtype": "FLOAT",
-                            "shape": ["vision", 16],
-                        },
-                        {
-                            "name": "action_tokens",
-                            "dtype": "FLOAT",
-                            "shape": ["action", 8],
-                        },
+    manifest["outputs"] = [
+        {"port": "video_encoder.latent", "alias": "encoded_video_latent"}
+    ]
+    manifest["stages"] = [
+        {
+            "name": "world_generation",
+            "kind": "iterative",
+            "components": ["generator"],
+            "run_on": "step",
+            "capabilities": [
+                "loop_carried_state",
+                "classifier_free_guidance",
+                "conditioned_diffusion",
+            ],
+            "options": {
+                "scheduler": {
+                    "kind": "UniPCMultistepScheduler",
+                    "config_asset": "scheduler/scheduler_config.json",
+                    "overrideable": [
+                        "num_inference_steps",
+                        "guidance_scale",
+                        "flow_shift",
+                        "use_karras_sigmas",
                     ],
-                    "outputs": [],
-                    "config": {"patch_latent_dim": 16},
-                },
-                {
-                    "name": "reasoner_embedding",
-                    "role": "embedding",
-                    "run_on": "always",
-                    "inputs": [
-                        {
-                            "name": "input_ids",
-                            "dtype": "INT64",
-                            "shape": ["batch", "sequence"],
+                    "mode_overrides": {
+                        "image_to_video": {
+                            "flow_shift": 3.0,
+                            "use_karras_sigmas": False,
+                            "num_inference_steps": 50,
+                            "guidance_scale": 5.0,
                         },
-                        {
-                            "name": "image_features",
-                            "dtype": "FLOAT",
-                            "shape": ["features", 8],
+                        "action": {
+                            "flow_shift": 10.0,
+                            "use_karras_sigmas": False,
+                            "num_inference_steps": 30,
+                            "guidance_scale": 1.0,
                         },
-                        {
-                            "name": "video_features",
-                            "dtype": "FLOAT",
-                            "shape": ["video_features", 8],
-                        },
-                    ],
-                    "outputs": [],
-                },
-                {
-                    "name": "reasoner_vision_encoder",
-                    "role": "encoder",
-                    "run_on": "always",
-                    "inputs": [
-                        {
-                            "name": "pixel_values",
-                            "dtype": "FLOAT",
-                            "shape": [1, 3, 32, 32],
-                        }
-                    ],
-                    "outputs": [
-                        {
-                            "name": "image_features",
-                            "dtype": "FLOAT",
-                            "shape": [4, 8],
-                        }
-                    ],
-                },
-                {
-                    "name": "video_encoder",
-                    "role": "encoder",
-                    "run_on": "always",
-                    "inputs": [],
-                    "outputs": [],
-                    "config": {
-                        "spatial_compression": 8,
-                        "temporal_compression": 2,
                     },
                 },
-            ],
-            "connections": [],
-            "stages": [],
-            "inputs": [
-                {
-                    "port": "reasoner_vision_encoder.pixel_values",
-                    "kind": "external",
-                    "semantic": "vision.pixel_values",
+                "guidance": {
+                    "kind": "classifier_free",
+                    "conditioning_input": "generator.input_ids",
+                    "scale_option": "guidance_scale",
+                    "default_scale": 1.0,
+                    "combine": (
+                        "unconditional + scale * (conditional - unconditional)"
+                    ),
                 },
-                {
-                    "port": "generator.vision_tokens",
-                    "kind": "external",
-                    "semantic": "diffusion.initial_vision_latent",
+                "conditioning": {
+                    "vision": {
+                        "encoder_stage": "encode_video",
+                        "encoder_input": "video_encoder.sample",
+                        "encoder_output": "video_encoder.latent",
+                        "state": "vision_state",
+                        "conditioned_latent_frames_option": (
+                            "vision_conditioned_latent_frames"
+                        ),
+                        "default_conditioned_latent_frames": [],
+                        "packing": {
+                            "spatial_patch_size": 2,
+                            "temporal_patch_size": 1,
+                            "input_layout": "BCTHW",
+                            "output_layout": "NC",
+                            "channel_order": "patch_height_patch_width_channel",
+                        },
+                    }
                 },
-                {
-                    "port": "generator.action_tokens",
-                    "kind": "external",
-                    "semantic": "diffusion.initial_action_latent",
-                },
-            ],
-            "outputs": [],
-            "metadata": {
-                "packing": {
-                    "latent_patch_size": 2,
-                    "patch_latent_dim": 16,
-                },
-                "action": {
-                    "padded_dimension": 8,
-                    "raw_dimensions": {
-                        "no_action": 0,
-                        "robot": 3,
-                    },
-                },
+                "default_steps": 50,
+                "timestep": {"generator": "scheduler_timesteps", "scale": 1000},
+                "prediction_type": "flow_prediction",
+                "state_inputs": ["generator.vision_tokens"],
+                "packed_modalities": True,
             },
         },
-        "component_files": {},
+        {
+            "name": "encode_video",
+            "kind": "on_demand",
+            "components": ["video_encoder"],
+            "run_on": "on_demand",
+            "options": {"presence": "video_conditioning"},
+        },
+    ]
+    manifest["metadata"]["packing"] = {
+        "generator_boundary": "packed_tokens",
+        "latent_patch_size": 2,
+        "patch_latent_dim": 192,
     }
-    (tmp_path / "pipeline.json").write_text(
-        json.dumps(document),
+    manifest["metadata"]["generation_recipes"] = {
+        "image_to_video": {
+            "conditioning": {
+                "modality": "image",
+                "encoder_stage": "encode_video",
+                "conditioned_latent_frames": [0],
+            },
+            "prompt": {
+                "positive": "json_or_text",
+                "negative_asset": "assets/negative_prompt.json",
+                "add_resolution_template": False,
+                "add_duration_template": False,
+                "use_system_prompt": False,
+            },
+            "height": 480,
+            "width": 832,
+            "frames": 121,
+            "fps": 24.0,
+        }
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    assets = preprocessing_package / "assets"
+    assets.mkdir(exist_ok=True)
+    # The shipped Edge asset is the structured negative prompt itself.
+    (assets / "negative_prompt.json").write_text(
+        json.dumps({"subjects": [{"description": "flickering"}]}),
         encoding="utf-8",
     )
-    return tmp_path
+    return preprocessing_package
+
+
+def test_matches_the_exported_edge_generation_contract(
+    edge_contract_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(edge_contract_package)
+    image = np.zeros((90, 160, 3), dtype=np.uint8)
+
+    prepared = preprocessor.prepare_world("a robot", image=image, seed=0)
+
+    assert prepared.options["mode"] == "image_to_video"
+    # 832x480 at 121 frames -> 31 latent frames of 30x52, packed 15x26.
+    assert prepared.output_shape == (121, 480, 832)
+    assert prepared.latent_shape == (31, 30, 52)
+    assert prepared.vision_tokens.shape == (31 * 15 * 26, 192)
+    conditioning = prepared.conditioning
+    assert conditioning is not None
+    assert conditioning.pixel_values.shape == (1, 3, 1, 480, 832)
+    assert conditioning.latent_grid == (15, 26)
+    assert prepared.noisy_vision_token_indexes is not None
+    np.testing.assert_array_equal(
+        prepared.noisy_vision_token_indexes,
+        np.arange(15 * 26, 31 * 15 * 26),
+    )
+    assert preprocessor.guidance_scale(mode="image_to_video") == 5.0
+    assert preprocessor.guidance_scale(mode="action") == 1.0
+    assert prepared.unconditional_input_name == (
+        "unconditional:generator.input_ids"
+    )
+    # The Edge recipe disables the metadata sentences and the system prompt.
+    np.testing.assert_array_equal(
+        prepared.input_ids,
+        preprocessor.prepare_generator_prompt("a robot", mode="image_to_video"),
+    )
+
+
+def test_structured_negative_prompt_asset_is_passed_through(
+    edge_contract_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(edge_contract_package)
+
+    negative = preprocessor.default_negative_prompt("image_to_video")
+
+    assert json.loads(negative) == {"subjects": [{"description": "flickering"}]}
+    # A structured prompt survives template application untouched.
+    assert (
+        preprocessor.generator_prompt.apply_templates(
+            negative,
+            negative=True,
+            is_image=False,
+            frames=121,
+            height=480,
+            width=832,
+            fps=24.0,
+            add_resolution_template=True,
+            add_duration_template=True,
+        )
+        == negative
+    )
+
+
+def test_recipe_can_default_the_negative_prompt_to_the_asset(
+    edge_contract_package: Path,
+) -> None:
+    path = edge_contract_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    recipe = document["manifest"]["metadata"]["generation_recipes"]
+    recipe["image_to_video"]["prompt"]["negative_default"] = "asset"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(edge_contract_package)
+    image = np.zeros((90, 160, 3), dtype=np.uint8)
+
+    prepared = preprocessor.prepare_world("a robot", image=image)
+
+    np.testing.assert_array_equal(
+        prepared.unconditional_input_ids,
+        preprocessor.prepare_generator_prompt(
+            preprocessor.default_negative_prompt("image_to_video"),
+            mode="image_to_video",
+            negative=True,
+        ),
+    )
+
+
+def test_recipe_can_declare_generator_prompt_suffix_tokens(
+    edge_contract_package: Path,
+) -> None:
+    path = edge_contract_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    recipe = document["manifest"]["metadata"]["generation_recipes"]
+    recipe["image_to_video"]["prompt"]["suffix_token_ids"] = [2, 3]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(edge_contract_package)
+
+    tokens = preprocessor.prepare_generator_prompt(
+        "a robot", mode="image_to_video"
+    )
+
+    assert tokens[-2:].tolist() == [2, 3]
+    assert preprocessor.prepare_generator_prompt("a robot")[-2:].tolist() != [
+        2,
+        3,
+    ]
+
+
+def test_rejects_disagreeing_conditioning_packing(
+    edge_contract_package: Path,
+) -> None:
+    path = edge_contract_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    stage = document["manifest"]["stages"][0]
+    stage["options"]["conditioning"]["vision"]["packing"][
+        "spatial_patch_size"
+    ] = 4
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(edge_contract_package)
+
+    with pytest.raises(ValueError, match="spatial_patch_size"):
+        preprocessor.prepare_world(
+            "a robot", image=np.zeros((16, 16, 3), dtype=np.uint8)
+        )
+
+
+def test_conditioning_preprocessing_contract_is_honored(
+    conditioned_package: Path,
+) -> None:
+    path = conditioned_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    vision = document["manifest"]["stages"][0]["options"]["conditioning"][
+        "vision"
+    ]
+    vision["preprocessing"] = {
+        "resize": "stretch_to_target",
+        "resample": "nearest",
+        "convert_rgb": True,
+        "rescale_factor": 1 / 255,
+        "normalize": {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]},
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    image = np.full((16, 16, 3), 128, dtype=np.uint8)
+
+    frames = preprocessor.prepare_conditioning_frames(
+        image, height=32, width=32
+    )
+
+    assert preprocessor.conditioning is not None
+    assert preprocessor.conditioning.resample == "nearest"
+    # mean 0 / std 1 keeps the frame in [0, 1] instead of the signed default.
+    np.testing.assert_allclose(frames, 128 / 255.0, atol=1e-6)
+
+
+def test_conditioning_preprocessing_defaults_to_the_signed_range(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    image = np.full((16, 16, 3), 128, dtype=np.uint8)
+
+    frames = preprocessor.prepare_conditioning_frames(
+        image, height=32, width=32
+    )
+
+    assert preprocessor.conditioning is not None
+    assert preprocessor.conditioning.resample == "bilinear"
+    np.testing.assert_allclose(
+        frames, (128 / 255.0 - 0.5) / 0.5, atol=1e-6
+    )
+
+
+def test_rejects_unsupported_conditioning_resample(
+    conditioned_package: Path,
+) -> None:
+    path = conditioned_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    vision = document["manifest"]["stages"][0]["options"]["conditioning"][
+        "vision"
+    ]
+    vision["preprocessing"] = {"resample": "spline"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    with pytest.raises(ValueError, match="resample"):
+        preprocessor.prepare_conditioning_frames(
+            np.zeros((8, 8, 3), dtype=np.uint8), height=32, width=32
+        )
+
+
+def test_rejects_unsupported_conditioning_resize_strategy(
+    conditioned_package: Path,
+) -> None:
+    path = conditioned_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    vision = document["manifest"]["stages"][0]["options"]["conditioning"][
+        "vision"
+    ]
+    vision["preprocessing"] = {"resize": "pad_to_target"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    with pytest.raises(ValueError, match="stretch_to_target"):
+        preprocessor.prepare_conditioning_frames(
+            np.zeros((8, 8, 3), dtype=np.uint8), height=32, width=32
+        )
+
+
+def test_generator_prompt_chat_flags_reach_the_template(
+    conditioned_package: Path,
+) -> None:
+    (conditioned_package / "chat_template.jinja").write_text(
+        "{% if add_vision_id %}<|vision_start|>{% endif %}"
+        "{{ messages[-1].content }}"
+        "{% if add_generation_prompt %}<|im_end|>{% endif %}",
+        encoding="utf-8",
+    )
+    path = conditioned_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    prompt = document["manifest"]["metadata"]["generator_prompt"]
+    prompt["chat"] = {
+        "add_generation_prompt": False,
+        "add_vision_id": True,
+        "enable_thinking": True,
+    }
+    prompt["suffix_token_ids"] = []
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    token_ids = preprocessor.prepare_generator_prompt("cat")
+
+    # <|vision_start|> is 3 and <|im_end|> is 2 in the fixture vocabulary.
+    assert token_ids.tolist() == [3, 8]
+    assert preprocessor.text.render_chat(
+        "cat", add_generation_prompt=True, add_vision_id=False
+    ) == "cat<|im_end|>"
+
+
+def test_generator_prompt_enable_thinking_reaches_template(
+    conditioned_package: Path,
+) -> None:
+    (conditioned_package / "chat_template.jinja").write_text(
+        "{{ messages[-1].content }}"
+        "{% if enable_thinking %}<|vision_start|>{% endif %}",
+        encoding="utf-8",
+    )
+    path = conditioned_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    prompt = document["manifest"]["metadata"]["generator_prompt"]
+    prompt["chat"] = {"enable_thinking": True}
+    prompt["suffix_token_ids"] = []
+    path.write_text(json.dumps(document), encoding="utf-8")
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    assert preprocessor.prepare_generator_prompt("cat").tolist() == [8, 3]
+
+
+def test_rejects_unsupported_generator_prompt_chat_fields(
+    conditioned_package: Path,
+) -> None:
+    path = conditioned_package / "pipeline.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    prompt = document["manifest"]["metadata"]["generator_prompt"]
+    prompt["chat"] = {"add_thinking_prompt": True}
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="add_thinking_prompt"):
+        WorldModelPreprocessor(conditioned_package)
+
+
+def test_unconditional_ids_require_an_active_guidance_program(
+    conditioned_package: Path,
+) -> None:
+    guided = WorldModelPreprocessor(conditioned_package)
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    ids = np.asarray([1, 2, 3], dtype=np.int64)
+
+    with pytest.raises(ValueError, match="guidance scale"):
+        guided.prepare_world("cat", unconditional_input_ids=ids)
+    with pytest.raises(ValueError, match="guidance scale"):
+        guided.prepare_world(
+            "cat",
+            image=image,
+            guidance_scale=1.0,
+            unconditional_input_ids=ids,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        guided.prepare_world(
+            "cat",
+            image=image,
+            negative_prompt="blurry",
+            unconditional_input_ids=ids,
+        )
+
+
+def test_unconditional_ids_require_a_declared_guidance_input(
+    preprocessing_package: Path,
+) -> None:
+    unguided = WorldModelPreprocessor(preprocessing_package)
+
+    with pytest.raises(ValueError, match="classifier-free guidance"):
+        unguided.prepare_world(
+            "cat",
+            unconditional_input_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        )
+
+
+def test_unconditional_ids_are_used_when_guidance_is_active(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    ids = np.asarray([1, 2, 3], dtype=np.int64)
+
+    prepared = preprocessor.prepare_world(
+        "cat",
+        image=np.zeros((16, 16, 3), dtype=np.uint8),
+        unconditional_input_ids=ids,
+    )
+
+    np.testing.assert_array_equal(prepared.unconditional_input_ids, ids)
+    np.testing.assert_array_equal(
+        prepared.pipeline_inputs()["unconditional:generator.input_ids"], ids
+    )
+
+
+def test_packs_latents_in_runtime_token_order() -> None:
+    latent = np.arange(1 * 4 * 2 * 4 * 4, dtype=np.float32).reshape(
+        1, 4, 2, 4, 4
+    )
+
+    packed = preprocessing.pack_latent_tokens(latent, 2)
+
+    assert packed.shape == (8, 16)
+    np.testing.assert_array_equal(packed, _reference_packed_tokens(latent, 2))
+
+
+def test_rejects_latents_that_do_not_tile() -> None:
+    with pytest.raises(ValueError, match="divisible"):
+        preprocessing.pack_latent_tokens(
+            np.zeros((1, 4, 1, 3, 4), dtype=np.float32), 2
+        )
+
+
+def test_prepares_image_to_video_inputs(conditioned_package: Path) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    image[:, :8] = 255
+
+    prepared = preprocessor.prepare_world("cat", image=image, seed=5)
+
+    assert prepared.options["mode"] == "image_to_video"
+    assert prepared.output_shape == (5, 32, 32)
+    assert prepared.latent_shape == (3, 4, 4)
+    conditioning = prepared.conditioning
+    assert conditioning is not None
+    assert conditioning.encoder_stage == "encode_video"
+    assert conditioning.encoder_output == "encoded_video_latent"
+    assert conditioning.latent_frames == (0,)
+    assert conditioning.pixel_values.shape == (1, 3, 1, 32, 32)
+    assert conditioning.pixel_values.min() == pytest.approx(-1.0)
+    assert conditioning.pixel_values.max() == pytest.approx(1.0)
+    assert list(conditioning.pipeline_inputs()) == ["video_encoder.sample"]
+    assert prepared.noisy_vision_token_indexes is not None
+    np.testing.assert_array_equal(
+        prepared.noisy_vision_token_indexes, np.arange(4, 12)
+    )
+    overrides = prepared.pipeline_overrides()
+    assert list(overrides) == ["generator.vision_timestep_token_indexes"]
+    np.testing.assert_array_equal(
+        overrides["generator.vision_timestep_token_indexes"],
+        prepared.noisy_vision_token_indexes,
+    )
+    assert prepared.unconditional_input_name == (
+        "unconditional:generator.input_ids"
+    )
+    assert prepared.unconditional_input_ids is not None
+    assert (
+        "unconditional:generator.input_ids" in prepared.pipeline_inputs()
+    )
+
+
+def test_conditioned_latent_anchors_only_its_frames(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    prepared = preprocessor.prepare_world(
+        "cat",
+        image=np.zeros((16, 16, 3), dtype=np.uint8),
+        seed=5,
+    )
+    latent = np.arange(1 * 4 * 1 * 4 * 4, dtype=np.float32).reshape(
+        1, 4, 1, 4, 4
+    )
+
+    conditioned = prepared.with_conditioning_latent(latent)
+
+    expected = _reference_packed_tokens(latent, 2)
+    np.testing.assert_array_equal(conditioned.vision_tokens[:4], expected)
+    np.testing.assert_array_equal(
+        conditioned.vision_tokens[4:], prepared.vision_tokens[4:]
+    )
+    # The noise of the conditioned frame is replaced, not blended.
+    assert not np.array_equal(
+        conditioned.vision_tokens[:4], prepared.vision_tokens[:4]
+    )
+
+
+def test_rejects_mismatched_conditioning_latent(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    prepared = preprocessor.prepare_world(
+        "cat",
+        image=np.zeros((16, 16, 3), dtype=np.uint8),
+        seed=5,
+    )
+
+    with pytest.raises(ValueError, match="latent frames"):
+        prepared.with_conditioning_latent(
+            np.zeros((1, 4, 2, 4, 4), dtype=np.float32)
+        )
+    with pytest.raises(ValueError, match="channels"):
+        prepared.with_conditioning_latent(
+            np.zeros((1, 2, 1, 4, 4), dtype=np.float32)
+        )
+
+
+def test_conditioned_frames_must_be_a_leading_run(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="leading run"):
+        preprocessor.prepare_world(
+            "cat", image=image, conditioned_latent_frames=[1]
+        )
+    with pytest.raises(ValueError, match="outside"):
+        preprocessor.prepare_world(
+            "cat", image=image, conditioned_latent_frames=[0, 1, 2, 3]
+        )
+    with pytest.raises(ValueError, match="nothing to denoise"):
+        preprocessor.prepare_world(
+            "cat", image=image, conditioned_latent_frames=[0, 1, 2]
+        )
+
+
+def test_two_conditioned_frames_encode_the_matching_clip(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    prepared = preprocessor.prepare_world(
+        "cat",
+        image=np.zeros((16, 16, 3), dtype=np.uint8),
+        conditioned_latent_frames=[0, 1],
+    )
+
+    assert prepared.conditioning is not None
+    # Two latent frames need temporal_compression * 1 + 1 pixel frames.
+    assert prepared.conditioning.pixel_values.shape == (1, 3, 3, 32, 32)
+    np.testing.assert_array_equal(
+        prepared.noisy_vision_token_indexes, np.arange(8, 12)
+    )
+
+
+def test_guidance_scale_follows_the_manifest_mode(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    assert preprocessor.guidance_scale(mode="image_to_video") == 5.0
+    assert preprocessor.guidance_scale(mode="action") == 1.0
+    assert preprocessor.guidance_scale(mode=None) == 1.0
+    assert (
+        preprocessor.guidance_scale(mode="image_to_video", requested=2.5)
+        == 2.5
+    )
+    assert preprocessor.default_negative_prompt("image_to_video") == "blurry"
+
+
+def test_unconditional_prompt_defaults_to_empty_text(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    prepared = preprocessor.prepare_world("cat", image=image)
+    empty = preprocessor.prepare_generator_prompt("", allow_empty=True)
+
+    assert prepared.unconditional_input_ids is not None
+    np.testing.assert_array_equal(prepared.unconditional_input_ids, empty)
+
+    negative = preprocessor.prepare_world(
+        "cat", image=image, negative_prompt="cat"
+    )
+    assert negative.unconditional_input_ids is not None
+    assert not np.array_equal(negative.unconditional_input_ids, empty)
+
+
+def test_unguided_generation_rejects_a_negative_prompt(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    with pytest.raises(ValueError, match="guidance scale"):
+        preprocessor.prepare_world("cat", negative_prompt="blurry")
+
+
+def test_guidance_requires_a_declared_program(
+    preprocessing_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(preprocessing_package)
+
+    assert preprocessor.unconditional_input_name() is None
+    with pytest.raises(ValueError, match="classifier-free guidance"):
+        preprocessor.prepare_world("cat", guidance_scale=5.0)
+
+
+def test_image_conditioning_requires_a_declared_recipe(
+    preprocessing_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(preprocessing_package)
+
+    with pytest.raises(ValueError, match="image-conditioned"):
+        preprocessor.prepare_world(
+            "cat", image=np.zeros((8, 8, 3), dtype=np.uint8)
+        )
+
+
+def test_generator_prompt_appends_manifest_suffix_tokens(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+
+    token_ids = preprocessor.prepare_generator_prompt("cat")
+
+    assert token_ids[-2:].tolist() == [2, 3]
+    assert preprocessor.generator_prompt.system_prompt(is_image=False) == (
+        "system video"
+    )
+
+
+def test_undeclared_system_prompt_is_reported(
+    preprocessing_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(preprocessing_package)
+
+    assert preprocessor.prepare_generator_prompt("cat")[-1] != 3
+    with pytest.raises(ValueError, match="system prompt"):
+        preprocessor.prepare_generator_prompt("cat", use_system_prompt=True)
+
+
+def test_metadata_templates_are_applied_per_polarity(
+    conditioned_package: Path,
+) -> None:
+    packer = WorldModelPreprocessor(conditioned_package).generator_prompt
+
+    positive = packer.apply_templates(
+        "a robot",
+        negative=False,
+        is_image=False,
+        frames=121,
+        height=480,
+        width=832,
+        fps=24.0,
+        add_resolution_template=True,
+        add_duration_template=True,
+    )
+    negative = packer.apply_templates(
+        "",
+        negative=True,
+        is_image=False,
+        frames=121,
+        height=480,
+        width=832,
+        fps=24.0,
+        add_resolution_template=True,
+        add_duration_template=True,
+    )
+    image = packer.apply_templates(
+        "a robot",
+        negative=False,
+        is_image=True,
+        frames=1,
+        height=480,
+        width=832,
+        fps=24.0,
+        add_resolution_template=True,
+        add_duration_template=True,
+    )
+
+    assert positive == (
+        "a robot. The video is 5.0 seconds long and is of 24 FPS. "
+        "This video is of 480x832 resolution."
+    )
+    assert negative == (
+        "The video is not 5.0 seconds long and is not of 24 FPS. "
+        "This video is not of 480x832 resolution."
+    )
+    assert image == "a robot. This image is of 480x832 resolution."
+
+
+def test_structured_prompts_are_never_rewritten(
+    conditioned_package: Path,
+) -> None:
+    packer = WorldModelPreprocessor(conditioned_package).generator_prompt
+    prompt = json.dumps({"actions": [{"description": "a robot moves."}]})
+
+    assert (
+        packer.apply_templates(
+            prompt,
+            negative=False,
+            is_image=False,
+            frames=121,
+            height=480,
+            width=832,
+            fps=24.0,
+            add_resolution_template=True,
+            add_duration_template=True,
+        )
+        == prompt
+    )
+
+
+def test_recipe_disables_templates_by_default(
+    conditioned_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(conditioned_package)
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    prepared = preprocessor.prepare_world("cat", image=image)
+    plain = preprocessor.prepare_generator_prompt("cat")
+    templated = preprocessor.prepare_world(
+        "cat",
+        image=image,
+        add_resolution_template=True,
+    )
+
+    np.testing.assert_array_equal(prepared.input_ids, plain)
+    assert not np.array_equal(templated.input_ids, plain)
+
+
+def test_missing_template_reports_the_expected_manifest_key(
+    preprocessing_package: Path,
+) -> None:
+    preprocessor = WorldModelPreprocessor(preprocessing_package)
+
+    with pytest.raises(ValueError, match="video_resolution"):
+        preprocessor.prepare_generator_prompt(
+            "cat",
+            frames=5,
+            height=32,
+            width=32,
+            fps=24.0,
+            add_resolution_template=True,
+        )
 
 
 def test_prepares_text_and_image(
@@ -663,6 +1332,12 @@ class _FakeSession:
                 "action_velocity": np.ones((1, 8), dtype=np.float32),
                 "vision_velocity": np.ones((12, 16), dtype=np.float32),
             }
+        if stage == "encode_video":
+            return {
+                "encoded_video_latent": np.full(
+                    (1, 4, 1, 4, 4), 0.25, dtype=np.float32
+                )
+            }
         if stage == "decode_video":
             latent_frames = int((options or {}).get("video_latent_frames", 3))
             frames = (latent_frames - 1) * 2 + 1
@@ -700,6 +1375,11 @@ class _FakePipeline:
                 name="world_generation",
                 kind="iterative",
                 run_on="step",
+            ),
+            SimpleNamespace(
+                name="encode_video",
+                kind="on_demand",
+                run_on="on_demand",
             ),
             SimpleNamespace(
                 name="decode_video",
@@ -828,6 +1508,101 @@ def test_video_and_action_generators_return_modality_outputs(
         "decode_video",
         "world_generation",
     ]
+
+
+@pytest.fixture
+def conditioned_world_model(
+    conditioned_package: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> WorldModel:
+    monkeypatch.setattr(generation, "Pipeline", _FakePipeline)
+    return WorldModel(conditioned_package)
+
+
+def test_video_generator_conditions_and_guides(
+    conditioned_world_model: WorldModel,
+) -> None:
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    image[:, :8] = 255
+
+    result = conditioned_world_model.video.generate(
+        "cat",
+        image=image,
+        negative_prompt="cat",
+        seed=3,
+    )
+
+    fake = _FakePipeline.last_instance
+    assert fake is not None
+    assert [call[0] for call in fake.session.calls] == [
+        "encode_video",
+        "world_generation",
+        "decode_video",
+    ]
+    encode_inputs = fake.session.calls[0][1]["inputs"]
+    assert encode_inputs["video_encoder.sample"].shape == (1, 3, 1, 32, 32)
+    world = fake.session.calls[1][1]
+    assert "unconditional:generator.input_ids" in world["inputs"]
+    assert list(world["overrides"]) == [
+        "generator.vision_timestep_token_indexes"
+    ]
+    np.testing.assert_array_equal(
+        world["overrides"]["generator.vision_timestep_token_indexes"],
+        np.arange(4, 12),
+    )
+    assert world["options"]["mode"] == "image_to_video"
+    # Latent frame 0 carries the encoded conditioning frame.
+    np.testing.assert_allclose(
+        world["inputs"]["diffusion.initial_vision_latent"][:4],
+        np.full((4, 16), 0.25, dtype=np.float32),
+    )
+    assert result.video.shape == (1, 3, 5, 32, 32)
+    assert fake.session.released == [
+        "encode_video",
+        "world_generation",
+        "decode_video",
+    ]
+    assert set(result.timings) == {"encode", "generate", "decode"}
+
+
+def test_video_generator_can_disable_guidance(
+    conditioned_world_model: WorldModel,
+) -> None:
+    result = conditioned_world_model.video.generate(
+        "cat",
+        image=np.zeros((16, 16, 3), dtype=np.uint8),
+        guidance_scale=1.0,
+    )
+
+    fake = _FakePipeline.last_instance
+    assert fake is not None
+    world = fake.session.calls[1][1]
+    assert "unconditional:generator.input_ids" not in world["inputs"]
+    assert world["options"]["guidance_scale"] == 1.0
+    assert result.video.shape == (1, 3, 5, 32, 32)
+
+
+def test_text_to_video_stays_unconditioned(
+    conditioned_world_model: WorldModel,
+) -> None:
+    conditioned_world_model.video.generate(
+        "cat",
+        frames=5,
+        height=32,
+        width=32,
+        num_inference_steps=2,
+    )
+
+    fake = _FakePipeline.last_instance
+    assert fake is not None
+    assert [call[0] for call in fake.session.calls] == [
+        "world_generation",
+        "decode_video",
+    ]
+    world = fake.session.calls[0][1]
+    assert world["overrides"] is None
+    assert "mode" not in world["options"]
+    assert "unconditional:generator.input_ids" not in world["inputs"]
 
 
 def test_image_generator_returns_one_frame(

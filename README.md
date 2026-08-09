@@ -34,6 +34,10 @@ The loader supports Mobius pipeline schema 1.x and validates:
 Unknown or unsupported semantics fail during loading or execution instead of
 silently selecting a fallback.
 
+Image-to-video conditioning and classifier-free guidance are described by
+additional stage options and metadata; see the manifest contract in the
+[Pipeline API](docs/pipeline-api.md).
+
 ## Architecture
 
 ```text
@@ -150,8 +154,47 @@ print(image.images.shape)
 
 `image=` accepts an image path, PIL image, or NumPy array. `video=` accepts a
 video path, frame sequence, or THWC/TCHW NumPy array. They are mutually
-exclusive in one text-generation request. Image-to-video conditioning is not
-yet supported.
+exclusive in one text-generation request.
+
+### Image-to-video
+
+`model.video.generate(prompt, image=...)` runs the image-to-video recipe the
+package declares. Text-to-video and text-to-image are unchanged: image
+conditioning is never inferred, and a package without that recipe rejects
+`image=`.
+
+```python
+video = model.video.generate(
+    "A robot picks up the red block.",
+    image="frame.png",
+    negative_prompt=model.video.default_negative_prompt("image_to_video"),
+    guidance_scale=5.0,
+    frames=121,
+    height=480,
+    width=832,
+    num_inference_steps=50,
+    seed=1234,
+)
+```
+
+The conditioning frame is normalized to the encoder's range, encoded by the
+declared encoder stage, packed into generator token rows, and written over the
+noise of the conditioned latent frames. Only the remaining rows carry a
+timestep, an MSE index, and a scheduler update, so the conditioned frame is
+bit-identical from the first step to the last. Each step then runs the
+generator once for the prompt and once for the negative prompt and combines the
+velocities as `unconditional + scale * (conditional - unconditional)`.
+
+`guidance_scale=1` skips the unconditional pass. `negative_prompt` defaults to
+the empty string unless the recipe declares `"negative_default": "asset"`, and
+`negative_input_ids` supplies unconditional token IDs directly — it is mutually
+exclusive with `negative_prompt`, and using either without active guidance is
+an error. `conditioned_latent_frames=`, the metadata templates
+(`add_resolution_template`, `add_duration_template`), and the system prompt
+(`use_system_prompt`, `system_prompt`) all default to the recipe's values; JSON
+prompts are never rewritten by the templates. Scheduler modes stay explicit:
+`mode="image_to_video"` is selected when an image is supplied, and a call that
+selects no mode keeps the stage defaults.
 
 Low-level tensor and stage execution is documented in the
 [Pipeline API](docs/pipeline-api.md). Cosmos3 Edge results are in
@@ -162,5 +205,6 @@ Low-level tensor and stage execution is documented in the
 - Text, image, video, and action generation from Mobius packages.
 - Configurable execution providers, subject to the loaded ONNX Runtime build.
 - One image or video per text-generation request.
-- Image-to-video conditioning and output media encoding are not yet included.
+- Image-to-video conditioning and classifier-free guidance for packages that
+  declare them; output media encoding is not yet included.
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

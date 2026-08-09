@@ -27,3 +27,25 @@ The tested export uses a fixed vision encoder input of normalized NCHW
 `[1, 3, 256, 256]` and produces 64 feature rows. Its reasoner input therefore
 contains 64 image-placeholder tokens. These values describe that test artifact
 only; newer exports may use variable-resolution packed vision inputs.
+
+## Image-to-video
+
+Image-to-video orchestration is covered by unit tests and by an end-to-end
+guided/conditioned test on real ONNX Runtime sessions with tiny hand-built
+components. It has not yet been replayed against a full Edge export, because
+that requires a package whose manifest declares the `guidance`,
+`conditioning`, `generation_recipes`, and `generator_prompt` contracts.
+`tools/image_to_video_smoke.py` runs that check once such a package exists:
+
+```bash
+# Host preprocessing only; works with any exported pipeline.json.
+python tools/image_to_video_smoke.py output/cosmos3-edge frame.png --dry-run
+
+# Full conditioning, guided denoising, and decode.
+python tools/image_to_video_smoke.py output/cosmos3-edge frame.png \
+    --prompt "A robot picks up the red block." --steps 2 --frames 5
+```
+
+`tests/python/test_image_to_video_smoke.py` runs the dry check on every test
+run and the full check when `ONNX_WORLD_MODEL_EDGE_PACKAGE` points at an
+exported package.

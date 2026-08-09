@@ -32,6 +32,23 @@ void CheckThrows(Function&& function, const char* message) {
   }
 }
 
+template <typename Function>
+void CheckThrowsMessage(
+    Function&& function,
+    std::string_view expected,
+    const char* message) {
+  try {
+    function();
+    Check(false, message);
+  } catch (const onnx_world_model::Error& error) {
+    if (std::string_view(error.what()).find(expected) ==
+        std::string_view::npos) {
+      std::cerr << "FAILED: " << message << " (got: " << error.what() << ")\n";
+      ++failures;
+    }
+  }
+}
+
 class IdentityBackend final : public onnx_world_model::ModelBackend {
  public:
   IdentityBackend() {
@@ -825,6 +842,407 @@ constexpr std::string_view kAutoregressiveManifest = R"json(
 }
 )json";
 
+class GuidedVelocityBackend final : public onnx_world_model::ModelBackend {
+ public:
+  struct Pass {
+    std::int64_t prompt{0};
+    std::int64_t und_len{0};
+    std::vector<std::int64_t> text_indexes;
+    std::vector<std::int64_t> vision_sequence_indexes;
+    std::vector<std::int64_t> vision_mse_loss_indexes;
+  };
+
+  GuidedVelocityBackend() {
+    metadata_.inputs = {
+        {
+            .name = "input_ids",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {-1},
+        },
+        {
+            .name = "text_indexes",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {-1},
+        },
+        {
+            .name = "und_len",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {1},
+        },
+        {
+            .name = "vision_tokens",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {-1, 2},
+        },
+        {
+            .name = "vision_sequence_indexes",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {-1},
+        },
+        {
+            .name = "vision_timestep_token_indexes",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {-1},
+        },
+        {
+            .name = "vision_mse_loss_indexes",
+            .data_type = onnx_world_model::DataType::int64,
+            .shape = {-1},
+        },
+        {
+            .name = "vision_timesteps",
+            .data_type = onnx_world_model::DataType::float32,
+            .shape = {-1},
+        },
+    };
+    metadata_.outputs = {{
+        .name = "vision_pred",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {-1, 2},
+    }};
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    ++calls;
+    const auto prompt = inputs.at("input_ids").values<std::int64_t>();
+    const auto indexes =
+        inputs.at("vision_timestep_token_indexes").values<std::int64_t>();
+    Check(
+        inputs.at("vision_timesteps").element_count() == indexes.size(),
+        "one timestep per noisy vision token");
+    Check(
+        inputs.at("vision_tokens").shape()[0] == 3,
+        "the generator always sees every vision token");
+    const auto values = [](const onnx_world_model::Tensor& tensor) {
+      const auto span = tensor.values<std::int64_t>();
+      return std::vector<std::int64_t>(span.begin(), span.end());
+    };
+    passes.push_back(Pass{
+        .prompt = prompt[0],
+        .und_len = inputs.at("und_len").values<std::int64_t>()[0],
+        .text_indexes = values(inputs.at("text_indexes")),
+        .vision_sequence_indexes = values(inputs.at("vision_sequence_indexes")),
+        .vision_mse_loss_indexes = values(inputs.at("vision_mse_loss_indexes")),
+    });
+    // Predict a constant velocity that identifies the prompt, so the test can
+    // verify the classifier-free combination exactly.
+    onnx_world_model::Tensor prediction = onnx_world_model::Tensor::Zeros(
+        onnx_world_model::DataType::float32,
+        {static_cast<std::int64_t>(indexes.size()), 2});
+    auto span = std::span(
+        reinterpret_cast<float*>(prediction.mutable_bytes().data()),
+        prediction.element_count());
+    std::ranges::fill(span, static_cast<float>(prompt[0]));
+    return {{"vision_pred", std::move(prediction)}};
+  }
+
+  mutable int calls{0};
+  mutable std::vector<Pass> passes;
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+class ConditioningEncoderBackend final
+    : public onnx_world_model::ModelBackend {
+ public:
+  ConditioningEncoderBackend() {
+    metadata_.inputs = {{
+        .name = "sample",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1, 3, 1, 2, 2},
+    }};
+    metadata_.outputs = {{
+        .name = "latent",
+        .data_type = onnx_world_model::DataType::float32,
+        .shape = {1, 2, 1, 1, 1},
+    }};
+  }
+
+  [[nodiscard]] const onnx_world_model::ModelMetadata& metadata()
+      const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] onnx_world_model::NamedTensors Run(
+      const onnx_world_model::NamedTensors& inputs) const override {
+    (void)inputs;
+    const std::array<float, 2> latent{10.0F, 10.0F};
+    return {{
+        "latent",
+        onnx_world_model::Tensor::FromValues<float>(
+            {1, 2, 1, 1, 1}, std::span(latent)),
+    }};
+  }
+
+ private:
+  onnx_world_model::ModelMetadata metadata_;
+};
+
+constexpr std::string_view kGuidanceManifest = R"json(
+{
+  "format": "mobius-pipeline",
+  "schema_version": "1.1",
+  "manifest": {
+    "schema_version": "1.1",
+    "components": [
+      {
+        "name": "generator",
+        "role": "dynamics",
+        "run_on": "step",
+        "inputs": [
+          {"name": "input_ids", "dtype": "INT64", "shape": ["text"]},
+          {"name": "text_indexes", "dtype": "INT64", "shape": ["text"]},
+          {"name": "und_len", "dtype": "INT64", "shape": [1]},
+          {"name": "vision_tokens", "dtype": "FLOAT", "shape": ["vision", 2]},
+          {
+            "name": "vision_sequence_indexes",
+            "dtype": "INT64",
+            "shape": ["vision"]
+          },
+          {
+            "name": "vision_timestep_token_indexes",
+            "dtype": "INT64",
+            "shape": ["noisy"]
+          },
+          {
+            "name": "vision_mse_loss_indexes",
+            "dtype": "INT64",
+            "shape": ["noisy"]
+          },
+          {"name": "vision_timesteps", "dtype": "FLOAT", "shape": ["noisy"]}
+        ],
+        "outputs": [
+          {"name": "vision_pred", "dtype": "FLOAT", "shape": ["noisy", 2]}
+        ],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      },
+      {
+        "name": "video_encoder",
+        "role": "encoder",
+        "run_on": "on_demand",
+        "inputs": [
+          {"name": "sample", "dtype": "FLOAT", "shape": [1, 3, 1, 2, 2]}
+        ],
+        "outputs": [
+          {"name": "latent", "dtype": "FLOAT", "shape": [1, 2, 1, 1, 1]}
+        ],
+        "preferred_execution_providers": ["cpu"],
+        "parameter_dtype": "FLOAT"
+      }
+    ],
+    "connections": [
+      {
+        "source": "generator.vision_pred",
+        "target": "generator.vision_tokens",
+        "recurrent": true,
+        "transform": "scheduler_step",
+        "parameters": {
+          "scheduler_asset": "scheduler.json",
+          "stage": "world_generation",
+          "state": "vision_state",
+          "timestep_input": "generator.vision_timesteps"
+        }
+      }
+    ],
+    "stages": [
+      {
+        "name": "world_generation",
+        "kind": "iterative",
+        "components": ["generator"],
+        "run_on": "step",
+        "capabilities": [
+          "loop_carried_state",
+          "classifier_free_guidance",
+          "conditioned_diffusion"
+        ],
+        "options": {
+          "scheduler": {
+            "kind": "FlowMatchEulerDiscreteScheduler",
+            "config_asset": "scheduler.json",
+            "mode_overrides": {
+              "image_to_video": {"guidance_scale": 3.0}
+            }
+          },
+          "guidance": {
+            "kind": "classifier_free",
+            "conditioning_input": "generator.input_ids",
+            "scale_option": "guidance_scale",
+            "default_scale": 1.0,
+            "combine": "unconditional + scale * (conditional - unconditional)"
+          },
+          "conditioning": {
+            "vision": {
+              "encoder_stage": "encode_video",
+              "encoder_input": "video_encoder.sample",
+              "encoder_output": "video_encoder.latent",
+              "state": "vision_state",
+              "conditioned_latent_frames_option":
+                "vision_conditioned_latent_frames",
+              "default_conditioned_latent_frames": [],
+              "preprocessing": {
+                "resize": "stretch_to_target",
+                "resample": "bicubic",
+                "convert_rgb": true,
+                "normalize": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}
+              },
+              "packing": {
+                "spatial_patch_size": 1,
+                "temporal_patch_size": 1,
+                "input_layout": "BCTHW",
+                "output_layout": "NC",
+                "channel_order": "patch_height_patch_width_channel"
+              }
+            }
+          },
+          "default_steps": 1,
+          "timestep": {},
+          "state_inputs": ["generator.vision_tokens"]
+        }
+      },
+      {
+        "name": "encode_video",
+        "kind": "single_pass",
+        "components": ["video_encoder"],
+        "run_on": "on_demand"
+      }
+    ],
+    "inputs": [
+      {
+        "port": "generator.input_ids",
+        "kind": "external",
+        "alias": "generator_input_ids",
+        "semantic": "text.token_ids",
+        "required": true
+      },
+      {
+        "port": "generator.vision_tokens",
+        "kind": "external",
+        "alias": "initial_vision_tokens",
+        "semantic": "diffusion.initial_vision_latent",
+        "required": true
+      },
+      {
+        "port": "generator.vision_timestep_token_indexes",
+        "kind": "generated",
+        "semantic": "packing.vision_timestep_token_indexes",
+        "generator": {
+          "kind": "packed_sequence_layout",
+          "parameters": {
+            "modality": "vision",
+            "source": "generator.vision_tokens",
+            "index_kind": "vision_timestep_token_indexes"
+          }
+        }
+      },
+      {
+        "port": "generator.text_indexes",
+        "kind": "generated",
+        "semantic": "packing.text_indexes",
+        "generator": {
+          "kind": "packed_sequence_layout",
+          "parameters": {
+            "modality": "text",
+            "source": "generator.input_ids",
+            "index_kind": "text_indexes"
+          }
+        }
+      },
+      {
+        "port": "generator.und_len",
+        "kind": "generated",
+        "semantic": "packing.und_len",
+        "generator": {
+          "kind": "packed_sequence_layout",
+          "parameters": {
+            "modality": "text",
+            "source": "generator.input_ids",
+            "understanding_prefix": true,
+            "index_kind": "und_len"
+          }
+        }
+      },
+      {
+        "port": "generator.vision_sequence_indexes",
+        "kind": "generated",
+        "semantic": "packing.vision_sequence_indexes",
+        "generator": {
+          "kind": "packed_sequence_layout",
+          "parameters": {
+            "modality": "vision",
+            "source": "generator.vision_tokens",
+            "index_kind": "vision_sequence_indexes"
+          }
+        }
+      },
+      {
+        "port": "generator.vision_mse_loss_indexes",
+        "kind": "generated",
+        "semantic": "packing.vision_mse_loss_indexes",
+        "generator": {
+          "kind": "packed_sequence_layout",
+          "parameters": {
+            "modality": "vision",
+            "source": "generator.vision_tokens",
+            "index_kind": "vision_mse_loss_indexes"
+          }
+        }
+      },
+      {
+        "port": "generator.vision_timesteps",
+        "kind": "generated",
+        "semantic": "diffusion.vision.timesteps",
+        "generator": {
+          "kind": "scheduler_timesteps",
+          "parameters": {"stage": "world_generation", "modality": "vision"}
+        }
+      },
+      {
+        "port": "video_encoder.sample",
+        "kind": "external",
+        "alias": "video_encoder_sample",
+        "semantic": "video.frames",
+        "required": true
+      }
+    ],
+    "outputs": [
+      {"state": "vision_state", "alias": "vision_latent"},
+      {"port": "generator.vision_pred", "alias": "vision_velocity"},
+      {"port": "video_encoder.latent", "alias": "encoded_video_latent"}
+    ],
+    "profile": {"name": "guided-world", "version": "1.0"},
+    "states": [
+      {
+        "name": "vision_state",
+        "kind": "diffusion_latent",
+        "input": "generator.vision_tokens",
+        "output": "generator.vision_pred",
+        "lifetime": "request",
+        "release_after": "world_generation",
+        "sequence_axis": 0
+      }
+    ],
+    "assets": [{"path": "scheduler.json"}],
+    "required_capabilities": [
+      "iterative_scheduler",
+      "loop_carried_state",
+      "packed_sequence_program"
+    ]
+  },
+  "component_files": {
+    "generator": "generator/model.onnx",
+    "video_encoder": "video_encoder/model.onnx"
+  }
+}
+)json";
+
 }  // namespace
 
 int main(int argument_count, char** arguments) {
@@ -1053,6 +1471,370 @@ int main(int argument_count, char** arguments) {
           (-0.913395524F)) < 1e-4F,
       "UniPC scheduler steps");
   std::filesystem::remove_all(scheduler_root);
+
+  // Classifier-free guidance over a conditioned diffusion stage.
+  PipelineManifest guidance_manifest =
+      PipelineManifest::Parse(kGuidanceManifest);
+  const auto guidance_root =
+      std::filesystem::temp_directory_path() /
+      "onnx-world-model-guidance-test";
+  std::filesystem::remove_all(guidance_root);
+  std::filesystem::create_directories(guidance_root);
+  {
+    std::ofstream scheduler(guidance_root / "scheduler.json");
+    scheduler << R"json({
+      "_class_name":"FlowMatchEulerDiscreteScheduler",
+      "num_train_timesteps":1000,
+      "shift":1.0
+    })json";
+  }
+  auto guided_backend = std::make_shared<GuidedVelocityBackend>();
+  std::unordered_map<std::string, Model> guided_models;
+  guided_models.emplace("generator", Model(guided_backend));
+  guided_models.emplace(
+      "video_encoder",
+      Model(std::make_shared<ConditioningEncoderBackend>()));
+  onnx_world_model::Pipeline guided_pipeline(PipelinePackage(
+      guidance_root, guidance_manifest, std::move(guided_models)));
+  auto guided_session = guided_pipeline.CreateSession();
+  auto encoded = guided_session.RunStage(
+      "encode_video",
+      {
+          {
+              "video.frames",
+              onnx_world_model::Tensor::Zeros(
+                  onnx_world_model::DataType::float32, {1, 3, 1, 2, 2}),
+          },
+      });
+  Check(
+      encoded.at("encoded_video_latent").values<float>()[0] == 10.0F,
+      "conditioning encoder stage output");
+
+  // Latent frame 0 carries the encoded conditioning frame; frames 1 and 2 are
+  // noisy and are the only rows the timestep/loss index sets name. The two
+  // prompts have different lengths, so every packed index must be rebuilt for
+  // the unconditional pass.
+  const std::array<float, 6> conditioned_latent{
+      10.0F, 10.0F, 20.0F, 20.0F, 30.0F, 30.0F};
+  const std::array<std::int64_t, 3> conditional_prompt{7, 7, 7};
+  const std::array<std::int64_t, 1> unconditional_prompt{1};
+  const std::array<std::int64_t, 2> noisy_tokens{1, 2};
+  onnx_world_model::PipelineRunOptions guided_options;
+  guided_options.strings.emplace("mode", "image_to_video");
+  auto guided_output = guided_session.RunStage(
+      "world_generation",
+      {
+          {
+              "text.token_ids",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {3}, std::span(conditional_prompt)),
+          },
+          {
+              "diffusion.initial_vision_latent",
+              onnx_world_model::Tensor::FromValues<float>(
+                  {3, 2}, std::span(conditioned_latent)),
+          },
+          {
+              "unconditional:generator.input_ids",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {1}, std::span(unconditional_prompt)),
+          },
+      },
+      {
+          {
+              "generator.vision_timestep_token_indexes",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {2}, std::span(noisy_tokens)),
+          },
+      },
+      guided_options);
+  Check(guided_backend->calls == 2, "guided step runs cond and uncond passes");
+  Check(
+      guided_backend->passes.size() == 2 &&
+          guided_backend->passes[0].prompt == 7 &&
+          guided_backend->passes[1].prompt == 1,
+      "guided passes use the conditional and unconditional prompts");
+  const auto& conditional_pass = guided_backend->passes[0];
+  const auto& unconditional_pass = guided_backend->passes[1];
+  // The conditional prompt is three tokens long, so vision starts at row 3.
+  Check(
+      conditional_pass.und_len == 3 &&
+          conditional_pass.text_indexes ==
+              std::vector<std::int64_t>({0, 1, 2}) &&
+          conditional_pass.vision_sequence_indexes ==
+              std::vector<std::int64_t>({3, 4, 5}) &&
+          conditional_pass.vision_mse_loss_indexes ==
+              std::vector<std::int64_t>({4, 5}),
+      "conditional pass packs the joint sequence behind its prompt");
+  // The unconditional prompt is one token long, so every joint index shifts.
+  Check(
+      unconditional_pass.und_len == 1 &&
+          unconditional_pass.text_indexes ==
+              std::vector<std::int64_t>({0}) &&
+          unconditional_pass.vision_sequence_indexes ==
+              std::vector<std::int64_t>({1, 2, 3}) &&
+          unconditional_pass.vision_mse_loss_indexes ==
+              std::vector<std::int64_t>({2, 3}),
+      "unconditional pass rebuilds the joint layout for its own prompt");
+  const auto guided_velocity =
+      guided_output.at("vision_velocity").values<float>();
+  Check(
+      guided_velocity.size() == 4 &&
+          std::ranges::all_of(
+              guided_velocity,
+              [](float value) { return std::abs(value - 19.0F) < 1e-5F; }),
+      "classifier-free velocity combination");
+  const auto guided_latent =
+      guided_output.at("vision_latent").values<float>();
+  Check(
+      guided_latent.size() == 6 && guided_latent[0] == 10.0F &&
+          guided_latent[1] == 10.0F,
+      "conditioned latent frame is preserved by the scheduler");
+  Check(
+      std::abs(guided_latent[2] - 1.0F) < 1e-5F &&
+          std::abs(guided_latent[4] - 11.0F) < 1e-5F,
+      "noisy latent frames follow the guided velocity");
+
+  auto unguided_backend = std::make_shared<GuidedVelocityBackend>();
+  std::unordered_map<std::string, Model> unguided_models;
+  unguided_models.emplace("generator", Model(unguided_backend));
+  unguided_models.emplace(
+      "video_encoder",
+      Model(std::make_shared<ConditioningEncoderBackend>()));
+  onnx_world_model::Pipeline unguided_pipeline(PipelinePackage(
+      guidance_root, guidance_manifest, std::move(unguided_models)));
+  auto unguided_session = unguided_pipeline.CreateSession();
+  onnx_world_model::PipelineRunOptions unguided_options;
+  unguided_options.strings.emplace("mode", "image_to_video");
+  unguided_options.numbers.emplace("guidance_scale", 1.0);
+  auto unguided_output = unguided_session.RunStage(
+      "world_generation",
+      {
+          {
+              "text.token_ids",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {3}, std::span(conditional_prompt)),
+          },
+          {
+              "diffusion.initial_vision_latent",
+              onnx_world_model::Tensor::FromValues<float>(
+                  {3, 2}, std::span(conditioned_latent)),
+          },
+      },
+      {
+          {
+              "generator.vision_timestep_token_indexes",
+              onnx_world_model::Tensor::FromValues<std::int64_t>(
+                  {2}, std::span(noisy_tokens)),
+          },
+      },
+      unguided_options);
+  Check(
+      unguided_backend->calls == 1,
+      "guidance scale 1 skips the unconditional pass");
+  const auto unguided_latent =
+      unguided_output.at("vision_latent").values<float>();
+  Check(
+      unguided_latent[0] == 10.0F &&
+          std::abs(unguided_latent[2] - 13.0F) < 1e-5F,
+      "unguided step uses the conditional velocity only");
+
+  auto missing_session = guided_pipeline.CreateSession();
+  CheckThrows(
+      [&missing_session,
+       &conditional_prompt,
+       &conditioned_latent,
+       &noisy_tokens] {
+        onnx_world_model::PipelineRunOptions options;
+        options.strings.emplace("mode", "image_to_video");
+        (void)missing_session.RunStage(
+            "world_generation",
+            {
+                {
+                    "text.token_ids",
+                    onnx_world_model::Tensor::FromValues<std::int64_t>(
+                        {3}, std::span(conditional_prompt)),
+                },
+                {
+                    "diffusion.initial_vision_latent",
+                    onnx_world_model::Tensor::FromValues<float>(
+                        {3, 2}, std::span(conditioned_latent)),
+                },
+            },
+            {
+                {
+                    "generator.vision_timestep_token_indexes",
+                    onnx_world_model::Tensor::FromValues<std::int64_t>(
+                        {2}, std::span(noisy_tokens)),
+                },
+            },
+            options);
+      },
+      "guidance without an unconditional value must fail");
+  std::filesystem::remove_all(guidance_root);
+
+  std::string unknown_guidance(kGuidanceManifest);
+  const std::string guidance_kind = R"json("kind": "classifier_free")json";
+  unknown_guidance.replace(
+      unknown_guidance.find(guidance_kind),
+      guidance_kind.size(),
+      R"json("kind": "distilled")json");
+  CheckThrowsMessage(
+      [&unknown_guidance] {
+        (void)PipelineManifest::Parse(unknown_guidance);
+      },
+      "unsupported kind",
+      "unknown guidance kind must fail");
+
+  std::string unguided_capability(kGuidanceManifest);
+  const std::string guidance_capability =
+      R"json("classifier_free_guidance",)json";
+  unguided_capability.replace(
+      unguided_capability.find(guidance_capability),
+      guidance_capability.size(),
+      "");
+  CheckThrowsMessage(
+      [&unguided_capability] {
+        (void)PipelineManifest::Parse(unguided_capability);
+      },
+      "requires stage capability 'classifier_free_guidance'",
+      "guidance without the stage capability must fail");
+
+  // The runtime advertises the capabilities it implements, and a stage may
+  // not claim one without the option that describes it.
+  const auto supported = PipelineManifest::SupportedCapabilities();
+  for (const std::string_view capability :
+       {"classifier_free_guidance",
+        "conditioned_diffusion",
+        "loop_carried_state",
+        "iterative_scheduler",
+        "packed_sequence_program"}) {
+    Check(
+        std::ranges::find(supported, capability) != supported.end(),
+        "runtime advertises an implemented capability");
+  }
+
+  std::string unimplemented(kGuidanceManifest);
+  const std::string required_list = R"json("iterative_scheduler",)json";
+  unimplemented.replace(
+      unimplemented.rfind(required_list),
+      required_list.size(),
+      R"json("iterative_scheduler", "streaming",)json");
+  CheckThrowsMessage(
+      [&unimplemented] { (void)PipelineManifest::Parse(unimplemented); },
+      "which this runtime does not implement",
+      "unimplemented required capability must fail");
+
+  // A capability a component or stage declares stays honored even though the
+  // runtime has no program of its own for it.
+  std::string provided_capability(unimplemented);
+  const std::string stage_capabilities =
+      R"json("loop_carried_state",
+          "classifier_free_guidance",)json";
+  provided_capability.replace(
+      provided_capability.find(stage_capabilities),
+      stage_capabilities.size(),
+      R"json("loop_carried_state",
+          "streaming",
+          "classifier_free_guidance",)json");
+  (void)PipelineManifest::Parse(provided_capability);
+  std::string component_capability(unimplemented);
+  const std::string component_dtype = R"json("parameter_dtype": "FLOAT")json";
+  component_capability.replace(
+      component_capability.find(component_dtype),
+      component_dtype.size(),
+      R"json("parameter_dtype": "FLOAT",
+        "capabilities": ["streaming"])json");
+  (void)PipelineManifest::Parse(component_capability);
+
+  std::string unknown_preprocessing(kGuidanceManifest);
+  const std::string resample = R"json("resample": "bicubic")json";
+  unknown_preprocessing.replace(
+      unknown_preprocessing.find(resample),
+      resample.size(),
+      R"json("resample": "spline")json");
+  CheckThrowsMessage(
+      [&unknown_preprocessing] {
+        (void)PipelineManifest::Parse(unknown_preprocessing);
+      },
+      "field 'resample' has unsupported value",
+      "unknown conditioning resample must fail");
+
+  std::string unknown_preprocessing_field(kGuidanceManifest);
+  unknown_preprocessing_field.replace(
+      unknown_preprocessing_field.find(resample),
+      resample.size(),
+      R"json("sharpen": true)json");
+  CheckThrowsMessage(
+      [&unknown_preprocessing_field] {
+        (void)PipelineManifest::Parse(unknown_preprocessing_field);
+      },
+      "has unknown field 'sharpen'",
+      "unknown conditioning preprocessing field must fail");
+
+  std::string zero_std(kGuidanceManifest);
+  const std::string normalize_std = R"json("std": [0.5, 0.5, 0.5])json";
+  zero_std.replace(
+      zero_std.find(normalize_std),
+      normalize_std.size(),
+      R"json("std": [0.5, 0.0, 0.5])json");
+  CheckThrowsMessage(
+      [&zero_std] { (void)PipelineManifest::Parse(zero_std); },
+      "must be non-zero",
+      "zero conditioning normalization std must fail");
+
+  std::string claimed_capability(kGuidanceManifest);
+  const std::size_t conditioning_begin =
+      claimed_capability.find(R"json("conditioning": {)json");
+  const std::size_t conditioning_end =
+      claimed_capability.find(R"json("default_steps")json");
+  claimed_capability.erase(
+      conditioning_begin, conditioning_end - conditioning_begin);
+  CheckThrowsMessage(
+      [&claimed_capability] {
+        (void)PipelineManifest::Parse(claimed_capability);
+      },
+      "declares no 'conditioning' option",
+      "advertised capability without its option must fail");
+
+  // Scheduler modes are selected explicitly; an absent mode uses the stage
+  // default instead of silently adopting an image-to-video recipe.
+  std::string mode_document(kIterativeManifest);
+  const std::string scheduler_asset =
+      R"json("config_asset": "scheduler.json")json";
+  mode_document.replace(
+      mode_document.find(scheduler_asset),
+      scheduler_asset.size(),
+      R"json("config_asset": "scheduler.json",
+            "mode_overrides": {
+              "image_to_video": {"num_inference_steps": 1}
+            })json");
+  PipelineManifest mode_manifest = PipelineManifest::Parse(mode_document);
+  std::unordered_map<std::string, Model> mode_models;
+  mode_models.emplace("counter", Model(std::make_shared<IncrementBackend>()));
+  onnx_world_model::Pipeline mode_pipeline(
+      PipelinePackage({}, mode_manifest, std::move(mode_models)));
+  auto default_mode_session = mode_pipeline.CreateSession();
+  auto default_mode_output = default_mode_session.RunStage("iterate");
+  Check(
+      default_mode_output.at("value").values<float>()[0] == 3.0F,
+      "absent scheduler mode keeps the declared default step count");
+  auto explicit_mode_session = mode_pipeline.CreateSession();
+  onnx_world_model::PipelineRunOptions mode_options;
+  mode_options.strings.emplace("mode", "image_to_video");
+  auto explicit_mode_output =
+      explicit_mode_session.RunStage("iterate", {}, {}, mode_options);
+  Check(
+      explicit_mode_output.at("value").values<float>()[0] == 1.0F,
+      "explicit scheduler mode selects its override");
+  auto unknown_mode_session = mode_pipeline.CreateSession();
+  CheckThrows(
+      [&unknown_mode_session] {
+        onnx_world_model::PipelineRunOptions options;
+        options.strings.emplace("mode", "video_to_video");
+        (void)unknown_mode_session.RunStage("iterate", {}, {}, options);
+      },
+      "unknown scheduler mode must fail");
 
   PipelineManifest autoregressive_manifest =
       PipelineManifest::Parse(kAutoregressiveManifest);

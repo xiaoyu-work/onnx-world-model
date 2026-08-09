@@ -660,6 +660,7 @@ struct PipelineSession::Impl {
   NamedTensors external_values;
   NamedTensors endpoint_values;
   NamedTensors state_values;
+  NamedTensors guidance_values;
   std::unordered_map<std::string, std::size_t> stage_iterations;
   mutable std::unordered_map<std::string, SchedulerHistory>
       scheduler_histories;
@@ -1046,8 +1047,6 @@ struct PipelineSession::Impl {
     } else if (options.strings.contains("action_domain") &&
                modes.contains("action")) {
       mode = "action";
-    } else if (modes.contains("image_to_video")) {
-      mode = "image_to_video";
     }
     if (mode.empty()) {
       return Json::object();
@@ -1058,6 +1057,178 @@ struct PipelineSession::Impl {
           "Unknown scheduler mode '" + mode + "'");
     }
     return modes.at(mode);
+  }
+
+  [[nodiscard]] Json StageGuidance(std::string_view stage_name) const {
+    const Json stage_options =
+        Json::parse(FindStage(manifest(), stage_name).options_json);
+    if (!stage_options.contains("guidance") ||
+        !stage_options.at("guidance").is_object()) {
+      return Json::object();
+    }
+    return stage_options.at("guidance");
+  }
+
+  // Names a host may use to supply the unconditional value of the guided
+  // input. The manifest may declare one explicitly; otherwise the reserved
+  // "unconditional:" prefix is applied to the guided port, its semantic, and
+  // its alias so no extra manifest field is required.
+  [[nodiscard]] std::vector<std::string> GuidanceInputNames(
+      const Json& guidance) const {
+    std::vector<std::string> names;
+    if (guidance.contains("unconditional_input") &&
+        guidance.at("unconditional_input").is_string()) {
+      names.push_back(
+          guidance.at("unconditional_input").get<std::string>());
+    }
+    const std::string conditioning =
+        guidance.value("conditioning_input", std::string{});
+    if (conditioning.empty()) {
+      return names;
+    }
+    names.push_back("unconditional:" + conditioning);
+    const Endpoint endpoint = Endpoint::Parse(conditioning);
+    if (const PipelineInput* declared =
+            FindDeclaredInput(manifest(), endpoint)) {
+      if (!declared->semantic.empty()) {
+        names.push_back("unconditional:" + declared->semantic);
+      }
+      if (!declared->name.empty()) {
+        names.push_back("unconditional:" + declared->name);
+      }
+    }
+    return names;
+  }
+
+  // Endpoints whose predictions are combined across the conditional and
+  // unconditional passes. The manifest may list them; otherwise every
+  // scheduler-driven recurrent output produced by the stage is guided.
+  [[nodiscard]] std::vector<std::string> GuidedOutputs(
+      const PipelineStage& stage,
+      const Json& guidance) const {
+    std::vector<std::string> result;
+    if (guidance.contains("outputs") && guidance.at("outputs").is_array()) {
+      for (const auto& value : guidance.at("outputs")) {
+        result.push_back(value.get<std::string>());
+      }
+      return result;
+    }
+    for (const auto& connection : manifest().connections()) {
+      if (!connection.recurrent ||
+          !connection.transform.has_value() ||
+          *connection.transform != "scheduler_step" ||
+          !Contains(stage.components, connection.source.component)) {
+        continue;
+      }
+      result.push_back(connection.source.qualified());
+    }
+    return result;
+  }
+
+  [[nodiscard]] double GuidanceScale(
+      std::string_view stage_name,
+      const Json& guidance,
+      const PipelineRunOptions& options) const {
+    const std::string scale_option =
+        guidance.value("scale_option", std::string("guidance_scale"));
+    const auto number = options.numbers.find(scale_option);
+    if (number != options.numbers.end()) {
+      return number->second;
+    }
+    const auto integer = options.integers.find(scale_option);
+    if (integer != options.integers.end()) {
+      return static_cast<double>(integer->second);
+    }
+    const Json mode = SchedulerModeOverrides(stage_name, options);
+    if (mode.contains(scale_option) && mode.at(scale_option).is_number()) {
+      return mode.at(scale_option).get<double>();
+    }
+    return guidance.value("default_scale", 1.0);
+  }
+
+  struct GuidancePlan {
+    bool active{false};
+    Endpoint conditioning;
+    Tensor unconditional;
+    double scale{1.0};
+    std::vector<std::string> outputs;
+  };
+
+  [[nodiscard]] GuidancePlan ResolveGuidance(
+      const PipelineStage& stage,
+      const NamedTensors& overrides,
+      const PipelineRunOptions& options) const {
+    GuidancePlan plan;
+    const Json guidance = StageGuidance(stage.name);
+    if (guidance.empty()) {
+      return plan;
+    }
+    const std::string kind = guidance.value("kind", std::string{});
+    if (kind != "classifier_free") {
+      ExecutionError("Unsupported stage guidance kind '" + kind + "'");
+    }
+    plan.scale = GuidanceScale(stage.name, guidance, options);
+    plan.conditioning =
+        Endpoint::Parse(guidance.at("conditioning_input").get<std::string>());
+    const Tensor* unconditional = nullptr;
+    for (const auto& name : GuidanceInputNames(guidance)) {
+      const auto stored = guidance_values.find(name);
+      if (stored != guidance_values.end()) {
+        unconditional = &stored->second;
+        break;
+      }
+      const auto supplied = overrides.find(name);
+      if (supplied != overrides.end()) {
+        unconditional = &supplied->second;
+        break;
+      }
+    }
+    if (plan.scale == 1.0) {
+      // Classifier-free guidance at scale 1 is the conditional pass itself.
+      return plan;
+    }
+    if (unconditional == nullptr) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "Stage '" + stage.name + "' uses classifier-free guidance at scale " +
+              std::to_string(plan.scale) + " but no unconditional value for '" +
+              plan.conditioning.qualified() +
+              "' was provided; supply 'unconditional:" +
+              plan.conditioning.qualified() + "'");
+    }
+    plan.unconditional = AdaptExternal(
+        *unconditional, manifest().Input(plan.conditioning));
+    plan.outputs = GuidedOutputs(stage, guidance);
+    if (plan.outputs.empty()) {
+      ExecutionError(
+          "Stage '" + stage.name +
+          "' declares guidance but produces no guided prediction");
+    }
+    plan.active = true;
+    return plan;
+  }
+
+  [[nodiscard]] static Tensor CombineGuidance(
+      const Tensor& conditional,
+      const Tensor& unconditional,
+      double scale) {
+    if (conditional.shape() != unconditional.shape() ||
+        conditional.data_type() != unconditional.data_type()) {
+      ExecutionError(
+          "Conditional and unconditional predictions have different shapes");
+    }
+    Tensor result(conditional.data_type(), conditional.shape());
+    for (std::size_t index = 0;
+         index < conditional.element_count();
+         ++index) {
+      const double guided = ReadFloat(unconditional, index);
+      WriteFloat(
+          result,
+          index,
+          static_cast<float>(
+              guided + scale * (ReadFloat(conditional, index) - guided)));
+    }
+    return result;
   }
 
   [[nodiscard]] std::size_t InferenceSteps(
@@ -2485,15 +2656,11 @@ struct PipelineSession::Impl {
     return result;
   }
 
-  [[nodiscard]] NamedTensors StepStage(
-      std::string_view stage_name,
-      const NamedTensors& inputs,
+  void RunStageComponents(
+      const PipelineStage& stage,
+      bool first_call_inputs_empty,
       const NamedTensors& overrides,
       const PipelineRunOptions& options) {
-    (void)options;
-    const PipelineStage& stage = FindStage(manifest(), stage_name);
-    StoreExternalInputs(inputs);
-
     for (const auto& component_name :
          TopologicalComponents(manifest(), stage)) {
       const PipelineComponent& component =
@@ -2504,7 +2671,7 @@ struct PipelineSession::Impl {
       const bool reuse_prefill_embedding =
           stage.kind == "autoregressive" &&
           stage_iterations[stage.name] == 0 &&
-          inputs.empty() &&
+          first_call_inputs_empty &&
           component.role == "embedding" &&
           std::ranges::all_of(
               component.metadata.outputs,
@@ -2528,6 +2695,89 @@ struct PipelineSession::Impl {
       for (auto& [name, tensor] : model_outputs) {
         endpoint_values.insert_or_assign(
             component.name + "." + name, std::move(tensor));
+      }
+    }
+  }
+
+  // Stores host-supplied unconditional values for a guided stage and returns
+  // the remaining inputs, which are bound as ordinary external values.
+  [[nodiscard]] NamedTensors ExtractGuidanceInputs(
+      const PipelineStage& stage,
+      const NamedTensors& inputs) {
+    const Json guidance = StageGuidance(stage.name);
+    if (guidance.empty() || inputs.empty()) {
+      return inputs;
+    }
+    const std::vector<std::string> names = GuidanceInputNames(guidance);
+    NamedTensors remaining;
+    remaining.reserve(inputs.size());
+    for (const auto& [name, tensor] : inputs) {
+      if (std::ranges::find(names, name) != names.end()) {
+        guidance_values.insert_or_assign(name, tensor);
+      } else {
+        remaining.emplace(name, tensor);
+      }
+    }
+    return remaining;
+  }
+
+  [[nodiscard]] NamedTensors StepStage(
+      std::string_view stage_name,
+      const NamedTensors& inputs,
+      const NamedTensors& overrides,
+      const PipelineRunOptions& options) {
+    const PipelineStage& stage = FindStage(manifest(), stage_name);
+    const NamedTensors external = ExtractGuidanceInputs(stage, inputs);
+    StoreExternalInputs(external);
+
+    const GuidancePlan guidance =
+        ResolveGuidance(stage, overrides, options);
+    RunStageComponents(stage, external.empty(), overrides, options);
+    if (guidance.active) {
+      // The conditional pass owns the packed layout that the scheduler
+      // update and the public outputs observe; the unconditional pass only
+      // contributes its prediction.
+      NamedTensors conditional_endpoints = endpoint_values;
+      const auto conditional_cursors = position_cursors;
+      NamedTensors conditional_outputs;
+      for (const auto& name : guidance.outputs) {
+        const auto produced = endpoint_values.find(name);
+        if (produced == endpoint_values.end()) {
+          ExecutionError(
+              "Guided output '" + name + "' was not produced by stage '" +
+              stage.name + "'");
+        }
+        conditional_outputs.emplace(name, produced->second);
+      }
+      const std::string conditioning = guidance.conditioning.qualified();
+      const auto saved = external_values.find(conditioning);
+      if (saved == external_values.end()) {
+        ExecutionError(
+            "Guided input '" + conditioning + "' has no conditional value");
+      }
+      const Tensor conditional_value = saved->second;
+      external_values.insert_or_assign(conditioning, guidance.unconditional);
+      RunStageComponents(stage, external.empty(), overrides, options);
+      NamedTensors combined;
+      for (const auto& name : guidance.outputs) {
+        const auto produced = endpoint_values.find(name);
+        if (produced == endpoint_values.end()) {
+          ExecutionError(
+              "Guided output '" + name +
+              "' was not produced by the unconditional pass");
+        }
+        combined.emplace(
+            name,
+            CombineGuidance(
+                conditional_outputs.at(name),
+                produced->second,
+                guidance.scale));
+      }
+      endpoint_values = std::move(conditional_endpoints);
+      position_cursors = conditional_cursors;
+      external_values.insert_or_assign(conditioning, conditional_value);
+      for (auto& [name, tensor] : combined) {
+        endpoint_values.insert_or_assign(name, std::move(tensor));
       }
     }
 
@@ -3007,7 +3257,13 @@ std::optional<Tensor> PipelineSession::state(std::string_view name) const {
 
 void PipelineSession::ReleaseStage(std::string_view stage) {
   std::scoped_lock lock(impl_->mutex);
-  (void)FindStage(impl_->manifest(), stage);
+  const PipelineStage& released = FindStage(impl_->manifest(), stage);
+  const Json guidance = impl_->StageGuidance(released.name);
+  if (!guidance.empty()) {
+    for (const auto& name : impl_->GuidanceInputNames(guidance)) {
+      impl_->guidance_values.erase(name);
+    }
+  }
   for (const auto& state : impl_->manifest().states()) {
     if (state.release_after != stage) {
       continue;
@@ -3054,6 +3310,7 @@ void PipelineSession::Reset() {
   impl_->external_values.clear();
   impl_->endpoint_values.clear();
   impl_->state_values.clear();
+  impl_->guidance_values.clear();
   impl_->stage_iterations.clear();
   impl_->scheduler_histories.clear();
   impl_->position_cursors.clear();

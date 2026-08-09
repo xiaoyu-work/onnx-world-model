@@ -147,6 +147,16 @@ def available_execution_providers(
     return tuple(_native.available_execution_providers(os.fspath(library_path)))
 
 
+def supported_pipeline_capabilities() -> tuple[str, ...]:
+    """Pipeline capability names this runtime implements.
+
+    A package whose ``required_capabilities`` names anything outside this set
+    is rejected while loading instead of failing later, or silently doing
+    nothing.
+    """
+    return tuple(_native.supported_pipeline_capabilities())
+
+
 class OnnxModel:
     """A generic named-tensor ONNX model session."""
 

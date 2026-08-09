@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <functional>
 #include <set>
@@ -389,7 +390,8 @@ struct ProgramDefinition {
   std::set<std::string> allowed;
 };
 
-const ProgramDefinition& TransformDefinition(std::string_view kind) {
+const std::unordered_map<std::string, ProgramDefinition>&
+TransformDefinitions() {
   static const std::unordered_map<std::string, ProgramDefinition> definitions{
       {"cast", {{"tensor_cast"}, {}, {"to"}}},
       {
@@ -515,6 +517,11 @@ const ProgramDefinition& TransformDefinition(std::string_view kind) {
           },
       },
   };
+  return definitions;
+}
+
+const ProgramDefinition& TransformDefinition(std::string_view kind) {
+  const auto& definitions = TransformDefinitions();
   const auto found = definitions.find(std::string(kind));
   if (found == definitions.end()) {
     Fail("Unknown pipeline transform '" + std::string(kind) + "'");
@@ -522,7 +529,8 @@ const ProgramDefinition& TransformDefinition(std::string_view kind) {
   return found->second;
 }
 
-const ProgramDefinition& GeneratorDefinition(std::string_view kind) {
+const std::unordered_map<std::string, ProgramDefinition>&
+GeneratorDefinitions() {
   static const std::unordered_map<std::string, ProgramDefinition> definitions{
       {
           "empty_tensor",
@@ -596,11 +604,49 @@ const ProgramDefinition& GeneratorDefinition(std::string_view kind) {
           },
       },
   };
+  return definitions;
+}
+
+const ProgramDefinition& GeneratorDefinition(std::string_view kind) {
+  const auto& definitions = GeneratorDefinitions();
   const auto found = definitions.find(std::string(kind));
   if (found == definitions.end()) {
     Fail("Unknown generated input program '" + std::string(kind) + "'");
   }
   return found->second;
+}
+
+//: Stage capabilities the runtime implements, and the stage option each one
+//: describes. A stage must advertise the capability when it declares the
+//: option, and declare the option when it advertises the capability.
+const std::unordered_map<std::string, std::string>& StageCapabilityOptions() {
+  static const std::unordered_map<std::string, std::string> options{
+      {"classifier_free_guidance", "guidance"},
+      {"conditioned_diffusion", "conditioning"},
+  };
+  return options;
+}
+
+const std::set<std::string>& SupportedCapabilityNames() {
+  static const std::set<std::string> capabilities = [] {
+    std::set<std::string> result{"loop_carried_state"};
+    for (const auto& [name, definition] : TransformDefinitions()) {
+      (void)name;
+      result.insert(
+          definition.capabilities.begin(), definition.capabilities.end());
+    }
+    for (const auto& [name, definition] : GeneratorDefinitions()) {
+      (void)name;
+      result.insert(
+          definition.capabilities.begin(), definition.capabilities.end());
+    }
+    for (const auto& [capability, option] : StageCapabilityOptions()) {
+      (void)option;
+      result.insert(capability);
+    }
+    return result;
+  }();
+  return capabilities;
 }
 
 void ValidateProgramParameters(
@@ -643,6 +689,8 @@ const std::set<std::string>& AllowedStageOptions(std::string_view kind) {
           "iterative",
           {
               "scheduler",
+              "guidance",
+              "conditioning",
               "default_steps",
               "timestep",
               "state_inputs",
@@ -673,6 +721,359 @@ void ValidateStageOptions(const PipelineStage& stage) {
     if (!allowed.contains(name)) {
       Fail(
           "Stage '" + stage.name + "' has unknown option '" + name + "'");
+    }
+  }
+}
+
+void RequireOptionKeys(
+    const Json& value,
+    const std::set<std::string>& allowed,
+    const std::set<std::string>& required,
+    std::string_view context) {
+  RequireObject(value, context);
+  for (const auto& [name, item] : value.items()) {
+    (void)item;
+    if (!allowed.contains(name)) {
+      Fail(std::string(context) + " has unknown field '" + name + "'");
+    }
+  }
+  for (const auto& name : required) {
+    if (!value.contains(name)) {
+      Fail(
+          std::string(context) + " is missing required field '" + name + "'");
+    }
+  }
+}
+
+std::string RequireOptionString(
+    const Json& value,
+    std::string_view field,
+    std::string_view context) {
+  const auto found = value.find(std::string(field));
+  if (found == value.end() || !found->is_string() ||
+      found->get_ref<const std::string&>().empty()) {
+    Fail(
+        std::string(context) + " field '" + std::string(field) +
+        "' must be a non-empty string");
+  }
+  return found->get<std::string>();
+}
+
+bool StageOwns(const PipelineStage& stage, std::string_view component) {
+  return std::ranges::find(stage.components, component) !=
+         stage.components.end();
+}
+
+void RequireStageCapability(
+    const PipelineStage& stage,
+    std::string_view capability,
+    std::string_view context) {
+  if (std::ranges::find(stage.capabilities, capability) ==
+      stage.capabilities.end()) {
+    Fail(
+        std::string(context) + " requires stage capability '" +
+        std::string(capability) + "'");
+  }
+}
+
+// Classifier-free guidance: the runtime evaluates the stage twice per step,
+// once with the declared conditioning input and once with the host-supplied
+// unconditional value, and combines the guided predictions.
+void ValidateGuidanceOption(
+    const PipelineManifest& manifest,
+    const PipelineStage& stage,
+    const Json& guidance) {
+  const std::string context = "Stage '" + stage.name + "' guidance";
+  RequireOptionKeys(
+      guidance,
+      {
+          "kind",
+          "conditioning_input",
+          "unconditional_input",
+          "scale_option",
+          "default_scale",
+          "combine",
+          "outputs",
+      },
+      {"kind", "conditioning_input"},
+      context);
+  RequireStageCapability(stage, "classifier_free_guidance", context);
+  const std::string kind = RequireOptionString(guidance, "kind", context);
+  if (kind != "classifier_free") {
+    Fail(context + " has unsupported kind '" + kind + "'");
+  }
+  const Endpoint conditioning = Endpoint::Parse(
+      RequireOptionString(guidance, "conditioning_input", context));
+  if (!StageOwns(stage, conditioning.component)) {
+    Fail(
+        context + " conditions on '" + conditioning.qualified() +
+        "', which the stage does not run");
+  }
+  (void)RequireEndpoint(
+      manifest.components(), conditioning, true, context);
+  const auto declared = std::ranges::find(
+      manifest.inputs(), conditioning, &PipelineInput::port);
+  if (declared == manifest.inputs().end() ||
+      declared->kind != PipelineInputKind::external) {
+    Fail(
+        context + " conditioning input '" + conditioning.qualified() +
+        "' must be a declared external input");
+  }
+  if (guidance.contains("unconditional_input")) {
+    (void)RequireOptionString(guidance, "unconditional_input", context);
+  }
+  if (guidance.contains("scale_option")) {
+    (void)RequireOptionString(guidance, "scale_option", context);
+  }
+  if (guidance.contains("default_scale") &&
+      !guidance.at("default_scale").is_number()) {
+    Fail(context + " field 'default_scale' must be a number");
+  }
+  if (guidance.contains("combine")) {
+    const std::string combine =
+        RequireOptionString(guidance, "combine", context);
+    if (combine != "unconditional + scale * (conditional - unconditional)") {
+      Fail(context + " has unsupported combination rule '" + combine + "'");
+    }
+  }
+  if (guidance.contains("outputs")) {
+    const std::vector<std::string> outputs =
+        ParseStringArray(guidance.at("outputs"), context + " outputs");
+    for (const auto& name : outputs) {
+      const Endpoint endpoint = Endpoint::Parse(name);
+      if (!StageOwns(stage, endpoint.component)) {
+        Fail(
+            context + " guides '" + endpoint.qualified() +
+            "', which the stage does not produce");
+      }
+      (void)RequireEndpoint(
+          manifest.components(), endpoint, false, context);
+    }
+  }
+}
+
+//: Resampling filters the runtime can apply to conditioning frames.
+const std::set<std::string>& ConditioningResampleFilters() {
+  static const std::set<std::string> filters{
+      "bilinear", "bicubic", "nearest", "lanczos"};
+  return filters;
+}
+
+//: The only conditioning resize strategy the runtime implements: frames are
+//: scaled straight to the requested output geometry.
+constexpr std::string_view kConditioningResizeStrategy = "stretch_to_target";
+
+void ValidateConditioningPreprocessing(
+    const Json& preprocessing,
+    std::string_view context) {
+  RequireOptionKeys(
+      preprocessing,
+      {"resize", "resample", "normalize", "rescale_factor", "convert_rgb"},
+      {},
+      context);
+  for (const auto& field : {"resize", "resample"}) {
+    if (!preprocessing.contains(field)) {
+      continue;
+    }
+    const std::string value =
+        RequireOptionString(preprocessing, field, context);
+    // 'resample' always names a filter; 'resize' may name either the filter
+    // or the resize strategy.
+    if (ConditioningResampleFilters().contains(value)) {
+      continue;
+    }
+    if (std::string(field) == "resize" &&
+        value == kConditioningResizeStrategy) {
+      continue;
+    }
+    Fail(
+        std::string(context) + " field '" + std::string(field) +
+        "' has unsupported value '" + value + "'");
+  }
+  if (preprocessing.contains("rescale_factor")) {
+    const Json& factor = preprocessing.at("rescale_factor");
+    if (!factor.is_number() ||
+        std::abs(factor.get<double>() - 1.0 / 255.0) > 1e-9) {
+      Fail(std::string(context) + " field 'rescale_factor' must be 1/255");
+    }
+  }
+  if (preprocessing.contains("convert_rgb") &&
+      (!preprocessing.at("convert_rgb").is_boolean() ||
+       !preprocessing.at("convert_rgb").get<bool>())) {
+    Fail(std::string(context) + " field 'convert_rgb' must be true");
+  }
+  if (!preprocessing.contains("normalize")) {
+    return;
+  }
+  const Json& normalize = preprocessing.at("normalize");
+  RequireOptionKeys(
+      normalize, {"mean", "std"}, {}, std::string(context) + " normalize");
+  for (const auto& field : {"mean", "std"}) {
+    if (!normalize.contains(field)) {
+      continue;
+    }
+    const Json& values = normalize.at(field);
+    if (!values.is_array() || values.size() != 3 ||
+        !std::ranges::all_of(values, [](const Json& value) {
+          return value.is_number();
+        })) {
+      Fail(
+          std::string(context) + " normalize '" + std::string(field) +
+          "' must be three numbers");
+    }
+    if (std::string(field) == "std" &&
+        std::ranges::any_of(values, [](const Json& value) {
+          return value.get<double>() == 0.0;
+        })) {
+      Fail(std::string(context) + " normalize 'std' must be non-zero");
+    }
+  }
+}
+
+// Conditioned diffusion: a host encodes conditioning media through the named
+// encoder stage, packs it with the declared layout, and keeps the conditioned
+// rows of the diffusion state out of the noisy index sets.
+void ValidateConditioningOption(
+    const PipelineManifest& manifest,
+    const PipelineStage& stage,
+    const Json& conditioning) {
+  const std::string stage_context = "Stage '" + stage.name + "' conditioning";
+  RequireObject(conditioning, stage_context);
+  RequireStageCapability(stage, "conditioned_diffusion", stage_context);
+  if (conditioning.empty()) {
+    Fail(stage_context + " must describe at least one modality");
+  }
+  for (const auto& [modality, spec] : conditioning.items()) {
+    const std::string context =
+        stage_context + " modality '" + modality + "'";
+    RequireOptionKeys(
+        spec,
+        {
+            "encoder_stage",
+            "encoder_input",
+            "encoder_output",
+            "state",
+            "conditioned_latent_frames_option",
+            "default_conditioned_latent_frames",
+            "timestep_token_indexes_input",
+            "preprocessing",
+            "packing",
+        },
+        {"encoder_stage", "encoder_input", "encoder_output", "state", "packing"},
+        context);
+    const std::string encoder_stage =
+        RequireOptionString(spec, "encoder_stage", context);
+    const auto encoder = std::ranges::find(
+        manifest.stages(), encoder_stage, &PipelineStage::name);
+    if (encoder == manifest.stages().end()) {
+      Fail(context + " references unknown stage '" + encoder_stage + "'");
+    }
+    const Endpoint encoder_input =
+        Endpoint::Parse(RequireOptionString(spec, "encoder_input", context));
+    const Endpoint encoder_output =
+        Endpoint::Parse(RequireOptionString(spec, "encoder_output", context));
+    if (!StageOwns(*encoder, encoder_input.component) ||
+        !StageOwns(*encoder, encoder_output.component)) {
+      Fail(context + " encoder ports do not belong to '" + encoder_stage + "'");
+    }
+    (void)RequireEndpoint(
+        manifest.components(), encoder_input, true, context);
+    (void)RequireEndpoint(
+        manifest.components(), encoder_output, false, context);
+    const std::string state_name =
+        RequireOptionString(spec, "state", context);
+    const auto state = std::ranges::find(
+        manifest.states(), state_name, &PipelineState::name);
+    if (state == manifest.states().end()) {
+      Fail(context + " references unknown state '" + state_name + "'");
+    }
+    if (!StageOwns(stage, state->input.component)) {
+      Fail(
+          context + " state '" + state_name +
+          "' is not owned by the conditioned stage");
+    }
+    if (spec.contains("conditioned_latent_frames_option")) {
+      (void)RequireOptionString(
+          spec, "conditioned_latent_frames_option", context);
+    }
+    if (spec.contains("default_conditioned_latent_frames")) {
+      const Json& frames = spec.at("default_conditioned_latent_frames");
+      if (!frames.is_array() ||
+          !std::ranges::all_of(frames, [](const Json& value) {
+            return value.is_number_integer() && value.get<std::int64_t>() >= 0;
+          })) {
+        Fail(
+            context +
+            " field 'default_conditioned_latent_frames' must be "
+            "non-negative integers");
+      }
+    }
+    if (spec.contains("timestep_token_indexes_input")) {
+      const Endpoint indexes = Endpoint::Parse(
+          RequireOptionString(spec, "timestep_token_indexes_input", context));
+      (void)RequireEndpoint(manifest.components(), indexes, true, context);
+    }
+    if (spec.contains("preprocessing")) {
+      ValidateConditioningPreprocessing(
+          spec.at("preprocessing"), context + " preprocessing");
+    }
+    const Json& packing = spec.at("packing");
+    RequireOptionKeys(
+        packing,
+        {
+            "spatial_patch_size",
+            "temporal_patch_size",
+            "input_layout",
+            "output_layout",
+            "channel_order",
+        },
+        {"spatial_patch_size", "input_layout", "output_layout", "channel_order"},
+        context + " packing");
+    for (const auto& field : {"spatial_patch_size", "temporal_patch_size"}) {
+      if (packing.contains(field) &&
+          (!packing.at(field).is_number_integer() ||
+           packing.at(field).get<std::int64_t>() <= 0)) {
+        Fail(
+            context + " packing field '" + std::string(field) +
+            "' must be a positive integer");
+      }
+    }
+    // The runtime's video unpatchify packs one latent frame per token row.
+    if (packing.value("temporal_patch_size", std::int64_t{1}) != 1) {
+      Fail(context + " packing requires temporal_patch_size 1");
+    }
+    const std::string input_layout =
+        RequireOptionString(packing, "input_layout", context + " packing");
+    const std::string output_layout =
+        RequireOptionString(packing, "output_layout", context + " packing");
+    const std::string channel_order =
+        RequireOptionString(packing, "channel_order", context + " packing");
+    if (input_layout != "BCTHW" || output_layout != "NC" ||
+        channel_order != "patch_height_patch_width_channel") {
+      Fail(context + " packing uses an unsupported conditioning layout");
+    }
+  }
+}
+
+void ValidateStagePrograms(const PipelineManifest& manifest) {
+  for (const auto& stage : manifest.stages()) {
+    const Json options = Json::parse(stage.options_json);
+    if (options.contains("guidance")) {
+      ValidateGuidanceOption(manifest, stage, options.at("guidance"));
+    }
+    if (options.contains("conditioning")) {
+      ValidateConditioningOption(manifest, stage, options.at("conditioning"));
+    }
+    // An advertised capability must correspond to an executable option, so a
+    // package cannot claim behavior the stage never describes.
+    for (const auto& capability : stage.capabilities) {
+      const auto found = StageCapabilityOptions().find(capability);
+      if (found != StageCapabilityOptions().end() &&
+          !options.contains(found->second)) {
+        Fail(
+            "Stage '" + stage.name + "' provides '" + capability +
+            "' but declares no '" + found->second + "' option");
+      }
     }
   }
 }
@@ -1023,9 +1424,31 @@ void ValidateManifest(const PipelineManifest& manifest) {
     Fail("Every recurrent connection requires an explicit state lifecycle");
   }
 
+  ValidateStagePrograms(manifest);
+
   const std::set<std::string> declared_capabilities(
       manifest.required_capabilities().begin(),
       manifest.required_capabilities().end());
+  // A required capability is honored when this runtime implements it or when
+  // a component or stage in the manifest declares that it provides it. Only
+  // names nothing can satisfy are rejected.
+  std::set<std::string> known_capabilities = SupportedCapabilityNames();
+  for (const auto& component : components) {
+    known_capabilities.insert(
+        component.capabilities.begin(), component.capabilities.end());
+  }
+  for (const auto& stage : manifest.stages()) {
+    known_capabilities.insert(
+        stage.capabilities.begin(), stage.capabilities.end());
+  }
+  for (const auto& capability : declared_capabilities) {
+    if (!known_capabilities.contains(capability)) {
+      Fail(
+          "Pipeline requires capability '" + capability +
+          "', which this runtime does not implement and no component or "
+          "stage provides");
+    }
+  }
   if (!recurrent_producers.empty() &&
       !declared_capabilities.contains("loop_carried_state")) {
     Fail(
@@ -1899,6 +2322,11 @@ PipelineManifest PipelineManifest::Load(
         "Could not read pipeline manifest: " + path.string());
   }
   return Parse(document.str());
+}
+
+std::vector<std::string> PipelineManifest::SupportedCapabilities() {
+  const auto& capabilities = SupportedCapabilityNames();
+  return {capabilities.begin(), capabilities.end()};
 }
 
 std::string_view PipelineManifest::schema_version() const noexcept {

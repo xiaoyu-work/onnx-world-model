@@ -102,6 +102,10 @@ class PipelineManifest {
   static PipelineManifest Parse(std::string_view document);
   static PipelineManifest Load(const std::filesystem::path& path);
 
+  //: Pipeline capabilities this runtime implements. A manifest whose
+  //: `required_capabilities` names anything outside this set is rejected.
+  [[nodiscard]] static std::vector<std::string> SupportedCapabilities();
+
   [[nodiscard]] std::string_view schema_version() const noexcept;
   [[nodiscard]] std::string_view profile() const noexcept;
   [[nodiscard]] std::string_view profile_version() const noexcept;

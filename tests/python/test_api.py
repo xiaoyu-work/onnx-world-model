@@ -9,6 +9,7 @@ from onnx_world_model import (
     OnnxModel,
     WorldModelError,
     available_execution_providers,
+    supported_pipeline_capabilities,
 )
 
 
@@ -84,6 +85,19 @@ def test_lists_available_execution_providers():
     providers = available_execution_providers()
 
     assert "CPUExecutionProvider" in providers
+
+
+def test_advertises_supported_pipeline_capabilities():
+    capabilities = supported_pipeline_capabilities()
+
+    assert {
+        "classifier_free_guidance",
+        "conditioned_diffusion",
+        "iterative_scheduler",
+        "loop_carried_state",
+        "packed_sequence_program",
+    } <= set(capabilities)
+    assert "streaming" not in capabilities
 
 
 def test_registers_available_non_cpu_provider(world_model_path: Path):

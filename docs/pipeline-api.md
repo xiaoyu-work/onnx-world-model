@@ -108,6 +108,164 @@ video = session.run_stage(
 session.release_stage("decode_video")
 ```
 
+## Conditioned, guided generation contract
+
+Image-to-video generation is described entirely by the manifest. An iterative
+stage that supports it declares the capabilities
+`classifier_free_guidance` and `conditioned_diffusion` and these options:
+
+```json
+{
+  "name": "world_generation",
+  "kind": "iterative",
+  "capabilities": ["loop_carried_state", "classifier_free_guidance",
+                   "conditioned_diffusion"],
+  "options": {
+    "guidance": {
+      "kind": "classifier_free",
+      "conditioning_input": "generator.input_ids",
+      "scale_option": "guidance_scale",
+      "default_scale": 1.0,
+      "combine": "unconditional + scale * (conditional - unconditional)"
+    },
+    "conditioning": {
+      "vision": {
+        "encoder_stage": "encode_video",
+        "encoder_input": "video_encoder.sample",
+        "encoder_output": "video_encoder.latent",
+        "state": "vision_state",
+        "conditioned_latent_frames_option": "vision_conditioned_latent_frames",
+        "default_conditioned_latent_frames": [],
+        "packing": {
+          "spatial_patch_size": 2,
+          "temporal_patch_size": 1,
+          "input_layout": "BCTHW",
+          "output_layout": "NC",
+          "channel_order": "patch_height_patch_width_channel"
+        }
+      }
+    }
+  }
+}
+```
+
+`guidance` accepts two optional fields: `unconditional_input` names the input
+the host uses for the unconditional value, and `outputs` lists the guided
+predictions. Without them the runtime accepts `unconditional:<port>` (also
+`unconditional:<semantic>` and `unconditional:<alias>`) and guides every
+scheduler-driven recurrent output of the stage. `combine` is validated, not
+interpreted: only the formula above is supported. `scale_option` is resolved
+from the run options first, then from the selected scheduler mode override,
+then from `default_scale`; a scale of 1 runs one pass, any other scale requires
+an unconditional value.
+
+The two capabilities are part of the contract in both directions: a stage that
+declares `guidance` must advertise `classifier_free_guidance`, a stage that
+declares `conditioning` must advertise `conditioned_diffusion`, and a stage
+that advertises either without the matching option is rejected. The runtime
+publishes everything it implements, and a `required_capabilities` entry is
+honored when the runtime implements it or when a component or stage in the same
+manifest declares that it provides it; only names nothing can satisfy fail to
+load:
+
+```python
+from onnx_world_model import supported_pipeline_capabilities
+
+print(supported_pipeline_capabilities())
+# ('action_domain_program', 'attention_mask_program', 'classifier_free_guidance',
+#  'conditioned_diffusion', 'iterative_scheduler', 'loop_carried_state', ...)
+```
+
+The C++ equivalent is `PipelineManifest::SupportedCapabilities()`.
+
+`conditioning.<modality>.packing` must describe the same packing the runtime's
+video unpatchify inverts (`BCTHW` -> `NC` with
+`patch_height_patch_width_channel` channels and `temporal_patch_size` 1);
+anything else is rejected at load time, as is a `spatial_patch_size` that
+disagrees with `metadata.packing.latent_patch_size`. `encoder_output` must also
+be a public pipeline output so the host can read the encoded latent back from
+the encoder stage.
+
+`conditioning.<modality>` may add an optional `preprocessing` block describing
+how conditioning frames reach the encoder:
+
+```json
+"preprocessing": {
+  "resize": "stretch_to_target",
+  "resample": "bilinear",
+  "convert_rgb": true,
+  "rescale_factor": 0.00392156862745098,
+  "normalize": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}
+}
+```
+
+`resample` names the filter (`bilinear`, `bicubic`, `nearest`, or `lanczos`);
+`resize` may name either the filter or the only supported strategy,
+`stretch_to_target`, which scales frames straight to the requested output
+geometry. `rescale_factor` must be `1/255` and `convert_rgb` must be true,
+since that is what the runtime does. Omitting the block keeps the default
+bilinear resize into the signed `[-1, 1]` range.
+
+Generation recipes and prompt packaging live in the manifest metadata:
+
+```json
+"metadata": {
+  "generation_recipes": {
+    "image_to_video": {
+      "conditioning": {"modality": "image", "encoder_stage": "encode_video",
+                       "conditioned_latent_frames": [0]},
+      "prompt": {"positive": "json_or_text",
+                 "negative_asset": "assets/negative_prompt.json",
+                 "add_resolution_template": false,
+                 "add_duration_template": false,
+                 "use_system_prompt": false},
+      "height": 480, "width": 832, "frames": 121, "fps": 24.0
+    }
+  },
+  "generator_prompt": {
+    "chat": {
+      "add_generation_prompt": true,
+      "add_vision_id": false,
+      "enable_thinking": true
+    },
+    "suffix_token_ids": [151645, 151652],
+    "system_prompts": {"image": "...", "video": "..."},
+    "templates": {
+      "duration": "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS.",
+      "inverse_duration": "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS.",
+      "image_resolution": "This image is of {height}x{width} resolution.",
+      "inverse_image_resolution": "This image is not of {height}x{width} resolution.",
+      "video_resolution": "This video is of {height}x{width} resolution.",
+      "inverse_video_resolution": "This video is not of {height}x{width} resolution."
+    }
+  }
+}
+```
+
+`generation_recipes.<mode>` supplies the default geometry, fps, prompt flags,
+and conditioned latent frames for `mode`; the mode name is also the scheduler
+`mode_overrides` key, which is where `num_inference_steps`, `flow_shift`,
+`use_karras_sigmas`, and `guidance_scale` come from. `generator_prompt` is
+optional and backward compatible: `suffix_token_ids` (or `suffix_tokens` with
+token strings) are appended after the chat template, `system_prompts` selects a
+per-modality system message, and `templates` supplies the metadata sentences. A
+missing section means the runtime performs that step exactly as it did before,
+and requesting a template or system prompt the package does not declare is an
+error rather than a guess.
+
+A recipe's `prompt` block may restate any `generator_prompt` field (`chat`,
+`system_prompts`, `templates`, `suffix_token_ids`, `suffix_tokens`) to override
+it for that mode only, and `"negative_default": "empty" | "asset"` selects what
+an omitted `negative_prompt` means. The default is `"empty"`, matching the
+reference pipeline; `"asset"` uses the shipped `negative_asset`. That asset may
+hold the prompt text, a wrapper object with a `negative_prompt`/`default`/
+mode-named string, or — as Cosmos3 Edge ships it — the structured JSON document
+itself, which is passed through verbatim as a JSON string.
+
+`chat.add_generation_prompt`, `chat.add_vision_id`, and
+`chat.enable_thinking` are passed to the exported chat template, so a package
+selects the official behavior; any other field under `chat` is rejected.
+
 ## Stage execution
 
 - `run_stage()` executes the strategy declared by the manifest: single pass,
@@ -120,6 +278,52 @@ session.release_stage("decode_video")
 `PipelineSession.run()` executes selected stages in declaration order and
 releases each stage after execution. Explicit `run_stage()` calls are clearer
 when stages need different prepared inputs.
+
+## Conditioned, guided stages
+
+An iterative stage that declares `guidance` and `conditioning` adds two host
+responsibilities: run the declared conditioning encoder stage first, and pass
+the unconditional value of the guided input alongside the conditional one. The
+runtime then runs the stage twice per step — once conditional, once
+unconditional — and still applies exactly one scheduler update.
+
+```python
+encoded = session.run_stage(
+    "encode_video",
+    {"video_encoder.sample": conditioning_frames},  # [1, 3, T, H, W] in [-1, 1]
+)
+session.release_stage("encode_video")
+
+world = session.run_stage(
+    "world_generation",
+    {
+        "text.token_ids": conditional_input_ids,
+        "unconditional:generator.input_ids": unconditional_input_ids,
+        "diffusion.initial_vision_latent": packed_latents,  # conditioned rows anchored
+    },
+    overrides={
+        # Only the noisy rows carry a timestep, an MSE index, and a scheduler
+        # update; the generator still attends to every latent frame.
+        "generator.vision_timestep_token_indexes": noisy_token_indexes,
+    },
+    options={
+        "mode": "image_to_video",
+        "guidance_scale": 5.0,
+        "num_inference_steps": 50,
+        "video_latent_frames": latent_frames,
+        "video_latent_height": latent_height,
+        "video_latent_width": latent_width,
+    },
+)
+```
+
+The unconditional value is supplied as `unconditional:<port>`, and the manifest
+may name it explicitly through `guidance.unconditional_input`. A guidance scale
+of 1 runs one pass; any other scale requires the unconditional value.
+
+`WorldModelPreprocessor.prepare_world(..., image=...)` produces exactly those
+tensors: `pipeline_inputs()` and `pipeline_overrides()` carry them, and
+`with_conditioning_latent()` folds the encoder's latent into the packed rows.
 
 ## Outputs
 
@@ -168,6 +372,9 @@ NamedTensors outputs = session.RunStage(
 - Dense FP16, BF16, FP32, integer, and boolean tensors.
 - Single-pass, on-demand, state-transition, iterative, and autoregressive
   stages.
+- Classifier-free guidance and conditioned diffusion on iterative stages,
+  driven by the stage's `guidance` and `conditioning` options rather than by
+  model names.
 - KV-cache, request, sequence, iteration, and session state lifecycles.
 - FlowMatch Euler and flow-prediction UniPC order-1/order-2 schedulers.
 - Greedy and temperature/top-k/top-p autoregressive sampling.
@@ -178,3 +385,9 @@ NamedTensors outputs = session.RunStage(
 
 Pipeline scheduling and host transforms operate on CPU tensors. ONNX Runtime
 performs device transfers at component boundaries.
+
+Scheduler modes are never inferred: `mode` selects a declared `mode_overrides`
+entry, and an absent mode uses the stage defaults. Conditioning handoffs
+recorded only in manifest metadata are not executed automatically; the
+declared `conditioning` stage option is what drives image-to-video, and other
+handoffs still require the caller to supply the packed initial latent.

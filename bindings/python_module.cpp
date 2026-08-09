@@ -290,6 +290,9 @@ PYBIND11_MODULE(_native, module) {
         return AvailableExecutionProviders(ort_library_path);
       },
       py::arg("ort_library_path"));
+  module.def(
+      "supported_pipeline_capabilities",
+      [] { return onnx_world_model::PipelineManifest::SupportedCapabilities(); });
 
   py::class_<Model>(module, "Model")
       .def(

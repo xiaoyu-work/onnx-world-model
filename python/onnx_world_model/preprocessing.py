@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,22 @@ class PreparedReasonerInputs:
 
 
 @dataclass(frozen=True)
+class PreparedConditioning:
+    """Media conditioning that must be encoded before the diffusion stage."""
+
+    encoder_stage: str
+    encoder_input: str
+    encoder_output: str
+    pixel_values: NDArray[Any]
+    latent_frames: tuple[int, ...]
+    spatial_patch_size: int
+    latent_grid: tuple[int, int]
+
+    def pipeline_inputs(self) -> dict[str, NDArray[Any]]:
+        return {self.encoder_input: self.pixel_values}
+
+
+@dataclass(frozen=True)
 class PreparedWorldInputs:
     input_ids: NDArray[np.int64]
     vision_tokens: NDArray[Any]
@@ -55,6 +71,11 @@ class PreparedWorldInputs:
     latent_shape: tuple[int, int, int]
     output_shape: tuple[int, int, int]
     action_domain: str
+    unconditional_input_ids: NDArray[np.int64] | None = None
+    unconditional_input_name: str | None = None
+    conditioning: PreparedConditioning | None = None
+    noisy_vision_token_indexes: NDArray[np.int64] | None = None
+    noisy_vision_token_input: str | None = None
 
     def pipeline_inputs(self) -> dict[str, NDArray[Any]]:
         values: dict[str, NDArray[Any]] = {
@@ -65,7 +86,185 @@ class PreparedWorldInputs:
             values["diffusion.initial_action_latent"] = self.action_tokens
         if self.sound_tokens is not None:
             values["diffusion.initial_sound_latent"] = self.sound_tokens
+        if (
+            self.unconditional_input_ids is not None
+            and self.unconditional_input_name is not None
+        ):
+            values[self.unconditional_input_name] = self.unconditional_input_ids
         return values
+
+    def pipeline_overrides(self) -> dict[str, NDArray[Any]]:
+        """Generated inputs the host replaces for conditioned generation."""
+        if (
+            self.noisy_vision_token_indexes is None
+            or self.noisy_vision_token_input is None
+        ):
+            return {}
+        return {self.noisy_vision_token_input: self.noisy_vision_token_indexes}
+
+    def with_conditioning_latent(
+        self,
+        latent: NDArray[Any],
+    ) -> PreparedWorldInputs:
+        """Anchor the conditioned latent frames to an encoded latent.
+
+        ``latent`` is the ``[B, C, T, H, W]`` output of the manifest's
+        conditioning encoder. Its latent frames are packed into generator token
+        rows and written over the noise of the conditioned frames, leaving the
+        remaining rows noisy exactly as the official recipe does.
+        """
+        conditioning = self.conditioning
+        if conditioning is None:
+            raise ValueError("These world inputs declare no media conditioning")
+        packed = pack_latent_tokens(latent, conditioning.spatial_patch_size)
+        grid_height, grid_width = conditioning.latent_grid
+        frame_tokens = grid_height * grid_width
+        encoded_frames = packed.shape[0] // frame_tokens
+        if packed.shape[0] != encoded_frames * frame_tokens:
+            raise ValueError(
+                "The encoded conditioning latent does not match the requested "
+                "latent grid"
+            )
+        if encoded_frames != len(conditioning.latent_frames):
+            raise ValueError(
+                f"The conditioning encoder produced {encoded_frames} latent "
+                f"frames, expected {len(conditioning.latent_frames)}"
+            )
+        if packed.shape[1] != self.vision_tokens.shape[1]:
+            raise ValueError(
+                "The encoded conditioning latent has "
+                f"{packed.shape[1]} channels, expected "
+                f"{self.vision_tokens.shape[1]}"
+            )
+        vision_tokens = np.array(self.vision_tokens, copy=True)
+        for position, frame in enumerate(conditioning.latent_frames):
+            target = frame * frame_tokens
+            source = position * frame_tokens
+            vision_tokens[target : target + frame_tokens] = packed[
+                source : source + frame_tokens
+            ].astype(vision_tokens.dtype, copy=False)
+        return replace(self, vision_tokens=vision_tokens)
+
+
+def pack_latent_tokens(
+    latent: NDArray[Any],
+    spatial_patch_size: int,
+) -> NDArray[Any]:
+    """Pack a ``[B, C, T, H, W]`` latent into generator token rows.
+
+    Rows are ordered ``(batch, frame, patch_row, patch_column)`` and each row
+    concatenates its patch values as ``(patch_height, patch_width, channel)``,
+    which is the inverse of the runtime's video unpatchify transform.
+    """
+    if spatial_patch_size <= 0:
+        raise ValueError("spatial_patch_size must be positive")
+    values = np.asarray(latent)
+    if values.ndim != 5:
+        raise ValueError("Latents must have shape [batch, channels, T, H, W]")
+    batch, channels, frames, height, width = values.shape
+    if height % spatial_patch_size or width % spatial_patch_size:
+        raise ValueError(
+            "Latent height and width must be divisible by spatial_patch_size"
+        )
+    grid_height = height // spatial_patch_size
+    grid_width = width // spatial_patch_size
+    # (B, C, T, H_p, p_h, W_p, p_w) -> (B, T, H_p, W_p, p_h, p_w, C)
+    patches = values.reshape(
+        batch,
+        channels,
+        frames,
+        grid_height,
+        spatial_patch_size,
+        grid_width,
+        spatial_patch_size,
+    )
+    patches = patches.transpose(0, 2, 3, 5, 4, 6, 1)
+    return patches.reshape(
+        batch * frames * grid_height * grid_width,
+        spatial_patch_size * spatial_patch_size * channels,
+    )
+
+
+_CONDITIONING_RESAMPLING = {
+    "bilinear": Image.Resampling.BILINEAR,
+    "bicubic": Image.Resampling.BICUBIC,
+    "nearest": Image.Resampling.NEAREST,
+    "lanczos": Image.Resampling.LANCZOS,
+}
+
+#: The only conditioning resize strategy the runtime implements: frames are
+#: scaled straight to the requested output geometry.
+_CONDITIONING_RESIZE_STRATEGY = "stretch_to_target"
+
+
+def conditioning_resample(preprocessing: Mapping[str, Any]) -> str:
+    """The resampling filter a conditioning contract asks for.
+
+    ``resample`` always names the filter. ``resize`` may name either the
+    filter or the resize strategy, which keeps the block compatible with the
+    vision-understanding preprocessing spelling.
+    """
+    declared = preprocessing.get("resample")
+    if declared is None:
+        declared = preprocessing.get("resize")
+        if declared is not None and declared not in _CONDITIONING_RESAMPLING:
+            if declared != _CONDITIONING_RESIZE_STRATEGY:
+                raise ValueError(
+                    f"Unsupported conditioning resize {declared!r}; expected a "
+                    f"filter or {_CONDITIONING_RESIZE_STRATEGY!r}"
+                )
+            declared = None
+    if declared is None:
+        return "bilinear"
+    if declared not in _CONDITIONING_RESAMPLING:
+        raise ValueError(f"Unsupported conditioning resample {declared!r}")
+    return str(declared)
+
+
+class ConditioningFramePreprocessor:
+    """Conditioning frames for a latent video encoder.
+
+    Frames are resized to the requested output geometry and mapped to the
+    encoder's signed range, producing ``[1, 3, frames, height, width]``.
+    """
+
+    def __init__(
+        self,
+        *,
+        mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
+        std: tuple[float, float, float] = (0.5, 0.5, 0.5),
+        resample: str = "bilinear",
+        dtype: Any = np.float32,
+    ) -> None:
+        if any(value <= 0 for value in std):
+            raise ValueError("Conditioning standard deviations must be positive")
+        if resample not in _CONDITIONING_RESAMPLING:
+            raise ValueError(f"Unsupported conditioning resample {resample!r}")
+        self.mean = np.asarray(mean, dtype=np.float32)
+        self.std = np.asarray(std, dtype=np.float32)
+        self.resample = resample
+        self.dtype = np.dtype(dtype)
+
+    def __call__(
+        self,
+        image: RawImage,
+        *,
+        height: int,
+        width: int,
+        frames: int = 1,
+    ) -> NDArray[Any]:
+        if height <= 0 or width <= 0 or frames <= 0:
+            raise ValueError("Conditioning geometry must be positive")
+        resized = ImagePreprocessor._to_image(image).convert("RGB").resize(
+            (width, height),
+            _CONDITIONING_RESAMPLING[self.resample],
+        )
+        pixels = np.asarray(resized, dtype=np.float32) / 255.0
+        pixels = (pixels - self.mean) / self.std
+        frame = np.transpose(pixels, (2, 0, 1))
+        video = np.repeat(frame[:, None], frames, axis=1)
+        return video[None].astype(self.dtype, copy=False)
+
 
 
 class TextPreprocessor:
@@ -123,8 +322,11 @@ class TextPreprocessor:
         video: bool = False,
         system_prompt: str | None = None,
         enable_thinking: bool = False,
+        allow_empty: bool = False,
+        add_generation_prompt: bool = True,
+        add_vision_id: bool = False,
     ) -> str:
-        if not prompt:
+        if not prompt and not allow_empty:
             raise ValueError("prompt must be non-empty")
         messages: list[dict[str, Any]] = []
         if system_prompt is not None:
@@ -147,8 +349,8 @@ class TextPreprocessor:
         return self._template.render(
             messages=messages,
             tools=[],
-            add_generation_prompt=True,
-            add_vision_id=False,
+            add_generation_prompt=add_generation_prompt,
+            add_vision_id=add_vision_id,
             enable_thinking=enable_thinking,
         )
 
@@ -163,6 +365,9 @@ class TextPreprocessor:
         video: bool = False,
         system_prompt: str | None = None,
         enable_thinking: bool = False,
+        allow_empty: bool = False,
+        add_generation_prompt: bool = True,
+        add_vision_id: bool = False,
     ) -> tuple[str, list[int]]:
         rendered = self.render_chat(
             prompt,
@@ -170,6 +375,9 @@ class TextPreprocessor:
             video=video,
             system_prompt=system_prompt,
             enable_thinking=enable_thinking,
+            allow_empty=allow_empty,
+            add_generation_prompt=add_generation_prompt,
+            add_vision_id=add_vision_id,
         )
         return rendered, self.encode(rendered)
 
@@ -618,6 +826,223 @@ class PackedVideoPreprocessor(PackedImagePreprocessor):
         return resized_height, resized_width
 
 
+class GeneratorPromptPacker:
+    """Prompt packing for a joint generator, described by the manifest.
+
+    The generator consumes chat-formatted token IDs directly, so packaging
+    declares the chat flags, optional per-modality system prompt, the metadata
+    sentence templates, and the trailing special tokens that mark the start of
+    generation. Everything is optional: an absent section means the runtime
+    performs that step exactly as before.
+    """
+
+    def __init__(
+        self,
+        text: TextPreprocessor,
+        config: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.text = text
+        self.config: dict[str, Any] = dict(config or {})
+        chat = self.config.get("chat", {})
+        if not isinstance(chat, Mapping):
+            raise TypeError("generator_prompt.chat must be an object")
+        unknown = set(chat) - {
+            "add_generation_prompt",
+            "add_vision_id",
+            "enable_thinking",
+        }
+        if unknown:
+            raise ValueError(
+                "generator_prompt.chat has unsupported fields "
+                f"{sorted(unknown)}"
+            )
+        self.add_generation_prompt = bool(chat.get("add_generation_prompt", True))
+        self.add_vision_id = bool(chat.get("add_vision_id", False))
+        self.enable_thinking = bool(chat.get("enable_thinking", False))
+        self.system_prompts: dict[str, str] = {
+            str(name): str(value)
+            for name, value in (self.config.get("system_prompts") or {}).items()
+        }
+        self.templates: dict[str, str] = {
+            str(name): str(value)
+            for name, value in (self.config.get("templates") or {}).items()
+        }
+        self.suffix_token_ids = self._suffix_token_ids()
+
+    #: Prompt-packing fields a generation recipe may restate for one mode.
+    OVERRIDABLE = (
+        "chat",
+        "system_prompts",
+        "templates",
+        "suffix_token_ids",
+        "suffix_tokens",
+    )
+
+    def merged(
+        self,
+        overrides: Mapping[str, Any] | None,
+    ) -> GeneratorPromptPacker:
+        """Apply a recipe's prompt-packing overrides to this packer."""
+        selected = {
+            name: value
+            for name, value in (overrides or {}).items()
+            if name in self.OVERRIDABLE
+        }
+        if not selected:
+            return self
+        return GeneratorPromptPacker(self.text, {**self.config, **selected})
+
+    def _suffix_token_ids(self) -> tuple[int, ...]:
+        declared = self.config.get("suffix_token_ids")
+        if declared is not None:
+            if not isinstance(declared, (list, tuple)) or not all(
+                isinstance(value, int) for value in declared
+            ):
+                raise ValueError(
+                    "generator_prompt.suffix_token_ids must be a list of integers"
+                )
+            return tuple(int(value) for value in declared)
+        tokens = self.config.get("suffix_tokens")
+        if tokens is None:
+            return ()
+        if not isinstance(tokens, (list, tuple)):
+            raise TypeError(
+                "generator_prompt.suffix_tokens must be a list of token strings"
+            )
+        resolved: list[int] = []
+        for token in tokens:
+            token_id = self.text.token_id(str(token))
+            if token_id is None:
+                raise ValueError(
+                    f"Tokenizer does not define generator prompt token {token!r}"
+                )
+            resolved.append(token_id)
+        return tuple(resolved)
+
+    @property
+    def has_system_prompts(self) -> bool:
+        return bool(self.system_prompts)
+
+    @property
+    def has_templates(self) -> bool:
+        return bool(self.templates)
+
+    def system_prompt(self, *, is_image: bool) -> str:
+        key = "image" if is_image else "video"
+        if key not in self.system_prompts:
+            known = ", ".join(sorted(self.system_prompts)) or "<none>"
+            raise ValueError(
+                "The package declares no generator system prompt for "
+                f"{key!r}; declared: {known}"
+            )
+        return self.system_prompts[key]
+
+    def _template(self, name: str) -> str:
+        if name not in self.templates:
+            known = ", ".join(sorted(self.templates)) or "<none>"
+            raise ValueError(
+                f"The package declares no generator prompt template {name!r}; "
+                f"declared: {known}"
+            )
+        return self.templates[name]
+
+    def apply_templates(
+        self,
+        text: str,
+        *,
+        negative: bool,
+        is_image: bool,
+        frames: int,
+        height: int,
+        width: int,
+        fps: float,
+        add_resolution_template: bool,
+        add_duration_template: bool,
+    ) -> str:
+        if not (add_resolution_template or add_duration_template):
+            return text
+        if _is_structured_prompt(text):
+            # Structured prompts already carry their metadata; appending
+            # sentences would corrupt the document.
+            return text
+        prefix = "inverse_" if negative else ""
+        if not is_image and add_duration_template:
+            if fps <= 0:
+                raise ValueError("fps must be positive to add a duration template")
+            text = _append_sentence(
+                text,
+                self._template(f"{prefix}duration").format(
+                    duration=frames / fps, fps=fps
+                ),
+            )
+        if add_resolution_template:
+            modality = "image" if is_image else "video"
+            text = _append_sentence(
+                text,
+                self._template(f"{prefix}{modality}_resolution").format(
+                    height=height, width=width
+                ),
+            )
+        return text
+
+    def encode(
+        self,
+        prompt: str,
+        *,
+        negative: bool = False,
+        is_image: bool = False,
+        frames: int = 1,
+        height: int = 0,
+        width: int = 0,
+        fps: float = 0.0,
+        add_resolution_template: bool = False,
+        add_duration_template: bool = False,
+        use_system_prompt: bool = False,
+        system_prompt: str | None = None,
+    ) -> NDArray[np.int64]:
+        text = self.apply_templates(
+            prompt,
+            negative=negative,
+            is_image=is_image,
+            frames=frames,
+            height=height,
+            width=width,
+            fps=fps,
+            add_resolution_template=add_resolution_template,
+            add_duration_template=add_duration_template,
+        )
+        if system_prompt is None and use_system_prompt:
+            system_prompt = self.system_prompt(is_image=is_image)
+        _, token_ids = self.text.encode_chat(
+            text,
+            image=False,
+            system_prompt=system_prompt,
+            enable_thinking=self.enable_thinking,
+            allow_empty=True,
+            add_generation_prompt=self.add_generation_prompt,
+            add_vision_id=self.add_vision_id,
+        )
+        return np.asarray(
+            list(token_ids) + list(self.suffix_token_ids), dtype=np.int64
+        )
+
+
+def _append_sentence(base: str, addition: str) -> str:
+    base = base.rstrip(".")
+    return f"{base}. {addition}" if base else addition
+
+
+def _is_structured_prompt(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return False
+    try:
+        json.loads(stripped)
+    except ValueError:
+        return False
+    return True
+
+
 class WorldModelPreprocessor:
     """High-level preprocessing compiled from a Mobius world-model package."""
 
@@ -634,6 +1059,9 @@ class WorldModelPreprocessor:
         }
         self.text = TextPreprocessor(self.package_path)
         self.root_config = _read_optional_json(self.package_path / "config.json")
+        self.generator_prompt = GeneratorPromptPacker(
+            self.text, self.metadata.get("generator_prompt")
+        )
         self.image_token_id = -1
         self.image_feature_count = 0
         self.image_feature_width = 0
@@ -645,10 +1073,108 @@ class WorldModelPreprocessor:
         self._video_initialization_attempted = False
         self._video_config = self._component_config("video_encoder")
         self._generator_config = self._component_config("generator")
+        self.conditioning: ConditioningFramePreprocessor | None = None
 
     @property
     def profile(self) -> dict[str, Any] | None:
         return self.manifest.get("profile")
+
+    @property
+    def generation_recipes(self) -> dict[str, Any]:
+        recipes = self.metadata.get("generation_recipes", {})
+        return recipes if isinstance(recipes, dict) else {}
+
+    def generation_recipe(self, mode: str | None) -> dict[str, Any]:
+        if mode is None:
+            return {}
+        recipe = self.generation_recipes.get(mode)
+        return dict(recipe) if isinstance(recipe, dict) else {}
+
+    def diffusion_stage(self) -> tuple[str, dict[str, Any]]:
+        """The iterative stage that denoises the packed generator sequence."""
+        for stage in self.manifest.get("stages", []):
+            if stage.get("kind") == "iterative":
+                return stage["name"], dict(stage.get("options", {}))
+        raise ValueError("This package has no iterative generation stage")
+
+    def guidance_program(self) -> dict[str, Any]:
+        try:
+            _, options = self.diffusion_stage()
+        except ValueError:
+            return {}
+        guidance = options.get("guidance")
+        return dict(guidance) if isinstance(guidance, dict) else {}
+
+    def conditioning_program(self, modality: str) -> dict[str, Any]:
+        try:
+            _, options = self.diffusion_stage()
+        except ValueError:
+            return {}
+        conditioning = options.get("conditioning")
+        if not isinstance(conditioning, dict):
+            return {}
+        program = conditioning.get(modality)
+        return dict(program) if isinstance(program, dict) else {}
+
+    def guidance_scale(
+        self,
+        *,
+        mode: str | None,
+        requested: float | None = None,
+    ) -> float:
+        """Resolve the guidance scale exactly as the runtime stage does."""
+        guidance = self.guidance_program()
+        if requested is not None:
+            return float(requested)
+        if not guidance:
+            return 1.0
+        option = guidance.get("scale_option", "guidance_scale")
+        _, options = self.diffusion_stage()
+        scheduler = options.get("scheduler", {})
+        overrides = scheduler.get("mode_overrides", {}) if scheduler else {}
+        if mode is not None and mode in overrides:
+            override = overrides[mode].get(option)
+            if isinstance(override, (int, float)):
+                return float(override)
+        return float(guidance.get("default_scale", 1.0))
+
+    def unconditional_input_name(self) -> str | None:
+        """Reserved input name carrying the unconditional guided value."""
+        guidance = self.guidance_program()
+        if not guidance:
+            return None
+        declared = guidance.get("unconditional_input")
+        if isinstance(declared, str) and declared:
+            return declared
+        conditioning_input = guidance.get("conditioning_input")
+        if not isinstance(conditioning_input, str) or not conditioning_input:
+            return None
+        return f"unconditional:{conditioning_input}"
+
+    def default_negative_prompt(self, mode: str | None = None) -> str:
+        """The negative prompt a package recommends for a generation mode.
+
+        The asset may hold the prompt text directly, a wrapper object with a
+        ``negative_prompt``/``default``/mode-named string, or the structured
+        JSON document the checkpoint was trained on, which is passed through
+        verbatim as a JSON string.
+        """
+        recipe = self.generation_recipe(mode)
+        asset = recipe.get("prompt", {}).get("negative_asset")
+        if not isinstance(asset, str) or not asset:
+            return ""
+        path = self.package_path / asset
+        if not path.is_file():
+            return ""
+        with path.open(encoding="utf-8") as file:
+            value = json.load(file)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in (mode, "negative_prompt", "default"):
+                if key is not None and isinstance(value.get(key), str):
+                    return str(value[key])
+        return json.dumps(value)
 
     def _special_token_id(self, config_name: str, token: str) -> int:
         configured = self.root_config.get(config_name)
@@ -854,6 +1380,52 @@ class WorldModelPreprocessor:
         )
         return self.video
 
+    def _ensure_conditioning_preprocessor(
+        self,
+        program: Mapping[str, Any],
+    ) -> ConditioningFramePreprocessor:
+        if self.conditioning is not None:
+            return self.conditioning
+        encoder_input = str(program["encoder_input"])
+        spec = self._port_spec(encoder_input)
+        shape = spec["shape"]
+        if len(shape) != 5:
+            raise ValueError(
+                "Media conditioning requires a rank-5 [B,C,T,H,W] encoder input"
+            )
+        preprocessing = dict(program.get("preprocessing", {}))
+        if not preprocessing:
+            handoff = self.metadata.get("conditioning_handoffs", {})
+            video = handoff.get("video") if isinstance(handoff, dict) else None
+            if isinstance(video, dict):
+                preprocessing = dict(video.get("preprocessing", {}))
+        normalize = preprocessing.get("normalize", {})
+        self.conditioning = ConditioningFramePreprocessor(
+            mean=_float_triplet(normalize.get("mean", (0.5, 0.5, 0.5))),
+            std=_float_triplet(normalize.get("std", (0.5, 0.5, 0.5))),
+            resample=conditioning_resample(preprocessing),
+            dtype=_numpy_dtype(spec["dtype"]),
+        )
+        return self.conditioning
+
+    def prepare_conditioning_frames(
+        self,
+        image: RawImage,
+        *,
+        height: int,
+        width: int,
+        frames: int = 1,
+        modality: str = "vision",
+    ) -> NDArray[Any]:
+        """Normalized ``[1, 3, frames, height, width]`` conditioning frames."""
+        program = self.conditioning_program(modality)
+        if not program:
+            raise ValueError(
+                f"This package declares no {modality!r} media conditioning"
+            )
+        processor = self._ensure_conditioning_preprocessor(program)
+        return processor(image, height=height, width=width, frames=frames)
+
     def prepare_reasoner(
         self,
         prompt: str,
@@ -972,33 +1544,97 @@ class WorldModelPreprocessor:
             features_target=target,
         )
 
-    def prepare_generator_prompt(self, prompt: str) -> NDArray[np.int64]:
-        if not prompt:
+    def prepare_generator_prompt(
+        self,
+        prompt: str,
+        *,
+        mode: str | None = None,
+        negative: bool = False,
+        frames: int = 1,
+        height: int = 0,
+        width: int = 0,
+        fps: float = 0.0,
+        add_resolution_template: bool = False,
+        add_duration_template: bool = False,
+        use_system_prompt: bool = False,
+        system_prompt: str | None = None,
+        allow_empty: bool = False,
+    ) -> NDArray[np.int64]:
+        if not prompt and not allow_empty:
             raise ValueError("prompt must be non-empty")
-        _, token_ids = self.text.encode_chat(
-            prompt,
-            image=False,
-            enable_thinking=False,
+        packer = self.generator_prompt.merged(
+            self.generation_recipe(mode).get("prompt")
         )
-        return np.asarray(token_ids, dtype=np.int64)
+        return packer.encode(
+            prompt,
+            negative=negative,
+            is_image=frames == 1,
+            frames=frames,
+            height=height,
+            width=width,
+            fps=fps,
+            add_resolution_template=add_resolution_template,
+            add_duration_template=add_duration_template,
+            use_system_prompt=use_system_prompt,
+            system_prompt=system_prompt,
+        )
 
     def prepare_world(
         self,
         prompt: str,
         *,
-        frames: int = 5,
-        height: int = 256,
-        width: int = 256,
+        frames: int | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        fps: float | None = None,
         action_steps: int = 0,
         action_domain: str = "no_action",
         include_action: bool = False,
         num_inference_steps: int | None = None,
         mode: str | None = None,
         seed: int | None = None,
+        image: RawImage | None = None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
+        add_resolution_template: bool | None = None,
+        add_duration_template: bool | None = None,
+        use_system_prompt: bool | None = None,
+        system_prompt: str | None = None,
+        conditioned_latent_frames: Sequence[int] | None = None,
         initial_vision_tokens: NDArray[np.floating[Any]] | None = None,
         initial_action_tokens: NDArray[np.floating[Any]] | None = None,
         generator_input_ids: NDArray[np.integer[Any]] | None = None,
+        unconditional_input_ids: NDArray[np.integer[Any]] | None = None,
     ) -> PreparedWorldInputs:
+        if mode is None and image is not None:
+            mode = self._image_conditioned_mode()
+        recipe = self.generation_recipe(mode)
+        prompt_recipe = recipe.get("prompt", {})
+        frames = int(recipe.get("frames", 5) if frames is None else frames)
+        height = int(recipe.get("height", 256) if height is None else height)
+        width = int(recipe.get("width", 256) if width is None else width)
+        fps = float(recipe.get("fps", 24.0) if fps is None else fps)
+        if add_resolution_template is None:
+            add_resolution_template = bool(
+                prompt_recipe.get(
+                    "add_resolution_template",
+                    self.generator_prompt.has_templates,
+                )
+            )
+        if add_duration_template is None:
+            add_duration_template = bool(
+                prompt_recipe.get(
+                    "add_duration_template",
+                    self.generator_prompt.has_templates,
+                )
+            )
+        if use_system_prompt is None:
+            use_system_prompt = bool(
+                prompt_recipe.get(
+                    "use_system_prompt",
+                    self.generator_prompt.has_system_prompts,
+                )
+            )
         spatial_compression = int(
             self._video_config.get("spatial_compression", 16)
         )
@@ -1134,10 +1770,153 @@ class WorldModelPreprocessor:
             )
 
         input_ids = (
-            self.prepare_generator_prompt(prompt)
+            self.prepare_generator_prompt(
+                prompt,
+                mode=mode,
+                frames=frames,
+                height=height,
+                width=width,
+                fps=fps,
+                add_resolution_template=add_resolution_template,
+                add_duration_template=add_duration_template,
+                use_system_prompt=use_system_prompt,
+                system_prompt=system_prompt,
+            )
             if generator_input_ids is None
             else np.asarray(generator_input_ids, dtype=np.int64).reshape(-1)
         )
+
+        scale = self.guidance_scale(mode=mode, requested=guidance_scale)
+        if guidance_scale is not None:
+            options["guidance_scale"] = float(guidance_scale)
+        unconditional_name = self.unconditional_input_name()
+        unconditional_ids: NDArray[np.int64] | None = None
+        if unconditional_input_ids is not None:
+            if unconditional_name is None:
+                raise ValueError(
+                    "This package declares no classifier-free guidance input, "
+                    "so unconditional_input_ids cannot be used"
+                )
+            if scale == 1.0:
+                raise ValueError(
+                    "unconditional_input_ids requires a guidance scale other "
+                    "than 1"
+                )
+            if negative_prompt is not None:
+                raise ValueError(
+                    "negative_prompt and unconditional_input_ids are mutually "
+                    "exclusive"
+                )
+            unconditional_ids = np.asarray(
+                unconditional_input_ids, dtype=np.int64
+            ).reshape(-1)
+        elif scale != 1.0:
+            if unconditional_name is None:
+                raise ValueError(
+                    "This package declares no classifier-free guidance input, "
+                    "so guidance_scale must be 1"
+                )
+            unconditional_ids = self.prepare_generator_prompt(
+                self._resolve_negative_prompt(mode, negative_prompt),
+                mode=mode,
+                negative=True,
+                frames=frames,
+                height=height,
+                width=width,
+                fps=fps,
+                add_resolution_template=add_resolution_template,
+                add_duration_template=add_duration_template,
+                use_system_prompt=use_system_prompt,
+                system_prompt=system_prompt,
+                allow_empty=True,
+            )
+        elif negative_prompt:
+            raise ValueError(
+                "negative_prompt requires a guidance scale other than 1"
+            )
+
+        conditioning: PreparedConditioning | None = None
+        noisy_indexes: NDArray[np.int64] | None = None
+        noisy_indexes_input: str | None = None
+        conditioned_frames = self._conditioned_latent_frames(
+            recipe, conditioned_latent_frames
+        )
+        if image is not None:
+            if not conditioned_frames:
+                raise ValueError(
+                    "Image conditioning requires at least one conditioned "
+                    "latent frame"
+                )
+            program = self.conditioning_program("vision")
+            if not program:
+                raise ValueError(
+                    "This package declares no vision media conditioning"
+                )
+            invalid = [
+                frame
+                for frame in conditioned_frames
+                if not 0 <= frame < latent_frames
+            ]
+            if invalid:
+                raise ValueError(
+                    f"Conditioned latent frames {invalid} are outside the "
+                    f"{latent_frames}-frame latent video"
+                )
+            if conditioned_frames != tuple(range(len(conditioned_frames))):
+                raise ValueError(
+                    "Media conditioning can only anchor a leading run of "
+                    f"latent frames, got {list(conditioned_frames)}"
+                )
+            grid_height = latent_height // patch_size
+            grid_width = latent_width // patch_size
+            self._check_conditioning_packing(program, patch_size)
+            conditioning = PreparedConditioning(
+                encoder_stage=str(program["encoder_stage"]),
+                encoder_input=str(program["encoder_input"]),
+                encoder_output=self._public_output_alias(
+                    str(program["encoder_output"])
+                ),                # The latent video encoder is causal in time: latent frame k
+                # only sees pixel frames up to k * temporal_compression, so
+                # encoding that leading run reproduces the anchored latent
+                # frames of the official recipe, which repeats the same frame
+                # across the whole clip.
+                pixel_values=self.prepare_conditioning_frames(
+                    image,
+                    height=height,
+                    width=width,
+                    frames=max(conditioned_frames) * temporal_compression + 1,
+                ),
+                latent_frames=conditioned_frames,
+                spatial_patch_size=patch_size,
+                latent_grid=(grid_height, grid_width),
+            )
+            frame_tokens = grid_height * grid_width
+            conditioned_rows = {
+                frame * frame_tokens + offset
+                for frame in conditioned_frames
+                for offset in range(frame_tokens)
+            }
+            noisy_indexes = np.asarray(
+                [
+                    index
+                    for index in range(vision_count)
+                    if index not in conditioned_rows
+                ],
+                dtype=np.int64,
+            )
+            if noisy_indexes.size == 0:
+                raise ValueError(
+                    "Every latent frame is conditioned; there is nothing to "
+                    "denoise"
+                )
+            noisy_indexes_input = str(
+                program.get(
+                    "timestep_token_indexes_input",
+                    f"{self._generator_component()}."
+                    "vision_timestep_token_indexes",
+                )
+            )
+
         return PreparedWorldInputs(
             input_ids=input_ids,
             vision_tokens=vision_tokens,
@@ -1147,6 +1926,123 @@ class WorldModelPreprocessor:
             latent_shape=(latent_frames, latent_height, latent_width),
             output_shape=(frames, height, width),
             action_domain=action_domain,
+            unconditional_input_ids=unconditional_ids,
+            unconditional_input_name=(
+                unconditional_name if unconditional_ids is not None else None
+            ),
+            conditioning=conditioning,
+            noisy_vision_token_indexes=noisy_indexes,
+            noisy_vision_token_input=noisy_indexes_input,
+        )
+
+    def _check_conditioning_packing(
+        self,
+        program: Mapping[str, Any],
+        patch_size: int,
+    ) -> None:
+        """Fail loudly when the conditioning and packing contracts disagree."""
+        packing = program.get("packing", {})
+        declared = packing.get("spatial_patch_size")
+        if declared is not None and int(declared) != patch_size:
+            raise ValueError(
+                "Conditioning packing declares spatial_patch_size "
+                f"{int(declared)}, but the packed generator boundary uses "
+                f"{patch_size}"
+            )
+        temporal = packing.get("temporal_patch_size", 1)
+        if int(temporal) != 1:
+            raise ValueError(
+                "Conditioning packing requires temporal_patch_size 1; the "
+                f"package declares {int(temporal)}"
+            )
+        layouts = (
+            packing.get("input_layout", "BCTHW"),
+            packing.get("output_layout", "NC"),
+            packing.get("channel_order", "patch_height_patch_width_channel"),
+        )
+        if layouts != ("BCTHW", "NC", "patch_height_patch_width_channel"):
+            raise ValueError(
+                f"Unsupported conditioning packing layout {layouts}"
+            )
+
+    def _resolve_negative_prompt(        self,
+        mode: str | None,
+        requested: str | None,
+    ) -> str:
+        """The unconditional prompt text for a mode.
+
+        An explicit value always wins. Otherwise the recipe decides between the
+        empty prompt (the default, matching the reference pipeline) and the
+        package's shipped negative-prompt asset.
+        """
+        if requested is not None:
+            return requested
+        recipe = self.generation_recipe(mode)
+        default = recipe.get("prompt", {}).get("negative_default", "empty")
+        if default == "asset":
+            return self.default_negative_prompt(mode)
+        if default != "empty":
+            raise ValueError(
+                f"Unknown negative_default {default!r} in the {mode!r} recipe; "
+                "expected 'empty' or 'asset'"
+            )
+        return ""
+
+    def _image_conditioned_mode(self) -> str:
+        modes = [
+            name
+            for name, recipe in self.generation_recipes.items()
+            if isinstance(recipe, dict)
+            and recipe.get("conditioning", {}).get("modality") == "image"
+        ]
+        if len(modes) != 1:
+            raise ValueError(
+                "This package declares no single image-conditioned generation "
+                "recipe; pass mode= explicitly"
+            )
+        return modes[0]
+
+    def _conditioned_latent_frames(
+        self,
+        recipe: Mapping[str, Any],
+        requested: Sequence[int] | None,
+    ) -> tuple[int, ...]:
+        if requested is not None:
+            frames = [int(frame) for frame in requested]
+        else:
+            declared = recipe.get("conditioning", {}).get(
+                "conditioned_latent_frames"
+            )
+            if declared is None:
+                declared = self.conditioning_program("vision").get(
+                    "default_conditioned_latent_frames", []
+                )
+            frames = [int(frame) for frame in declared]
+        if any(frame < 0 for frame in frames):
+            raise ValueError("Conditioned latent frames must be non-negative")
+        if len(set(frames)) != len(frames):
+            raise ValueError("Conditioned latent frames must be unique")
+        return tuple(sorted(frames))
+
+    def _generator_component(self) -> str:
+        guidance = self.guidance_program()
+        conditioning_input = guidance.get("conditioning_input")
+        if isinstance(conditioning_input, str) and "." in conditioning_input:
+            return conditioning_input.split(".", 1)[0]
+        entry = self._external_input_by_semantic(
+            "diffusion.initial_vision_latent"
+        )
+        if entry is None:
+            raise ValueError("This package has no packed diffusion generator")
+        return str(entry["port"]).split(".", 1)[0]
+
+    def _public_output_alias(self, port: str) -> str:
+        for output in self.manifest.get("outputs", []):
+            if output.get("port") == port:
+                return str(output.get("alias") or port.split(".", 1)[1])
+        raise ValueError(
+            f"Port {port!r} is not a public pipeline output, so its value "
+            "cannot be read back from a stage"
         )
 
     def decode(self, token_ids: NDArray[np.integer[Any]]) -> str:
