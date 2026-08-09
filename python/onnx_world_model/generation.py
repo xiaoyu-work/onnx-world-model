@@ -15,7 +15,7 @@ from .preprocessing import RawImage, RawVideo, WorldModelPreprocessor
 
 
 @dataclass(frozen=True)
-class LLMOutput:
+class TextOutput:
     text: str
     token_ids: NDArray[np.int64]
     timings: Mapping[str, float] = field(default_factory=dict)
@@ -64,7 +64,7 @@ class WorldModel:
             log_severity=log_severity,
         )
         self._runtime = runtime
-        self.llm = LLM(runtime)
+        self.text = TextGenerator(runtime)
         self.image = ImageGenerator(runtime)
         self.video = VideoGenerator(runtime)
         self.action = ActionGenerator(runtime)
@@ -91,7 +91,7 @@ class WorldModel:
     def capabilities(self) -> tuple[str, ...]:
         capabilities: list[str] = []
         if self._runtime.reasoner_decode_stage is not None:
-            capabilities.append("llm")
+            capabilities.append("text")
         if (
             self._runtime.world_stage is not None
             and self._runtime.video_stage is not None
@@ -105,7 +105,7 @@ class WorldModel:
         return tuple(capabilities)
 
 
-class LLM:
+class TextGenerator:
     def __init__(self, runtime: _GenerationRuntime) -> None:
         self._runtime = runtime
 
@@ -127,7 +127,7 @@ class LLM:
         video_fps: float | None = None,
         video_num_frames: int | None = None,
         video_sample_fps: float | None = None,
-    ) -> LLMOutput:
+    ) -> TextOutput:
         if image is not None and video is not None:
             raise ValueError("image and video are mutually exclusive")
         if max_tokens <= 0:
@@ -314,14 +314,14 @@ class _GenerationRuntime:
         video_fps: float | None,
         video_num_frames: int | None,
         video_sample_fps: float | None,
-    ) -> LLMOutput:
+    ) -> TextOutput:
         if self.reasoner_decode_stage is None:
-            raise RuntimeError("This package has no LLM generation stage")
+            raise RuntimeError("This package has no text generation stage")
         session = self.pipeline.create_session()
         timings: dict[str, float] = {}
         if video is not None:
             if self.reasoner_prompt_stage is None:
-                raise RuntimeError("This package has no visual LLM prefill stage")
+                raise RuntimeError("This package has no visual text prefill stage")
             prepared_video = self.preprocessor.prepare_video_reasoner(
                 prompt,
                 video,
@@ -362,7 +362,7 @@ class _GenerationRuntime:
             )
         if image is not None:
             if self.reasoner_prompt_stage is None:
-                raise RuntimeError("This package has no visual LLM prefill stage")
+                raise RuntimeError("This package has no visual text prefill stage")
             started = time.perf_counter()
             empty_video = self.preprocessor.empty_video_features()
             session.run_stage(
@@ -408,7 +408,7 @@ class _GenerationRuntime:
         timings["generate"] = time.perf_counter() - started
         session.release_stage(self.reasoner_decode_stage)
         token_ids = np.asarray(generated["generated_token_ids"], dtype=np.int64)
-        return LLMOutput(
+        return TextOutput(
             text=self.preprocessor.decode(token_ids),
             token_ids=token_ids,
             timings=timings,
@@ -507,12 +507,12 @@ class _GenerationRuntime:
 
 
 __all__ = [
-    "LLM",
     "ActionGenerator",
     "ActionOutput",
     "ImageGenerator",
     "ImageOutput",
-    "LLMOutput",
+    "TextGenerator",
+    "TextOutput",
     "VideoGenerator",
     "VideoOutput",
     "WorldModel",

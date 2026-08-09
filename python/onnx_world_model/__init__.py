@@ -16,12 +16,12 @@ from onnx_world_model._api import (
 )
 from onnx_world_model._native import WorldModelError
 from onnx_world_model.generation import (
-    LLM,
     ActionGenerator,
     ActionOutput,
     ImageGenerator,
     ImageOutput,
-    LLMOutput,
+    TextGenerator,
+    TextOutput,
     VideoGenerator,
     VideoOutput,
     WorldModel,
@@ -40,13 +40,11 @@ from onnx_world_model.preprocessing import (
 )
 
 __all__ = [
-    "LLM",
     "ActionGenerator",
     "ActionOutput",
     "ImageGenerator",
     "ImageOutput",
     "ImagePreprocessor",
-    "LLMOutput",
     "LatentDynamicsModel",
     "LegacyWorldModel",
     "ModelMetadata",
@@ -66,6 +64,8 @@ __all__ = [
     "Rollout",
     "StepResult",
     "TensorSpec",
+    "TextGenerator",
+    "TextOutput",
     "TextPreprocessor",
     "VideoGenerator",
     "VideoOutput",

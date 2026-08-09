@@ -749,7 +749,7 @@ def test_llm_generate_preprocesses_and_decodes(
 ) -> None:
     image = np.zeros((32, 32, 3), dtype=np.uint8)
 
-    result = world_model.llm.generate(
+    result = world_model.text.generate(
         "cat",
         image,
         max_tokens=2,
@@ -775,7 +775,7 @@ def test_llm_generate_accepts_video(
     model = WorldModel(preprocessing_package)
     frames = np.zeros((4, 16, 16, 3), dtype=np.uint8)
 
-    output = model.llm.generate(
+    output = model.text.generate(
         "cat",
         video=frames,
         video_fps=2,
@@ -844,7 +844,8 @@ def test_image_generator_returns_one_frame(
 
 
 def test_public_api_uses_modality_names(world_model: WorldModel) -> None:
-    assert world_model.capabilities == ("llm", "image", "video", "action")
+    assert world_model.capabilities == ("text", "image", "video", "action")
+    assert not hasattr(world_model, "llm")
     assert not hasattr(world_model, "respond")
     assert not hasattr(world_model, "generate_world")
 

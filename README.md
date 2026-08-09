@@ -86,10 +86,10 @@ model = WorldModel.from_pretrained(
     providers=["cuda", "cpu"],
     provider_options={"cuda": {"device_id": 0}},
 )
-print(model.capabilities)  # ("llm", "image", "video", "action")
+print(model.capabilities)  # ("text", "image", "video", "action")
 
-# LLM / visual-language generation.
-answer = model.llm.generate(
+# Text / visual-language generation.
+answer = model.text.generate(
     "What is shown in this image?",
     image="frame.png",
     max_tokens=64,
@@ -97,8 +97,8 @@ answer = model.llm.generate(
 )
 print(answer.text)
 
-# Video understanding uses the same LLM interface.
-summary = model.llm.generate(
+# Video understanding uses the same text interface.
+summary = model.text.generate(
     "Summarize what happens in this video.",
     video="clip.mp4",
     video_sample_fps=2,
@@ -136,11 +136,11 @@ image = model.image.generate(
 print(image.images.shape)
 ```
 
-The modality objects are also public (`LLM`, `ImageGenerator`,
+The modality objects are also public (`TextGenerator`, `ImageGenerator`,
 `VideoGenerator`, and `ActionGenerator`), but they normally come from one
 loaded `WorldModel` so component sessions and preprocessing assets are shared.
 
-Raw `image=` belongs to `model.llm.generate()` and conditions the visual
+Raw `image=` belongs to `model.text.generate()` and conditions the visual
 Reasoner. `video=` accepts a video path, a frame sequence, or a
 `[T,H,W,C]`/`[T,C,H,W]` NumPy array. Packages with a declared video-
 understanding contract apply frame sampling, timestamps, packed patchification,
@@ -168,7 +168,7 @@ conditioning/masking contract.
 
 Results retain model-boundary array layouts:
 
-- `LLMOutput.text` is decoded text and `token_ids` is
+- `TextOutput.text` is decoded text and `token_ids` is
   `[batch, generated_tokens]`;
 - `ActionOutput.actions` is sliced from padded action state to the selected
   domain's raw width;
