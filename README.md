@@ -101,6 +101,7 @@ model = WorldModel.from_pretrained(
     "output/cosmos3-edge",
     providers=["cuda", "cpu"],
     provider_options={"cuda": {"device_id": 0}},
+    graph_optimization="basic",
 )
 print(model.capabilities)  # ("text", "image", "video", "action")
 
@@ -131,6 +132,7 @@ video = model.video.generate(
     width=256,
     num_inference_steps=50,
     seed=1234,
+    decode_latent_chunk=6,
 )
 print(video.video.shape)
 
@@ -157,6 +159,19 @@ print(image.images.shape)
 video path, frame sequence, or THWC/TCHW NumPy array. They are mutually
 exclusive in one text-generation request. Image-to-video requires a package
 that declares the corresponding recipe.
+
+`graph_optimization` selects the ONNX Runtime graph optimization level
+(`"disabled"`, `"basic"`, `"extended"`, or `"all"`, the default). Cosmos3 Edge
+needs `"basic"`, because ONNX Runtime's extended fusions abort while building
+the reasoner decoder session.
+
+`decode_latent_chunk` decodes the video latent that many latent frames at a
+time instead of in one pass, and `decode_latent_overlap` (default 2) sets how
+many latent frames of context each chunk after the first is given before its
+extra pixels are dropped. Full-resolution clips need this on CUDA: a single
+decode makes an intermediate VAE activation exceed what ONNX Runtime's CUDA
+kernels can index. Decoding 121 frames of 480x832 in chunks of 6 takes about
+7 seconds on an H200, versus about 580 seconds for one CPU decode.
 
 Low-level tensor and stage execution is documented in the
 [Pipeline API](docs/pipeline-api.md). Cosmos3 Edge results are in
