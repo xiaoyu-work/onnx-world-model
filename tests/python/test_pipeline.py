@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +51,40 @@ def test_pipeline_provider_selection(pipeline_path: Path):
 def test_pipeline_rejects_incompatible_provider(pipeline_path: Path):
     with pytest.raises(WorldModelError, match="no execution provider compatible"):
         Pipeline(pipeline_path, providers=["cuda"])
+
+
+def test_pipeline_keeps_requested_cpu_fallback(tmp_path: Path, pipeline_path: Path):
+    """A component preferring one accelerator must still accept a CPU fallback.
+
+    Exporting with ``mobius build --ep cuda`` writes
+    ``preferred_execution_providers: ["cuda"]`` for every component. Those are
+    placement preferences, not an allowlist, so an explicitly requested CPU
+    provider has to survive; dropping it makes ONNX Runtime refuse any node the
+    accelerator does not implement.
+    """
+    package = tmp_path / "package"
+    shutil.copytree(pipeline_path, package)
+    manifest_path = package / "pipeline.json"
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for component in document["manifest"]["components"]:
+        component["preferred_execution_providers"] = ["cuda"]
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+
+    pipeline = Pipeline(package, providers=["cuda", "cpu"])
+
+    for providers in pipeline.execution_providers.values():
+        assert "CPUExecutionProvider" in providers
+
+
+def test_pipeline_rejects_unknown_graph_optimization(pipeline_path: Path):
+    with pytest.raises(ValueError, match="graph_optimization"):
+        Pipeline(pipeline_path, graph_optimization="aggressive")
+
+
+def test_pipeline_accepts_graph_optimization_levels(pipeline_path: Path):
+    for level in ("disabled", "basic", "extended", "all"):
+        pipeline = Pipeline(pipeline_path, graph_optimization=level)
+        assert pipeline.execution_providers
 
 
 def test_runs_pipeline_stage(pipeline_path: Path):

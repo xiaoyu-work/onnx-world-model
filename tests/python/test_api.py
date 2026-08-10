@@ -73,12 +73,25 @@ def test_configures_cpu_execution_provider(world_model_path: Path):
 def test_explicit_provider_fallback(world_model_path: Path):
     model = OnnxModel(world_model_path, providers=["cuda", "cpu"])
 
-    assert model.metadata.execution_providers == ("CPUExecutionProvider",)
+    expected = ("CPUExecutionProvider",)
+    if "CUDAExecutionProvider" in available_execution_providers():
+        expected = ("CUDAExecutionProvider", "CPUExecutionProvider")
+    assert model.metadata.execution_providers == expected
 
 
 def test_rejects_unavailable_provider(world_model_path: Path):
+    available = {
+        name.lower().removesuffix("executionprovider")
+        for name in available_execution_providers()
+    }
+    unavailable = next(
+        (name for name in ("cuda", "vitisai", "openvino", "qnn") if name not in available),
+        None,
+    )
+    if unavailable is None:
+        pytest.skip("every candidate execution provider is available here")
     with pytest.raises(WorldModelError, match="requested execution providers"):
-        OnnxModel(world_model_path, providers=["cuda"])
+        OnnxModel(world_model_path, providers=[unavailable])
 
 
 def test_lists_available_execution_providers():

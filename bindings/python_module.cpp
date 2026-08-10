@@ -2,6 +2,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <pybind11/numpy.h>
@@ -218,11 +219,31 @@ using onnx_world_model::WorldModel;
   return result;
 }
 
+[[nodiscard]] onnx_world_model::GraphOptimizationLevel ParseGraphOptimization(
+    const std::string& level) {
+  using onnx_world_model::GraphOptimizationLevel;
+  static const std::unordered_map<std::string, GraphOptimizationLevel> levels{
+      {"disabled", GraphOptimizationLevel::disabled},
+      {"basic", GraphOptimizationLevel::basic},
+      {"extended", GraphOptimizationLevel::extended},
+      {"all", GraphOptimizationLevel::all},
+  };
+  const auto found = levels.find(level);
+  if (found == levels.end()) {
+    throw py::value_error(
+        "graph_optimization must be one of 'disabled', 'basic', 'extended', "
+        "or 'all', not '" +
+        level + "'");
+  }
+  return found->second;
+}
+
 [[nodiscard]] RuntimeOptions RuntimeOptionsFromPython(
     const std::string& ort_library_path,
     int intra_op_threads,
     int inter_op_threads,
     int log_severity,
+    const std::string& graph_optimization,
     const std::vector<std::string>& providers,
     const py::dict& provider_options) {
   RuntimeOptions result{
@@ -230,6 +251,7 @@ using onnx_world_model::WorldModel;
       .intra_op_threads = intra_op_threads,
       .inter_op_threads = inter_op_threads,
       .log_severity = log_severity,
+      .graph_optimization = ParseGraphOptimization(graph_optimization),
       .providers = providers,
   };
   for (const auto& provider : provider_options) {
@@ -302,6 +324,7 @@ PYBIND11_MODULE(_native, module) {
                        int intra_op_threads,
                        int inter_op_threads,
                        int log_severity,
+                       const std::string& graph_optimization,
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options) {
             RuntimeOptions options = RuntimeOptionsFromPython(
@@ -309,6 +332,7 @@ PYBIND11_MODULE(_native, module) {
                 intra_op_threads,
                 inter_op_threads,
                 log_severity,
+                graph_optimization,
                 providers,
                 provider_options);
             py::gil_scoped_release release;
@@ -319,6 +343,7 @@ PYBIND11_MODULE(_native, module) {
           py::arg("intra_op_threads") = 0,
           py::arg("inter_op_threads") = 0,
           py::arg("log_severity") = 3,
+          py::arg("graph_optimization") = "all",
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict())
       .def_property_readonly(
@@ -347,6 +372,7 @@ PYBIND11_MODULE(_native, module) {
                        int intra_op_threads,
                        int inter_op_threads,
                        int log_severity,
+                       const std::string& graph_optimization,
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options) {
             RuntimeOptions options = RuntimeOptionsFromPython(
@@ -354,6 +380,7 @@ PYBIND11_MODULE(_native, module) {
                 intra_op_threads,
                 inter_op_threads,
                 log_severity,
+                graph_optimization,
                 providers,
                 provider_options);
             py::gil_scoped_release release;
@@ -364,6 +391,7 @@ PYBIND11_MODULE(_native, module) {
           py::arg("intra_op_threads") = 0,
           py::arg("inter_op_threads") = 0,
           py::arg("log_severity") = 3,
+          py::arg("graph_optimization") = "all",
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict())
       .def_property_readonly(
@@ -407,6 +435,7 @@ PYBIND11_MODULE(_native, module) {
                        int intra_op_threads,
                        int inter_op_threads,
                        int log_severity,
+                       const std::string& graph_optimization,
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options) {
             RuntimeOptions options = RuntimeOptionsFromPython(
@@ -414,6 +443,7 @@ PYBIND11_MODULE(_native, module) {
                 intra_op_threads,
                 inter_op_threads,
                 log_severity,
+                graph_optimization,
                 providers,
                 provider_options);
             py::gil_scoped_release release;
@@ -424,6 +454,7 @@ PYBIND11_MODULE(_native, module) {
           py::arg("intra_op_threads") = 0,
           py::arg("inter_op_threads") = 0,
           py::arg("log_severity") = 3,
+          py::arg("graph_optimization") = "all",
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict())
       .def_property_readonly(

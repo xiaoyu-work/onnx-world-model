@@ -1805,6 +1805,21 @@ RuntimeOptions ComponentRuntimeOptions(
       resolved.providers.push_back(provider);
     }
   }
+  // A component's manifest preferences say where it runs best; they are not an
+  // allowlist. Keep an explicitly requested CPU provider even when they omit
+  // it, because dropping the CPU fallback makes ONNX Runtime refuse to build a
+  // session that contains any node the preferred provider does not implement.
+  const auto names_cpu = [](const std::vector<std::string>& providers) {
+    return std::any_of(
+        providers.begin(),
+        providers.end(),
+        [](const std::string& provider) {
+          return NormalizeExecutionProviderName(provider) == "cpu";
+        });
+  };
+  if (names_cpu(requested.providers) && !names_cpu(resolved.providers)) {
+    resolved.providers.emplace_back("cpu");
+  }
   if (resolved.providers.empty()) {
     if (requested.providers.empty() && allowed.empty()) {
       resolved.providers.emplace_back("cpu");

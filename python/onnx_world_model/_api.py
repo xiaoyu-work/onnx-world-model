@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import sysconfig
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +90,49 @@ def _step_result(values: tuple[NDArray[Any], ...]) -> StepResult:
     )
 
 
+_CUDA_LIBRARY_ORDER = (
+    "libcudart.so",
+    "libnvJitLink.so",
+    "libcublasLt.so",
+    "libcublas.so",
+    "libcufft.so",
+    "libcurand.so",
+    "libcudnn.so",
+)
+
+
+def _preload_cuda_dependencies(package_dir: Path) -> None:
+    """Resolve the CUDA libraries onnxruntime-gpu links by soname alone.
+
+    A pip CUDA installation puts them under ``nvidia/*/lib`` rather than on the
+    loader path, so opening the CUDA provider fails unless they are already
+    mapped into the process. Missing pieces are ignored: the provider reports a
+    clearer error than a preload failure would.
+    """
+    if not (package_dir / "libonnxruntime_providers_cuda.so").is_file():
+        return
+    roots = [
+        Path(sysconfig.get_paths()["purelib"]) / "nvidia",
+        Path(sysconfig.get_paths()["platlib"]) / "nvidia",
+    ]
+    directories = [
+        directory
+        for root in dict.fromkeys(roots)
+        if root.is_dir()
+        for directory in sorted(root.glob("*/lib"))
+    ]
+    if not directories:
+        return
+    for soname in _CUDA_LIBRARY_ORDER:
+        for directory in directories:
+            for candidate in sorted(directory.glob(f"{soname}*")):
+                try:
+                    ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    continue
+                break
+
+
 def _find_ort_library() -> Path:
     override = os.environ.get("ONNX_RUNTIME_LIBRARY_PATH")
     if override:
@@ -113,6 +158,7 @@ def _find_ort_library() -> Path:
     for pattern in patterns:
         candidates = sorted(package_dir.rglob(pattern))
         if candidates:
+            _preload_cuda_dependencies(candidates[0].parent)
             return candidates[0]
     raise RuntimeError(
         "The installed onnxruntime package does not contain a loadable C API "
@@ -168,6 +214,7 @@ class OnnxModel:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        graph_optimization: str = "all",
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
     ) -> None:
@@ -181,6 +228,7 @@ class OnnxModel:
             intra_op_threads,
             inter_op_threads,
             log_severity,
+            graph_optimization,
             provider_names,
             options,
         )
@@ -208,6 +256,7 @@ class Pipeline:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        graph_optimization: str = "all",
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
     ) -> None:
@@ -224,6 +273,7 @@ class Pipeline:
             intra_op_threads,
             inter_op_threads,
             log_severity,
+            graph_optimization,
             provider_names,
             options,
         )
@@ -437,6 +487,7 @@ class LatentDynamicsModel:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        graph_optimization: str = "all",
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
     ) -> None:
@@ -450,6 +501,7 @@ class LatentDynamicsModel:
             intra_op_threads,
             inter_op_threads,
             log_severity,
+            graph_optimization,
             provider_names,
             options,
         )

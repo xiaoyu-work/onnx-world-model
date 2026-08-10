@@ -1,10 +1,12 @@
 #include "ort_backend.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -120,6 +122,38 @@ namespace {
       .data_type = FromOrtDataType(tensor_info.GetElementType()),
       .shape = tensor_info.GetShape(),
   };
+}
+
+[[nodiscard]] std::string AnnotateExecutionFailure(std::string message) {
+  // Oversized intermediates surface as several different CUDA statuses: a
+  // kernel that rejects its launch configuration, an allocator that runs out of
+  // device memory, or a cuBLAS/cuDNN handle that cannot reserve its workspace.
+  // All of them are size problems rather than bad graphs, and the raw status
+  // gives a caller nothing to act on.
+  static constexpr std::string_view kOversizeSignals[] = {
+      "cudaErrorInvalidValue",
+      "cudaErrorMemoryAllocation",
+      "out of memory",
+      "resource allocation failed",
+      "CUBLAS_STATUS_ALLOC_FAILED",
+      "Failed to allocate memory for requested buffer",
+  };
+  const bool oversized = std::any_of(
+      std::begin(kOversizeSignals),
+      std::end(kOversizeSignals),
+      [&message](std::string_view signal) {
+        return message.find(signal) != std::string::npos;
+      });
+  if (oversized) {
+    message +=
+        ". This execution provider could not run the stage at this size, "
+        "either because an intermediate tensor exceeds what its kernels can "
+        "index or because it could not reserve device memory. Run the stage "
+        "over smaller inputs, for example fewer video frames per decode or a "
+        "lower resolution, place this component on the CPU provider, or free "
+        "device memory held by other processes.";
+  }
+  return message;
 }
 
 [[nodiscard]] Ort::Value MakeOrtTensor(
@@ -458,7 +492,8 @@ class OrtBackend final : public ModelBackend {
     } catch (const Ort::Exception& exception) {
       throw Error(
           ErrorCode::runtime_execution,
-          "ONNX Runtime inference failed: " + std::string(exception.what()));
+          "ONNX Runtime inference failed: " +
+              AnnotateExecutionFailure(exception.what()));
     }
   }
 
