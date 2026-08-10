@@ -10,8 +10,14 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from ._api import Pipeline, ProviderOptions
-from .preprocessing import RawImage, RawVideo, WorldModelPreprocessor
+from ._api import Pipeline, PipelineSession, ProviderOptions
+from .preprocessing import (
+    PreparedWorldInputs,
+    RawImage,
+    RawVideo,
+    WorldModelPreprocessor,
+    unpack_latent_tokens,
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,7 @@ class WorldModel:
         intra_op_threads: int = 0,
         inter_op_threads: int = 0,
         log_severity: int = 3,
+        graph_optimization: str = "all",
     ) -> None:
         runtime = _GenerationRuntime(
             package_path,
@@ -62,6 +69,7 @@ class WorldModel:
             intra_op_threads=intra_op_threads,
             inter_op_threads=inter_op_threads,
             log_severity=log_severity,
+            graph_optimization=graph_optimization,
         )
         self._runtime = runtime
         self.text = TextGenerator(runtime)
@@ -241,6 +249,8 @@ class VideoGenerator:
         initial_latents: NDArray[np.floating[Any]] | None = None,
         input_ids: NDArray[np.integer[Any]] | None = None,
         negative_input_ids: NDArray[np.integer[Any]] | None = None,
+        decode_latent_chunk: int = 0,
+        decode_latent_overlap: int = 2,
     ) -> VideoOutput:
         result, timings = self._runtime.generate(
             prompt,
@@ -264,6 +274,8 @@ class VideoGenerator:
             initial_vision_tokens=initial_latents,
             generator_input_ids=input_ids,
             unconditional_input_ids=negative_input_ids,
+            decode_latent_chunk=decode_latent_chunk,
+            decode_latent_overlap=decode_latent_overlap,
         )
         return VideoOutput(video=result["video"], timings=timings)
 
@@ -480,6 +492,8 @@ class _GenerationRuntime:
         initial_action_tokens: NDArray[np.floating[Any]] | None = None,
         generator_input_ids: NDArray[np.integer[Any]] | None = None,
         unconditional_input_ids: NDArray[np.integer[Any]] | None = None,
+        decode_latent_chunk: int = 0,
+        decode_latent_overlap: int = 2,
     ) -> tuple[dict[str, NDArray[Any]], dict[str, float]]:
         if self.world_stage is None:
             raise RuntimeError("This package has no world generation stage")
@@ -551,16 +565,95 @@ class _GenerationRuntime:
             if self.video_stage is None:
                 raise RuntimeError("This package has no video generation stage")
             started = time.perf_counter()
-            decoded = session.run_stage(
-                self.video_stage,
-                options=prepared.options,
-            )
+            if decode_latent_chunk:
+                video = self._decode_video_in_chunks(
+                    session,
+                    prepared,
+                    chunk=decode_latent_chunk,
+                    overlap=decode_latent_overlap,
+                )
+            else:
+                decoded = session.run_stage(
+                    self.video_stage,
+                    options=prepared.options,
+                )
+                if "video" not in decoded:
+                    raise RuntimeError("The package produced no video output")
+                video = np.asarray(decoded["video"]).copy()
             timings["decode"] = time.perf_counter() - started
-            if "video" not in decoded:
-                raise RuntimeError("The package produced no video output")
-            result["video"] = np.asarray(decoded["video"]).copy()
+            result["video"] = video
             session.release_stage(self.video_stage)
         return result, timings
+
+    def _video_finalize_connection(self) -> dict[str, Any]:
+        for connection in self.preprocessor.manifest.get("connections", []):
+            if connection.get("transform") == "video_diffusion_finalize":
+                return connection
+        raise RuntimeError(
+            "This package has no video_diffusion_finalize connection, so its "
+            "video latent cannot be decoded in chunks"
+        )
+
+    def _decode_video_in_chunks(
+        self,
+        session: PipelineSession,
+        prepared: PreparedWorldInputs,
+        *,
+        chunk: int,
+        overlap: int,
+    ) -> NDArray[Any]:
+        """Decode the video latent a few latent frames at a time.
+
+        A full-resolution clip makes the VAE decoder's widest activation exceed
+        what ONNX Runtime's CUDA kernels can index, so the latent is decoded in
+        temporal slices. Each slice after the first is prefixed with `overlap`
+        latent frames of context whose pixels are then dropped, because the
+        decoder's temporal convolutions are causal.
+        """
+        if chunk <= 0:
+            raise ValueError("decode_latent_chunk must be positive")
+        if overlap < 0:
+            raise ValueError("decode_latent_overlap must not be negative")
+        connection = self._video_finalize_connection()
+        parameters = connection.get("parameters", {})
+        packed = session.state(parameters["state"])
+        if packed is None:
+            raise RuntimeError(
+                f"State '{parameters['state']}' is unavailable after generation"
+            )
+        latent_frames, latent_height, latent_width = prepared.latent_shape
+        latent = unpack_latent_tokens(
+            packed,
+            int(parameters["spatial_patch_size"]),
+            channels=int(parameters["latent_channels"]),
+            frames=latent_frames,
+            height=latent_height,
+            width=latent_width,
+        ).astype(np.float32)
+
+        output_frames = prepared.output_shape[0]
+        ratio = (
+            (output_frames - 1) // (latent_frames - 1) if latent_frames > 1 else 1
+        )
+        target = connection["target"]
+        pieces: list[NDArray[Any]] = []
+        start = 0
+        while start < latent_frames:
+            stop = min(start + chunk, latent_frames)
+            context = min(overlap, start)
+            piece = session.run_stage(
+                self.video_stage,
+                overrides={target: latent[:, :, start - context : stop]},
+                options=prepared.options,
+            )
+            if "video" not in piece:
+                raise RuntimeError("The package produced no video output")
+            decoded = np.asarray(piece["video"])
+            if context:
+                decoded = decoded[:, :, 1 + (context - 1) * ratio :]
+            pieces.append(decoded.copy())
+            start = stop
+        return np.concatenate(pieces, axis=2)[:, :, :output_frames]
 
     def _find_stage(
         self,

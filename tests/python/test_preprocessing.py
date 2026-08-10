@@ -553,6 +553,29 @@ def test_rejects_latents_that_do_not_tile() -> None:
         )
 
 
+def test_unpacks_latents_back_to_bcthw() -> None:
+    latent = np.arange(1 * 4 * 2 * 4 * 4, dtype=np.float32).reshape(1, 4, 2, 4, 4)
+
+    packed = preprocessing.pack_latent_tokens(latent, 2)
+    restored = preprocessing.unpack_latent_tokens(
+        packed, 2, channels=4, frames=2, height=4, width=4
+    )
+
+    np.testing.assert_array_equal(restored, latent)
+
+
+def test_rejects_packed_latents_of_the_wrong_shape() -> None:
+    with pytest.raises(ValueError, match="expected"):
+        preprocessing.unpack_latent_tokens(
+            np.zeros((7, 16), dtype=np.float32),
+            2,
+            channels=4,
+            frames=2,
+            height=4,
+            width=4,
+        )
+
+
 def test_prepares_image_to_video_inputs(conditioned_package: Path) -> None:
     preprocessor = WorldModelPreprocessor(conditioned_package)
     image = np.zeros((16, 16, 3), dtype=np.uint8)

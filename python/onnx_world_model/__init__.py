@@ -43,6 +43,7 @@ from onnx_world_model.preprocessing import (
     TextPreprocessor,
     WorldModelPreprocessor,
     pack_latent_tokens,
+    unpack_latent_tokens,
 )
 
 __all__ = [
@@ -86,4 +87,5 @@ __all__ = [
     "available_execution_providers",
     "pack_latent_tokens",
     "supported_pipeline_capabilities",
+    "unpack_latent_tokens",
 ]

@@ -185,6 +185,55 @@ def pack_latent_tokens(
     )
 
 
+def unpack_latent_tokens(
+    packed: NDArray[Any],
+    spatial_patch_size: int,
+    *,
+    channels: int,
+    frames: int,
+    height: int,
+    width: int,
+    batch: int = 1,
+) -> NDArray[Any]:
+    """Unpack generator token rows into a ``[B, C, T, H, W]`` latent.
+
+    This is the inverse of :func:`pack_latent_tokens` and mirrors the runtime's
+    video unpatchify transform, so a host can recover the latent a decoder
+    stage would have received.
+    """
+    if spatial_patch_size <= 0:
+        raise ValueError("spatial_patch_size must be positive")
+    values = np.asarray(packed)
+    if values.ndim != 2:
+        raise ValueError("Packed latents must have shape [tokens, features]")
+    if height % spatial_patch_size or width % spatial_patch_size:
+        raise ValueError(
+            "Latent height and width must be divisible by spatial_patch_size"
+        )
+    grid_height = height // spatial_patch_size
+    grid_width = width // spatial_patch_size
+    expected = (
+        batch * frames * grid_height * grid_width,
+        spatial_patch_size * spatial_patch_size * channels,
+    )
+    if values.shape != expected:
+        raise ValueError(
+            f"Packed latents have shape {values.shape}, expected {expected}"
+        )
+    patches = values.reshape(
+        batch,
+        frames,
+        grid_height,
+        grid_width,
+        spatial_patch_size,
+        spatial_patch_size,
+        channels,
+    )
+    # (B, T, H_p, W_p, p_h, p_w, C) -> (B, C, T, H_p, p_h, W_p, p_w)
+    patches = patches.transpose(0, 6, 1, 2, 4, 3, 5)
+    return patches.reshape(batch, channels, frames, height, width)
+
+
 _CONDITIONING_RESAMPLING = {
     "bilinear": Image.Resampling.BILINEAR,
     "bicubic": Image.Resampling.BICUBIC,
