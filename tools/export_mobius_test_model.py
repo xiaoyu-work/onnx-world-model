@@ -1,3 +1,9 @@
+# @agent-file
+# @agent-purpose: Exports the small deterministic Mobius world-model and pipeline packages that the Python test fixtures load, with fixed head biases so predictions are reproducible.
+# @agent-public-api: export_test_model, export_test_pipeline, main
+# @agent-invariants: Head biases are pinned so `tests/python/test_api.py` can compare a step against a hand-computed reference; changing them breaks those assertions. The exported pipeline declares the `latent-dynamics` profile with a single `step` stage. This module imports `mobius`, `torch`, and `onnx_ir`, which are not project dependencies, so importers must guard the import.
+# @agent-side-effects: Writes ONNX models, pipeline packages, and weights under the given output directory; the CLI prints the exported model path.
+
 from __future__ import annotations
 
 import argparse

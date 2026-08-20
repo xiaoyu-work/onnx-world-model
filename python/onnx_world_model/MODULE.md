@@ -1,0 +1,68 @@
+# python/onnx_world_model
+
+## Purpose
+
+Implements the installed Python package: it wraps the compiled `_native`
+extension in typed classes and adds the preprocessing and generation layers
+that turn prompts, images, and videos into the tensors a Mobius package
+expects.
+
+## Responsibilities
+
+- Locate and load the ONNX Runtime shared library before the extension is used,
+  including the CUDA libraries an `onnxruntime-gpu` wheel resolves by soname.
+- Present the manifest as typed `PipelineInputSpec`, `PipelineOutputSpec`, and
+  `PipelineStageSpec` values.
+- Prepare model inputs from package configuration: chat templates, tokenizers,
+  image and video patch packing, latent-token layout, and conditioning frames.
+- Offer the modality-oriented `WorldModel` API (`text`, `image`, `video`,
+  `action`) and report the capabilities the loaded package actually declares.
+- Keep the low-level `OnnxModel`, `Pipeline`, `PipelineSession`,
+  `LatentDynamicsModel`, and `Rollout` APIs available.
+
+## Key Files
+
+| File | Responsibility |
+|---|---|
+| `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
+| `_api.py` | ORT library discovery, `_native` wrappers, manifest spec dataclasses, `Pipeline` and `PipelineSession`, latent-dynamics API. |
+| `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
+| `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
+| `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
+
+`WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases for
+`Pipeline` and `LatentDynamicsModel`.
+
+## Dependencies
+
+Intra-package imports are one-way and acyclic:
+
+```text
+_native (compiled) <- _api <- generation
+                     media <- preprocessing <- generation
+```
+
+`media.py` must not import `preprocessing.py`; `preprocessing.py` imports and
+re-exports the media symbols so `onnx_world_model.preprocessing` remains the
+single documented import path.
+
+Third-party runtime dependencies come from `pyproject.toml`: `numpy`,
+`onnxruntime`, `tokenizers`, `Jinja2`, `Pillow`, `imageio[ffmpeg]`, and
+`ml_dtypes`.
+
+The compiled `_native` module is produced from `bindings/python_module.cpp` by
+scikit-build-core and installed next to these files; it is not present in the
+source tree.
+
+## Tests
+
+```console
+.venv\Scripts\python.exe -m pytest tests/python -q
+uvx ruff check python
+```
+
+`tests/python/test_api.py` covers `_api.py`,
+`tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
+and `tests/python/test_guided_generation.py` and
+`tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that
+need a Mobius export skip unless the `mobius` package is installed.

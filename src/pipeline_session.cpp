@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling.
+ * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset
+ * @agent-invariants: All mutable state lives in PipelineSession::Impl behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused.
+ * @agent-side-effects: Runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling.
+ */
+
 #include "onnx_world_model/pipeline.hpp"
 
 #include <algorithm>

@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Implements the ONNX Runtime ModelBackend: it creates sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.
+ * @agent-public-api: CreateOrtBackend, GetAvailableOrtProviders
+ * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before any session is created. Requested execution providers are matched by NormalizeExecutionProviderName, and a provider the loaded ORT build does not offer is an error rather than a silent CPU fallback. DataType and ONNXTensorElementDataType map one-to-one; an unmapped ONNX element type throws ErrorCode::model_contract.
+ * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions, and runs inference.
+ */
+
 #include "ort_backend.hpp"
 
 #include <algorithm>

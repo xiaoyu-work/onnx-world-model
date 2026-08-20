@@ -1,3 +1,9 @@
+# @agent-file
+# @agent-purpose: Provides the shared pytest fixtures that build throwaway Mobius packages, tokenizers, chat templates, and conditioning configuration for the Python test suite.
+# @agent-public-api: world_model_path, pipeline_path, preprocessing_package, conditioned_package
+# @agent-invariants: `world_model_path` and `pipeline_path` are session scoped and call `pytest.importorskip("mobius")`, so the suite skips instead of failing when the exporter is absent. `preprocessing_package` and `conditioned_package` build a self-contained package under `tmp_path` with a WordLevel tokenizer whose special tokens match the chat template, so they need no network access and no exporter.
+# @agent-side-effects: Writes tokenizer, chat-template, and package configuration files into pytest temporary directories, and imports `tools.export_mobius_test_model` when the exporter fixtures are used.
+
 from __future__ import annotations
 
 import json

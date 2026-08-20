@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Implements the Tensor value type: checked shape and byte-size arithmetic, zero and byte construction, DataType naming and sizing, and copy-on-write mutable access.
+ * @agent-public-api: ToString, DataTypeSize, Tensor::Tensor, Tensor::FromBytes, Tensor::Zeros, Tensor::mutable_bytes
+ * @agent-invariants: Element count and byte size are computed with overflow checks and negative dimensions are rejected, both throwing ErrorCode::invalid_argument; FromBytes requires the source span to match the computed byte size exactly; mutable_bytes clones the buffer whenever it is shared, so existing copies never observe a mutation.
+ * @agent-side-effects: none
+ */
+
 #include "onnx_world_model/tensor.hpp"
 
 #include <algorithm>

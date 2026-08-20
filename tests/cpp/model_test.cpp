@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Standalone test executable for Model and its metadata contract, using an in-process AddOneBackend stub instead of a real ONNX Runtime session.
+ * @agent-public-api: main
+ * @agent-invariants: Registered with CTest as model_test; it counts failures through local Check and CheckThrows helpers and returns a non-zero exit code when any check fails. It covers input and output name validation, dtype and shape mismatches, and provider-name normalization through a stub ModelBackend, so it never loads an ONNX Runtime library or a model file.
+ * @agent-side-effects: Writes failure descriptions to stderr and returns a process exit code.
+ */
+
 #include <array>
 #include <cstddef>
 #include <iostream>

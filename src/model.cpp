@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Implements execution-provider name normalization, tensor-versus-signature validation, ModelMetadata lookups, and the Model facade that validates every named tensor around a backend run.
+ * @agent-public-api: NormalizeExecutionProviderName, AvailableExecutionProviders, ValidateTensor, ModelMetadata::Input, ModelMetadata::Output, Model::Model, Model::Load, Model::metadata, Model::Run
+ * @agent-invariants: Model::Run rejects missing, unexpected, or mismatched tensors on both the input and the output side before and after the backend call; a negative spec dimension accepts any concrete extent; NormalizeExecutionProviderName strips non-alphanumeric characters and the ExecutionProvider suffix, then folds the directml, trtrtx, nvtensorrtx, and tensortrt aliases; a null backend throws ErrorCode::invalid_argument.
+ * @agent-side-effects: Model::Load and AvailableExecutionProviders load the ONNX Runtime shared library and read model files from disk.
+ */
+
 #include "onnx_world_model/model.hpp"
 
 #include <algorithm>

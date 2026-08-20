@@ -1,5 +1,13 @@
 #pragma once
 
+/**
+ * @agent-file
+ * @agent-purpose: Declares tensor signature metadata (TensorSpec, ModelMetadata), its validation helper, and the fixed latent-dynamics Backend contract with its step input and output structs.
+ * @agent-public-api: TensorSpec, ModelMetadata, ValidateTensor, StepInput, StepOutput, Backend, BackendPtr
+ * @agent-invariants: A negative TensorSpec shape entry marks a dynamic dimension that ValidateTensor accepts for any concrete extent; ModelMetadata::Input and Output throw ErrorCode::model_contract for unknown names.
+ * @agent-side-effects: none
+ */
+
 #include <memory>
 #include <string>
 #include <vector>

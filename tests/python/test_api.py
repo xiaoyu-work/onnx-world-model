@@ -1,3 +1,9 @@
+# @agent-file
+# @agent-purpose: Tests the Python wrapper API in `_api.py`: model loading, metadata, execution-provider selection and rejection, named-tensor validation, and latent-dynamics stepping and rollout state.
+# @agent-public-api: none
+# @agent-invariants: Every test needs the `world_model_path` fixture, so the whole module skips unless the `mobius` exporter is installed. Provider tests assert that an unavailable execution provider raises instead of silently falling back to CPU.
+# @agent-side-effects: Loads exported ONNX models from pytest temporary directories and runs ONNX Runtime inference.
+
 from __future__ import annotations
 
 from pathlib import Path

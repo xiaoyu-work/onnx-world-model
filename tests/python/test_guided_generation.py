@@ -6,6 +6,12 @@ unconditional generator passes, the guided combination, and the indexed
 scheduler update — runs through the actual runtime instead of a stub.
 """
 
+# @agent-file
+# @agent-purpose: Tests classifier-free guidance end to end by building small ONNX graphs with onnx_ir, assembling a guided package, and running the conditioned stage on ONNX Runtime.
+# @agent-public-api: none
+# @agent-invariants: Graphs are synthesized in-process with onnx_ir rather than exported by Mobius, so these tests run without the exporter but require the optional `onnx_ir` dependency. The tests assert that a stage without a guidance scale runs exactly one pass and that guided passes restore the conditional batch layout.
+# @agent-side-effects: Writes ONNX models and package files into pytest temporary directories and runs ONNX Runtime inference.
+
 from __future__ import annotations
 
 import json

@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Implements the fixed latent-dynamics API: WorldModel enforces the three-input/four-output graph contract per step, and Rollout carries recurrent state across steps.
+ * @agent-public-api: WorldModel::WorldModel, WorldModel::Load, WorldModel::metadata, WorldModel::Step, Rollout::Rollout, Rollout::Reset, Rollout::ResetZeros, Rollout::has_state, Rollout::state, Rollout::Step
+ * @agent-invariants: Construction rejects any graph whose signature is not exactly observation, action, state to next_state, observation_prediction, reward, continuation, where next_state matches state, observation_prediction matches observation, and reward and continuation are [batch, 1]. Every step revalidates the returned shapes. Rollout guards all state under its mutex, lazily zero-initializes state from the observation batch, and adopts next_state only after a successful step; zero state requires all non-batch dimensions to be static.
+ * @agent-side-effects: WorldModel::Load reads a model file and loads the ONNX Runtime shared library; Rollout mutates its own recurrent state.
+ */
+
 #include "onnx_world_model/world_model.hpp"
 
 #include <algorithm>

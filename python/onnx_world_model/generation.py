@@ -1,3 +1,9 @@
+# @agent-file
+# @agent-purpose: Implements the modality-oriented `WorldModel` generation API by mapping text, image, video, and action requests onto the manifest stages of one Mobius pipeline package.
+# @agent-public-api: WorldModel, TextGenerator, TextOutput, ImageGenerator, ImageOutput, VideoGenerator, VideoOutput, ActionGenerator, ActionOutput
+# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names.
+# @agent-side-effects: Loads a pipeline package and its ONNX components, runs ONNX Runtime inference, reads image and video files supplied by the caller, and records per-stage wall-clock timings.
+
 from __future__ import annotations
 
 import os

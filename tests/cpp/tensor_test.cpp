@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Standalone test executable for the Tensor value type: shape and byte-size arithmetic, typed construction and views, zero initialization, and copy-on-write semantics.
+ * @agent-public-api: main
+ * @agent-invariants: Registered with CTest as tensor_test; it links no test framework, counts failures through local Check and CheckThrows helpers, and returns a non-zero exit code when any check fails. It exercises only tensor.hpp and error.hpp, so it needs no ONNX Runtime library.
+ * @agent-side-effects: Writes failure descriptions to stderr and returns a process exit code.
+ */
+
 #include <array>
 #include <cstddef>
 #include <cstdint>

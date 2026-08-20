@@ -6,6 +6,12 @@ The full run needs a complete exported package, so it is opt-in through
 ``ONNX_WORLD_MODEL_EDGE_IMAGE``) and is skipped otherwise.
 """
 
+# @agent-file
+# @agent-purpose: Smoke-tests image-to-video generation through the `tools/image_to_video_smoke.py` entry point, covering the dry-run plan and, when a package is available, real video generation.
+# @agent-public-api: none
+# @agent-invariants: The dry-run test must not load a package, so it stays fast and dependency free; the generation test is guarded by a skipif so the suite passes without an exported image-to-video package.
+# @agent-side-effects: Writes a conditioning image into a pytest temporary directory and, when not skipped, loads a package and runs ONNX Runtime inference.
+
 from __future__ import annotations
 
 import os

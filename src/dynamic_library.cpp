@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Loads the ONNX Runtime shared library at run time and binds the OrtApi function table once per process, so the library never links against a specific ORT binary.
+ * @agent-public-api: DynamicLibrary::DynamicLibrary, DynamicLibrary::~DynamicLibrary, DynamicLibrary::Symbol, InitializeOrtApi
+ * @agent-invariants: The first successful InitializeOrtApi call fixes the ORT library for the process; a later call with a different path throws ErrorCode::runtime_load, and an identical path is a no-op. The loaded handle is intentionally leaked because Ort::InitApi retains pointers into its function table. Load and symbol failures throw ErrorCode::runtime_load.
+ * @agent-side-effects: Loads and resolves symbols from a shared library (LoadLibraryW on Windows, dlopen elsewhere); mutates process-global ORT API state under a function-local mutex.
+ */
+
 #include "dynamic_library.hpp"
 
 #include <cstring>

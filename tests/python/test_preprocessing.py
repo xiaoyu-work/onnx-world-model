@@ -1,3 +1,9 @@
+# @agent-file
+# @agent-purpose: Tests the preprocessing and media layers: chat templating, tokenization, image and video patch packing, latent-token round trips, conditioning contracts, and guidance prompt handling.
+# @agent-public-api: none
+# @agent-invariants: `_reference_packed_tokens` is an independent transcription of the runtime unpatchify layout, so it must stay a literal loop rather than reuse `pack_latent_tokens`. Tests build packages from the `preprocessing_package` and `conditioned_package` fixtures and therefore run without the Mobius exporter. Rejection tests assert that unsupported resample filters, resize strategies, and prompt fields raise instead of falling back.
+# @agent-side-effects: Writes package configuration, images, and videos into pytest temporary directories and reads them back through the preprocessing API.
+
 from __future__ import annotations
 
 import json

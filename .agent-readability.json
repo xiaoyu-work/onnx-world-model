@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "exemptions": {
+    "oversizedFiles": {
+      "src/pipeline_session.cpp": "All state and behavior belong to the single PipelineSession::Impl class, whose ~60 members are defined inline and share the session's tensor caches, scheduler histories, and cursors. Splitting it would require publishing Impl in an internal header and redistributing interlocking members across translation units, which is a mechanical split with no natural, testable responsibility boundary. Independent concerns were already factored out of the pipeline layer into src/pipeline_manifest_common.cpp and src/pipeline_manifest_validation.cpp."
+    }
+  }
+}

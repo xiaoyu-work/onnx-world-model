@@ -12,6 +12,12 @@ python tools/image_to_video_smoke.py output/cosmos3-edge frame.png --dry-run
 ```
 """
 
+# @agent-file
+# @agent-purpose: Command-line smoke check for image-to-video generation that reports the prepared conditioning plan in dry-run mode or runs the full generation path against an exported package.
+# @agent-public-api: dry_run, full_run, main
+# @agent-invariants: `dry_run` imports `WorldModelPreprocessor` lazily and prepares host tensors only, so it never creates an ONNX session and stays usable with an incomplete package; `full_run` needs every component on disk. `tests/python/test_image_to_video_smoke.py` asserts the dry-run report shape, so its keys are part of the contract.
+# @agent-side-effects: Reads a package directory and a conditioning image from disk, prints a JSON report to stdout, and in `full_run` loads ONNX components and runs ONNX Runtime inference.
+
 from __future__ import annotations
 
 import argparse

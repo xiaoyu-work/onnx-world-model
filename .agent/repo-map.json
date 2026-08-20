@@ -1,0 +1,523 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-20T01:32:22.027Z",
+  "generatedBy": "check-agent-readability@1.1.0",
+  "sourceFingerprint": "767aa7ffdc3fb0e04bc2f8bdc4a53237efab4249896e0a9ca9e7dc83860c82f5",
+  "modules": [
+    {
+      "path": "include/onnx_world_model",
+      "purpose": "Declares the installed public C++20 API of the `onnx_world_model` library: the tensor value type, the error taxonomy, model and pipeline session contracts, and the fixed latent-dynamics compatibility types.",
+      "guide": "include/onnx_world_model/MODULE.md"
+    },
+    {
+      "path": "python/onnx_world_model",
+      "purpose": "Implements the installed Python package: it wraps the compiled `_native` extension in typed classes and adds the preprocessing and generation layers that turn prompts, images, and videos into the tensors a Mobius package expects.",
+      "guide": "python/onnx_world_model/MODULE.md"
+    },
+    {
+      "path": "src",
+      "purpose": "Implements the `onnx_world_model` C++ library declared in `include/onnx_world_model`: ONNX Runtime loading and session management, tensor marshalling, Mobius pipeline manifest parsing and validation, staged pipeline execution, and the fixed latent-dynamics compatibility layer.",
+      "guide": "src/MODULE.md"
+    },
+    {
+      "path": "tests/cpp",
+      "purpose": "Holds the C++ test executables that verify the library through its public headers, using in-process stub backends so the default run needs no ONNX Runtime library and no real ONNX model.",
+      "guide": "tests/cpp/MODULE.md"
+    },
+    {
+      "path": "tests/python",
+      "purpose": "Holds the pytest suite that exercises the installed `onnx_world_model` Python package, including the compiled `_native` extension, through its public API.",
+      "guide": "tests/python/MODULE.md"
+    }
+  ],
+  "files": [
+    {
+      "path": "bindings/python_module.cpp",
+      "kind": "source",
+      "purpose": "Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.",
+      "publicSymbols": [
+        "_native module",
+        "WorldModelError",
+        "available_execution_providers",
+        "supported_pipeline_capabilities",
+        "Model",
+        "WorldModel",
+        "Pipeline",
+        "PipelineSession",
+        "Rollout"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/backend.hpp",
+      "kind": "source",
+      "purpose": "Declares tensor signature metadata (TensorSpec, ModelMetadata), its validation helper, and the fixed latent-dynamics Backend contract with its step input and output structs.",
+      "publicSymbols": [
+        "TensorSpec",
+        "ModelMetadata",
+        "ValidateTensor",
+        "StepInput",
+        "StepOutput",
+        "Backend",
+        "BackendPtr"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/error.hpp",
+      "kind": "source",
+      "purpose": "Declares the library-wide error taxonomy: the ErrorCode category enum and the Error exception every public entry point throws on failure.",
+      "publicSymbols": [
+        "ErrorCode",
+        "Error"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/model.hpp",
+      "kind": "source",
+      "purpose": "Declares runtime session configuration (RuntimeOptions, provider naming helpers) and Model, the generic named-tensor ONNX graph session used by every higher-level API.",
+      "publicSymbols": [
+        "GraphOptimizationLevel",
+        "RuntimeOptions",
+        "NormalizeExecutionProviderName",
+        "AvailableExecutionProviders",
+        "NamedTensors",
+        "ModelBackend",
+        "ModelBackendPtr",
+        "Model"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/onnx_world_model.hpp",
+      "kind": "source",
+      "purpose": "Umbrella convenience header that includes every public onnx_world_model header so a consumer needs a single include.",
+      "publicSymbols": []
+    },
+    {
+      "path": "include/onnx_world_model/pipeline.hpp",
+      "kind": "source",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, and the per-trajectory PipelineSession.",
+      "publicSymbols": [
+        "Endpoint",
+        "PipelineComponent",
+        "PipelineConnection",
+        "PipelineInputKind",
+        "PipelineInput",
+        "PipelineOutput",
+        "PipelineStage",
+        "PipelineState",
+        "PipelineAsset",
+        "PipelineManifest",
+        "PipelinePackage",
+        "PipelineRunOptions",
+        "Pipeline",
+        "PipelineSession"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/tensor.hpp",
+      "kind": "source",
+      "purpose": "Declares the DataType enumeration and the Tensor value type that carries dense typed tensor data across the whole runtime.",
+      "publicSymbols": [
+        "DataType",
+        "ToString",
+        "DataTypeSize",
+        "DataTypeOf",
+        "Tensor"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/world_model.hpp",
+      "kind": "source",
+      "purpose": "Declares the fixed latent-dynamics compatibility API: WorldModel, which validates the three-input/four-output contract, and Rollout, which carries recurrent state between steps.",
+      "publicSymbols": [
+        "WorldModel",
+        "Rollout"
+      ]
+    },
+    {
+      "path": "python/onnx_world_model/__init__.py",
+      "kind": "source",
+      "purpose": "Declares the public `onnx_world_model` package surface by re-exporting the generation, pipeline, and preprocessing symbols that users are expected to import.",
+      "publicSymbols": [
+        "ActionGenerator",
+        "ActionOutput",
+        "ConditioningFramePreprocessor",
+        "GeneratorPromptPacker",
+        "ImageGenerator",
+        "ImageOutput",
+        "ImagePreprocessor",
+        "LatentDynamicsModel",
+        "LegacyWorldModel",
+        "ModelMetadata",
+        "OnnxModel",
+        "PackedImage",
+        "PackedImagePreprocessor",
+        "PackedVideoPreprocessor",
+        "Pipeline",
+        "PipelineInputSpec",
+        "PipelineOutputSpec",
+        "PipelineSession",
+        "PipelineStageSpec",
+        "PreparedConditioning",
+        "PreparedReasonerInputs",
+        "PreparedVideo",
+        "PreparedWorldInputs",
+        "RawImage",
+        "RawVideo",
+        "Rollout",
+        "StepResult",
+        "TensorSpec",
+        "TextGenerator",
+        "TextOutput",
+        "TextPreprocessor",
+        "VideoGenerator",
+        "VideoOutput",
+        "WorldModel",
+        "WorldModelError",
+        "WorldModelPipeline",
+        "WorldModelPreprocessor",
+        "available_execution_providers",
+        "pack_latent_tokens",
+        "supported_pipeline_capabilities",
+        "unpack_latent_tokens"
+      ]
+    },
+    {
+      "path": "python/onnx_world_model/_api.py",
+      "kind": "source",
+      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, and latent-dynamics APIs.",
+      "publicSymbols": [
+        "TensorSpec",
+        "ModelMetadata",
+        "PipelineInputSpec",
+        "PipelineOutputSpec",
+        "PipelineStageSpec",
+        "StepResult",
+        "ProviderOptionValue",
+        "ProviderOptions",
+        "available_execution_providers",
+        "supported_pipeline_capabilities",
+        "OnnxModel",
+        "Pipeline",
+        "WorldModelPipeline",
+        "PipelineSession",
+        "LatentDynamicsModel",
+        "LegacyWorldModel",
+        "Rollout"
+      ]
+    },
+    {
+      "path": "python/onnx_world_model/generation.py",
+      "kind": "source",
+      "purpose": "Implements the modality-oriented `WorldModel` generation API by mapping text, image, video, and action requests onto the manifest stages of one Mobius pipeline package.",
+      "publicSymbols": [
+        "WorldModel",
+        "TextGenerator",
+        "TextOutput",
+        "ImageGenerator",
+        "ImageOutput",
+        "VideoGenerator",
+        "VideoOutput",
+        "ActionGenerator",
+        "ActionOutput"
+      ]
+    },
+    {
+      "path": "python/onnx_world_model/media.py",
+      "kind": "source",
+      "purpose": "Decodes and normalizes visual inputs: it loads images and videos, resizes them onto the model grid, and packs frames into the patch-token layout the vision encoder expects.",
+      "publicSymbols": [
+        "RawImage",
+        "RawVideo",
+        "conditioning_resample",
+        "ConditioningFramePreprocessor",
+        "ImagePreprocessor",
+        "PackedImage",
+        "PackedImagePreprocessor",
+        "PreparedVideo",
+        "PackedVideoPreprocessor"
+      ]
+    },
+    {
+      "path": "python/onnx_world_model/preprocessing.py",
+      "kind": "source",
+      "purpose": "Turns user prompts and media into the exact tensors a Mobius package expects: it renders chat templates, tokenizes text, packs latent tokens, and assembles reasoner and world-model inputs from the package manifest.",
+      "publicSymbols": [
+        "PreparedReasonerInputs",
+        "PreparedConditioning",
+        "PreparedWorldInputs",
+        "TextPreprocessor",
+        "GeneratorPromptPacker",
+        "WorldModelPreprocessor",
+        "pack_latent_tokens",
+        "unpack_latent_tokens",
+        "and the media re-exports RawImage",
+        "RawVideo",
+        "conditioning_resample",
+        "ConditioningFramePreprocessor",
+        "ImagePreprocessor",
+        "PackedImage",
+        "PackedImagePreprocessor",
+        "PreparedVideo",
+        "PackedVideoPreprocessor"
+      ]
+    },
+    {
+      "path": "src/dynamic_library.cpp",
+      "kind": "source",
+      "purpose": "Loads the ONNX Runtime shared library at run time and binds the OrtApi function table once per process, so the library never links against a specific ORT binary.",
+      "publicSymbols": [
+        "DynamicLibrary::DynamicLibrary",
+        "DynamicLibrary::~DynamicLibrary",
+        "DynamicLibrary::Symbol",
+        "InitializeOrtApi"
+      ]
+    },
+    {
+      "path": "src/dynamic_library.hpp",
+      "kind": "source",
+      "purpose": "Declares the RAII dynamic-library handle and the process-wide ONNX Runtime C API initializer used to load ORT without link-time coupling.",
+      "publicSymbols": [
+        "onnx_world_model::detail::DynamicLibrary",
+        "onnx_world_model::detail::InitializeOrtApi"
+      ]
+    },
+    {
+      "path": "src/model.cpp",
+      "kind": "source",
+      "purpose": "Implements execution-provider name normalization, tensor-versus-signature validation, ModelMetadata lookups, and the Model facade that validates every named tensor around a backend run.",
+      "publicSymbols": [
+        "NormalizeExecutionProviderName",
+        "AvailableExecutionProviders",
+        "ValidateTensor",
+        "ModelMetadata::Input",
+        "ModelMetadata::Output",
+        "Model::Model",
+        "Model::Load",
+        "Model::metadata",
+        "Model::Run"
+      ]
+    },
+    {
+      "path": "src/ort_backend.cpp",
+      "kind": "source",
+      "purpose": "Implements the ONNX Runtime ModelBackend: it creates sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.",
+      "publicSymbols": [
+        "CreateOrtBackend",
+        "GetAvailableOrtProviders"
+      ]
+    },
+    {
+      "path": "src/ort_backend.hpp",
+      "kind": "source",
+      "purpose": "Declares the factory that builds an ONNX Runtime backed ModelBackend and the query for execution providers a given ORT library offers.",
+      "publicSymbols": [
+        "onnx_world_model::detail::CreateOrtBackend",
+        "onnx_world_model::detail::GetAvailableOrtProviders"
+      ]
+    },
+    {
+      "path": "src/pipeline.cpp",
+      "kind": "source",
+      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, opens their ONNX sessions, and builds the shareable Pipeline.",
+      "publicSymbols": [
+        "Endpoint::Parse",
+        "Endpoint::qualified",
+        "PipelineManifest::Parse",
+        "PipelineManifest::Load",
+        "PipelineManifest::SupportedCapabilities",
+        "PipelineManifest accessors",
+        "PipelineManifest::Component",
+        "PipelineManifest::Input",
+        "PipelineManifest::Output",
+        "PipelinePackage::PipelinePackage",
+        "PipelinePackage::Load",
+        "PipelinePackage accessors",
+        "Pipeline::Pipeline",
+        "Pipeline::Load"
+      ]
+    },
+    {
+      "path": "src/pipeline_manifest_common.cpp",
+      "kind": "source",
+      "purpose": "Implements the JSON field, token, and portable-name checks shared by pipeline manifest parsing and manifest semantic validation.",
+      "publicSymbols": [
+        "Fail",
+        "RequireObject",
+        "ValidateToken",
+        "ValidateComponentName",
+        "Lower",
+        "CheckUnique",
+        "ParseStringArray"
+      ]
+    },
+    {
+      "path": "src/pipeline_manifest_common.hpp",
+      "kind": "source",
+      "purpose": "Declares the JSON field, token, and portable-name checks shared by pipeline manifest parsing and manifest semantic validation.",
+      "publicSymbols": [
+        "onnx_world_model::detail::Json",
+        "Fail",
+        "RequireObject",
+        "ValidateToken",
+        "ValidateComponentName",
+        "Lower",
+        "CheckUnique",
+        "ParseStringArray"
+      ]
+    },
+    {
+      "path": "src/pipeline_manifest_validation.cpp",
+      "kind": "source",
+      "purpose": "Validates the semantics of a parsed Mobius PipelineManifest: dataflow acyclicity, endpoint and dtype agreement, transform and generator programs, stage options, capabilities, and recurrent state lifecycles.",
+      "publicSymbols": [
+        "FindComponent",
+        "RequireEndpoint",
+        "SupportedCapabilityNames",
+        "ValidateManifest"
+      ]
+    },
+    {
+      "path": "src/pipeline_manifest_validation.hpp",
+      "kind": "source",
+      "purpose": "Declares the semantic validation pass that checks an already-parsed PipelineManifest, plus the component and endpoint lookups its callers reuse.",
+      "publicSymbols": [
+        "onnx_world_model::detail::FindComponent",
+        "RequireEndpoint",
+        "SupportedCapabilityNames",
+        "ValidateManifest"
+      ]
+    },
+    {
+      "path": "src/pipeline_session.cpp",
+      "kind": "source",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling.",
+      "publicSymbols": [
+        "Pipeline::manifest",
+        "Pipeline::execution_providers",
+        "Pipeline::CreateSession",
+        "PipelineSession move operations and destructor",
+        "PipelineSession::RunStage",
+        "PipelineSession::StepStage",
+        "PipelineSession::outputs",
+        "PipelineSession::state",
+        "PipelineSession::ReleaseStage",
+        "PipelineSession::Reset"
+      ]
+    },
+    {
+      "path": "src/tensor.cpp",
+      "kind": "source",
+      "purpose": "Implements the Tensor value type: checked shape and byte-size arithmetic, zero and byte construction, DataType naming and sizing, and copy-on-write mutable access.",
+      "publicSymbols": [
+        "ToString",
+        "DataTypeSize",
+        "Tensor::Tensor",
+        "Tensor::FromBytes",
+        "Tensor::Zeros",
+        "Tensor::mutable_bytes"
+      ]
+    },
+    {
+      "path": "src/world_model.cpp",
+      "kind": "source",
+      "purpose": "Implements the fixed latent-dynamics API: WorldModel enforces the three-input/four-output graph contract per step, and Rollout carries recurrent state across steps.",
+      "publicSymbols": [
+        "WorldModel::WorldModel",
+        "WorldModel::Load",
+        "WorldModel::metadata",
+        "WorldModel::Step",
+        "Rollout::Rollout",
+        "Rollout::Reset",
+        "Rollout::ResetZeros",
+        "Rollout::has_state",
+        "Rollout::state",
+        "Rollout::Step"
+      ]
+    },
+    {
+      "path": "tests/cpp/model_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for Model and its metadata contract, using an in-process AddOneBackend stub instead of a real ONNX Runtime session.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
+      "path": "tests/cpp/pipeline_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for the pipeline layer: manifest parsing and rejection cases, stage execution, guidance, schedulers, and recurrent state, driven by in-process stub backends.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
+      "path": "tests/cpp/tensor_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for the Tensor value type: shape and byte-size arithmetic, typed construction and views, zero initialization, and copy-on-write semantics.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
+      "path": "tests/python/conftest.py",
+      "kind": "test",
+      "purpose": "Provides the shared pytest fixtures that build throwaway Mobius packages, tokenizers, chat templates, and conditioning configuration for the Python test suite.",
+      "publicSymbols": [
+        "world_model_path",
+        "pipeline_path",
+        "preprocessing_package",
+        "conditioned_package"
+      ]
+    },
+    {
+      "path": "tests/python/test_api.py",
+      "kind": "test",
+      "purpose": "Tests the Python wrapper API in `_api.py`: model loading, metadata, execution-provider selection and rejection, named-tensor validation, and latent-dynamics stepping and rollout state.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_guided_generation.py",
+      "kind": "test",
+      "purpose": "Tests classifier-free guidance end to end by building small ONNX graphs with onnx_ir, assembling a guided package, and running the conditioned stage on ONNX Runtime.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_image_to_video_smoke.py",
+      "kind": "test",
+      "purpose": "Smoke-tests image-to-video generation through the `tools/image_to_video_smoke.py` entry point, covering the dry-run plan and, when a package is available, real video generation.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_pipeline.py",
+      "kind": "test",
+      "purpose": "Tests the Pipeline and PipelineSession wrappers: manifest contract exposure, provider selection, graph-optimization levels, single-stage runs, stage subsets, and unknown-input rejection.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_preprocessing.py",
+      "kind": "test",
+      "purpose": "Tests the preprocessing and media layers: chat templating, tokenization, image and video patch packing, latent-token round trips, conditioning contracts, and guidance prompt handling.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tools/export_mobius_test_model.py",
+      "kind": "source",
+      "purpose": "Exports the small deterministic Mobius world-model and pipeline packages that the Python test fixtures load, with fixed head biases so predictions are reproducible.",
+      "publicSymbols": [
+        "export_test_model",
+        "export_test_pipeline",
+        "main"
+      ]
+    },
+    {
+      "path": "tools/image_to_video_smoke.py",
+      "kind": "source",
+      "purpose": "Command-line smoke check for image-to-video generation that reports the prepared conditioning plan in dry-run mode or runs the full generation path against an exported package.",
+      "publicSymbols": [
+        "dry_run",
+        "full_run",
+        "main"
+      ]
+    }
+  ]
+}

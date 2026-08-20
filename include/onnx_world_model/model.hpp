@@ -1,5 +1,13 @@
 #pragma once
 
+/**
+ * @agent-file
+ * @agent-purpose: Declares runtime session configuration (RuntimeOptions, provider naming helpers) and Model, the generic named-tensor ONNX graph session used by every higher-level API.
+ * @agent-public-api: GraphOptimizationLevel, RuntimeOptions, NormalizeExecutionProviderName, AvailableExecutionProviders, NamedTensors, ModelBackend, ModelBackendPtr, Model
+ * @agent-invariants: Model rejects a null backend; Model::Run validates every input and output tensor against metadata, so unknown or missing names throw instead of reaching ONNX Runtime; provider names are compared only after NormalizeExecutionProviderName folds case, separators, and the ExecutionProvider suffix.
+ * @agent-side-effects: none in this header; the declared Model::Load and AvailableExecutionProviders load the ONNX Runtime shared library and read model files.
+ */
+
 #include <filesystem>
 #include <memory>
 #include <string>

@@ -1,3 +1,9 @@
+# @agent-file
+# @agent-purpose: Tests the Pipeline and PipelineSession wrappers: manifest contract exposure, provider selection, graph-optimization levels, single-stage runs, stage subsets, and unknown-input rejection.
+# @agent-public-api: none
+# @agent-invariants: Every test needs the `pipeline_path` fixture, so the whole module skips unless the `mobius` exporter is installed. It asserts that an incompatible provider raises while a requested CPU fallback is preserved.
+# @agent-side-effects: Loads an exported pipeline package from a pytest temporary directory and runs ONNX Runtime inference.
+
 from __future__ import annotations
 
 import json

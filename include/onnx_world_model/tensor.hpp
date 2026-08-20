@@ -1,5 +1,13 @@
 #pragma once
 
+/**
+ * @agent-file
+ * @agent-purpose: Declares the DataType enumeration and the Tensor value type that carries dense typed tensor data across the whole runtime.
+ * @agent-public-api: DataType, ToString, DataTypeSize, DataTypeOf, Tensor
+ * @agent-invariants: Tensor has value semantics with copy-on-write storage, so mutable_bytes() clones a buffer that is shared; shape entries must be non-negative and size_bytes() always equals element_count() * DataTypeSize(data_type()); values<T>() throws unless T matches data_type().
+ * @agent-side-effects: none
+ */
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>

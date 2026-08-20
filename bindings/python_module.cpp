@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
+ * @agent-public-api: _native module, WorldModelError, available_execution_providers, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, Rollout
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views; the GIL is released around every blocking ONNX Runtime call; C++ Error is translated into the Python WorldModelError.
+ * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files from disk.
+ */
+
 #include <cstddef>
 #include <cstring>
 #include <memory>

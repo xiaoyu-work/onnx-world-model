@@ -1,3 +1,11 @@
+/**
+ * @agent-file
+ * @agent-purpose: Standalone test executable for the pipeline layer: manifest parsing and rejection cases, stage execution, guidance, schedulers, and recurrent state, driven by in-process stub backends.
+ * @agent-public-api: main
+ * @agent-invariants: Registered with CTest as pipeline_test; it counts failures through local Check, CheckThrows, and CheckThrowsMessage helpers and returns a non-zero exit code when any check fails. Every component is a stub ModelBackend such as IdentityBackend, VelocityBackend, AutoregressiveBackend, or GuidedVelocityBackend, so the default CTest run needs no ONNX Runtime library; optional argv entries name a real package directory and ORT library for an extra load check. This is the primary coverage for src/pipeline.cpp and src/pipeline_manifest_validation.cpp, so a new manifest rule belongs here.
+ * @agent-side-effects: Writes temporary pipeline package directories and manifest files under the filesystem temporary directory, and writes failure descriptions to stderr.
+ */
+
 #include <algorithm>
 #include <array>
 #include <cmath>
