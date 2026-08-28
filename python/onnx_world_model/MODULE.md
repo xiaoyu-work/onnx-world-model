@@ -11,6 +11,8 @@ expects.
 
 - Locate and load the ONNX Runtime shared library before the extension is used,
   including the CUDA libraries an `onnxruntime-gpu` wheel resolves by soname.
+- Register explicit execution-provider libraries and forward the opt-in
+  device-output policy through every model and pipeline wrapper.
 - Present the manifest as typed `PipelineInputSpec`, `PipelineOutputSpec`, and
   `PipelineStageSpec` values.
 - Prepare model inputs from package configuration: chat templates, tokenizers,
@@ -25,7 +27,7 @@ expects.
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT library discovery, `_native` wrappers, manifest spec dataclasses, `Pipeline` and `PipelineSession`, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline` and `PipelineSession`, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
 | `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |

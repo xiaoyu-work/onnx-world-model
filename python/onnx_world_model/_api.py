@@ -1,8 +1,8 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, and latent-dynamics APIs.
-# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, ProviderOptionValue, ProviderOptions, available_execution_providers, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it.
-# @agent-side-effects: Reads `pipeline.json` from the package directory, loads the ONNX Runtime shared library, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
+# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it.
+# @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
 
@@ -199,6 +199,23 @@ def available_execution_providers(
     return tuple(_native.available_execution_providers(os.fspath(library_path)))
 
 
+def register_execution_provider_library(
+    registration_name: str,
+    provider_library_path: str | os.PathLike[str],
+    *,
+    ort_library_path: str | os.PathLike[str] | None = None,
+) -> None:
+    """Register an EP library for device allocation and tensor transfers."""
+    library_path = (
+        Path(ort_library_path) if ort_library_path is not None else _find_ort_library()
+    )
+    _native.register_execution_provider_library(
+        registration_name,
+        os.fspath(provider_library_path),
+        os.fspath(library_path),
+    )
+
+
 def supported_pipeline_capabilities() -> tuple[str, ...]:
     """Pipeline capability names this runtime implements.
 
@@ -221,6 +238,7 @@ class OnnxModel:
         inter_op_threads: int = 0,
         log_severity: int = 3,
         graph_optimization: str = "all",
+        device_outputs: bool = False,
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
     ) -> None:
@@ -235,6 +253,7 @@ class OnnxModel:
             inter_op_threads,
             log_severity,
             graph_optimization,
+            device_outputs,
             provider_names,
             options,
         )
@@ -263,6 +282,7 @@ class Pipeline:
         inter_op_threads: int = 0,
         log_severity: int = 3,
         graph_optimization: str = "all",
+        device_outputs: bool = False,
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
     ) -> None:
@@ -280,6 +300,7 @@ class Pipeline:
             inter_op_threads,
             log_severity,
             graph_optimization,
+            device_outputs,
             provider_names,
             options,
         )
@@ -494,6 +515,7 @@ class LatentDynamicsModel:
         inter_op_threads: int = 0,
         log_severity: int = 3,
         graph_optimization: str = "all",
+        device_outputs: bool = False,
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
     ) -> None:
@@ -508,6 +530,7 @@ class LatentDynamicsModel:
             inter_op_threads,
             log_severity,
             graph_optimization,
+            device_outputs,
             provider_names,
             options,
         )

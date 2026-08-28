@@ -8,7 +8,8 @@ package, including the compiled `_native` extension, through its public API.
 ## Responsibilities
 
 - Verify the typed wrappers in `_api.py`: metadata, provider selection and
-  rejection, named-tensor validation, and latent-dynamics stepping.
+  registration rejection, device-output forwarding, named-tensor validation,
+  and latent-dynamics stepping.
 - Verify pipeline loading and staged execution through `Pipeline` and
   `PipelineSession`.
 - Verify the preprocessing and media layers against explicit reference

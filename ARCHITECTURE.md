@@ -153,6 +153,9 @@ Python:
   latent-dynamics API.
 - `onnx_world_model.available_execution_providers` and
   `supported_pipeline_capabilities` — capability queries.
+- `onnx_world_model.register_execution_provider_library` — process-wide EP
+  registration required before opting into device-resident outputs for that
+  provider.
 
 C++:
 

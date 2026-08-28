@@ -38,7 +38,9 @@ buffers stage through CPU. EP registration is required because device-to-CPU
 materialization uses the process-wide ORT data-transfer registry.
 
 Python `OnnxModel.run()` always returns independent NumPy arrays and therefore
-materializes device outputs.
+materializes device outputs. Python callers configure the same behavior with
+`register_execution_provider_library(...)` and `device_outputs=True` on
+`OnnxModel`, `Pipeline`, `LatentDynamicsModel`, or `WorldModel`.
 
 `PipelineSession::RunStage` and `StepStage` preserve device storage. Caller
 inputs, overrides, component outputs, recurrent state, and public outputs keep

@@ -1,9 +1,9 @@
 /**
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
- * @agent-public-api: _native module, WorldModelError, available_execution_providers, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime call, and C++ Error is translated into the Python WorldModelError.
- * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files from disk, and output conversion may transfer tensors to CPU.
+ * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, Rollout
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime or provider-library call, and C++ Error is translated into the Python WorldModelError.
+ * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
 #include <cstddef>
@@ -31,6 +31,7 @@ using onnx_world_model::NamedTensors;
 using onnx_world_model::Pipeline;
 using onnx_world_model::PipelineRunOptions;
 using onnx_world_model::PipelineSession;
+using onnx_world_model::RegisterExecutionProviderLibrary;
 using onnx_world_model::Rollout;
 using onnx_world_model::RuntimeOptions;
 using onnx_world_model::StepOutput;
@@ -260,6 +261,7 @@ using onnx_world_model::WorldModel;
     int inter_op_threads,
     int log_severity,
     const std::string& graph_optimization,
+    bool device_outputs,
     const std::vector<std::string>& providers,
     const py::dict& provider_options) {
   RuntimeOptions result{
@@ -268,6 +270,7 @@ using onnx_world_model::WorldModel;
       .inter_op_threads = inter_op_threads,
       .log_severity = log_severity,
       .graph_optimization = ParseGraphOptimization(graph_optimization),
+      .device_outputs = device_outputs,
       .providers = providers,
   };
   for (const auto& provider : provider_options) {
@@ -329,6 +332,20 @@ PYBIND11_MODULE(_native, module) {
       },
       py::arg("ort_library_path"));
   module.def(
+      "register_execution_provider_library",
+      [](const std::string& registration_name,
+         const std::string& provider_library_path,
+         const std::string& ort_library_path) {
+        py::gil_scoped_release release;
+        RegisterExecutionProviderLibrary(
+            registration_name,
+            provider_library_path,
+            ort_library_path);
+      },
+      py::arg("registration_name"),
+      py::arg("provider_library_path"),
+      py::arg("ort_library_path"));
+  module.def(
       "supported_pipeline_capabilities",
       [] { return onnx_world_model::PipelineManifest::SupportedCapabilities(); });
 
@@ -341,6 +358,7 @@ PYBIND11_MODULE(_native, module) {
                        int inter_op_threads,
                        int log_severity,
                        const std::string& graph_optimization,
+                       bool device_outputs,
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options) {
             RuntimeOptions options = RuntimeOptionsFromPython(
@@ -349,6 +367,7 @@ PYBIND11_MODULE(_native, module) {
                 inter_op_threads,
                 log_severity,
                 graph_optimization,
+                device_outputs,
                 providers,
                 provider_options);
             py::gil_scoped_release release;
@@ -360,6 +379,7 @@ PYBIND11_MODULE(_native, module) {
           py::arg("inter_op_threads") = 0,
           py::arg("log_severity") = 3,
           py::arg("graph_optimization") = "all",
+          py::arg("device_outputs") = false,
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict())
       .def_property_readonly(
@@ -389,6 +409,7 @@ PYBIND11_MODULE(_native, module) {
                        int inter_op_threads,
                        int log_severity,
                        const std::string& graph_optimization,
+                       bool device_outputs,
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options) {
             RuntimeOptions options = RuntimeOptionsFromPython(
@@ -397,6 +418,7 @@ PYBIND11_MODULE(_native, module) {
                 inter_op_threads,
                 log_severity,
                 graph_optimization,
+                device_outputs,
                 providers,
                 provider_options);
             py::gil_scoped_release release;
@@ -408,6 +430,7 @@ PYBIND11_MODULE(_native, module) {
           py::arg("inter_op_threads") = 0,
           py::arg("log_severity") = 3,
           py::arg("graph_optimization") = "all",
+          py::arg("device_outputs") = false,
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict())
       .def_property_readonly(
@@ -452,6 +475,7 @@ PYBIND11_MODULE(_native, module) {
                        int inter_op_threads,
                        int log_severity,
                        const std::string& graph_optimization,
+                       bool device_outputs,
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options) {
             RuntimeOptions options = RuntimeOptionsFromPython(
@@ -460,6 +484,7 @@ PYBIND11_MODULE(_native, module) {
                 inter_op_threads,
                 log_severity,
                 graph_optimization,
+                device_outputs,
                 providers,
                 provider_options);
             py::gil_scoped_release release;
@@ -471,6 +496,7 @@ PYBIND11_MODULE(_native, module) {
           py::arg("inter_op_threads") = 0,
           py::arg("log_severity") = 3,
           py::arg("graph_optimization") = "all",
+          py::arg("device_outputs") = false,
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict())
       .def_property_readonly(

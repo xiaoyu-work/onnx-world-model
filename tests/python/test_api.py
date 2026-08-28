@@ -1,8 +1,8 @@
 # @agent-file
 # @agent-purpose: Tests the Python wrapper API in `_api.py`: model loading, metadata, execution-provider selection and rejection, named-tensor validation, and latent-dynamics stepping and rollout state.
 # @agent-public-api: none
-# @agent-invariants: Every test needs the `world_model_path` fixture, so the whole module skips unless the `mobius` exporter is installed. Provider tests assert that an unavailable execution provider raises instead of silently falling back to CPU.
-# @agent-side-effects: Loads exported ONNX models from pytest temporary directories and runs ONNX Runtime inference.
+# @agent-invariants: Model-execution tests use `world_model_path` and skip unless the `mobius` exporter is installed; provider discovery and registration validation run without it. Provider tests assert that an unavailable execution provider raises instead of silently falling back to CPU.
+# @agent-side-effects: Loads exported ONNX models and the ONNX Runtime library, validates provider-library paths, and runs inference.
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from onnx_world_model import (
     OnnxModel,
     WorldModelError,
     available_execution_providers,
+    register_execution_provider_library,
     supported_pipeline_capabilities,
 )
 
@@ -45,7 +46,7 @@ def test_loads_mobius_contract(world_model_path: Path):
 
 
 def test_generic_named_tensor_model(world_model_path: Path):
-    model = OnnxModel(world_model_path)
+    model = OnnxModel(world_model_path, device_outputs=True)
     observation, action, state = _inputs(batch_size=2)
 
     output = model.run(
@@ -106,6 +107,14 @@ def test_lists_available_execution_providers():
     assert "CPUExecutionProvider" in providers
 
 
+def test_rejects_missing_execution_provider_library(tmp_path: Path):
+    with pytest.raises(WorldModelError, match="does not exist"):
+        register_execution_provider_library(
+            "missing-test-provider",
+            tmp_path / "missing-provider-library",
+        )
+
+
 def test_advertises_supported_pipeline_capabilities():
     capabilities = supported_pipeline_capabilities()
 
@@ -145,7 +154,7 @@ def test_generic_model_rejects_missing_input(world_model_path: Path):
 
 
 def test_stateless_step_matches_reference(world_model_path: Path):
-    model = LatentDynamicsModel(world_model_path)
+    model = LatentDynamicsModel(world_model_path, device_outputs=True)
     observation, action, state = _inputs(batch_size=2)
 
     output = model.step(observation, action, state)

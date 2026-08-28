@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T08:12:11.994Z",
+  "generatedAt": "2026-08-28T08:29:46.720Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "3e0a1778fc2234cc895a0a09f3adb85279bfa2d6b86b6ebe1490760c7f3797e4",
+  "sourceFingerprint": "3940bf4463b542ed5505509c0ec398f836da8ced58c7c462fed8129e6388d992",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -39,6 +39,7 @@
         "_native module",
         "WorldModelError",
         "available_execution_providers",
+        "register_execution_provider_library",
         "supported_pipeline_capabilities",
         "Model",
         "WorldModel",
@@ -180,6 +181,7 @@
         "WorldModelPreprocessor",
         "available_execution_providers",
         "pack_latent_tokens",
+        "register_execution_provider_library",
         "supported_pipeline_capabilities",
         "unpack_latent_tokens"
       ]
@@ -198,6 +200,7 @@
         "ProviderOptionValue",
         "ProviderOptions",
         "available_execution_providers",
+        "register_execution_provider_library",
         "supported_pipeline_capabilities",
         "OnnxModel",
         "Pipeline",

@@ -94,7 +94,10 @@ def test_pipeline_accepts_graph_optimization_levels(pipeline_path: Path):
 
 
 def test_runs_pipeline_stage(pipeline_path: Path):
-    session = Pipeline(pipeline_path).create_session()
+    session = Pipeline(
+        pipeline_path,
+        device_outputs=True,
+    ).create_session()
 
     output = session.run_stage("step", _inputs(batch_size=2))
 

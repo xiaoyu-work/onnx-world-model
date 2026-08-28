@@ -52,6 +52,28 @@ The requested order is intersected with each component's manifest preferences.
 An unavailable provider is skipped only when a later fallback is available.
 The loaded ONNX Runtime build must contain the requested provider.
 
+Device-resident component handoff is opt-in. Register the EP's shared library
+once before constructing a pipeline, then enable `device_outputs`:
+
+```python
+from onnx_world_model import Pipeline, register_execution_provider_library
+
+register_execution_provider_library(
+    "CUDAExecutionProvider",
+    "/path/to/onnxruntime_providers_cuda.dll",
+)
+pipeline = Pipeline(
+    "output/cosmos3-edge",
+    providers=["cuda", "cpu"],
+    device_outputs=True,
+)
+```
+
+Direct connections, recurrent state, public outputs, and shape-only views
+retain their device buffers. Host-authored programs and numeric transforms
+materialize each device source once at the transform boundary. Python return
+values are always independent NumPy arrays.
+
 ## Input contract
 
 Callers provide tokenized, normalized, and packed tensors using semantic or

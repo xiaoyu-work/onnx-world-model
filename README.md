@@ -162,6 +162,27 @@ image = model.image.generate(
 print(image.images.shape)
 ```
 
+To keep compatible intermediate tensors on an accelerator, first register the
+provider library with ONNX Runtime's process-wide environment, then opt into
+device outputs:
+
+```python
+from onnx_world_model import register_execution_provider_library
+
+register_execution_provider_library(
+    "CUDAExecutionProvider",
+    "/path/to/onnxruntime_providers_cuda.dll",
+)
+model = WorldModel.from_pretrained(
+    "output/cosmos3-edge",
+    providers=["cuda", "cpu"],
+    device_outputs=True,
+)
+```
+
+Python results remain independent NumPy arrays; only compatible internal
+pipeline connections and recurrent state stay device-resident.
+
 `image=` accepts an image path, PIL image, or NumPy array. `video=` accepts a
 video path, frame sequence, or THWC/TCHW NumPy array. They are mutually
 exclusive in one text-generation request. Image-to-video requires a package
