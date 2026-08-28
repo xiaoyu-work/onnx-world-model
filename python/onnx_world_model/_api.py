@@ -1,7 +1,7 @@
 # @agent-file
-# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, and latent-dynamics APIs.
-# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, StageEventKind, StageEvent, StageRun, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected.
+# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, cancellation, and latent-dynamics APIs.
+# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import json
+import math
 import os
 import sysconfig
 from collections.abc import Iterator, Mapping, Sequence
@@ -98,6 +99,109 @@ class StageEvent:
     token_ids: NDArray[Any] | None
     outputs: dict[str, NDArray[Any]]
     finished: bool
+
+
+CancellationReasonName = Literal["none", "cancelled", "deadline_exceeded"]
+
+
+@final
+class CancellationToken:
+    """A copyable observer of one :class:`CancellationSource`.
+
+    Only :meth:`CancellationSource.token` produces one. A token cannot cancel
+    and cannot change its source's deadline; it is what a call reads at its own
+    boundaries to decide whether to stop.
+    """
+
+    def __init__(self, core: _native.CancellationToken) -> None:
+        self._core = core
+
+    @property
+    def cancellable(self) -> bool:
+        """False only for a token whose source can never cancel it."""
+        return bool(self._core.cancellable)
+
+    @property
+    def cancelled(self) -> bool:
+        """True once the source was cancelled or its deadline passed."""
+        return bool(self._core.cancelled)
+
+    @property
+    def reason(self) -> CancellationReasonName:
+        """``"none"``, ``"cancelled"``, or ``"deadline_exceeded"``."""
+        return str(self._core.reason)  # type: ignore[return-value]
+
+
+@final
+class CancellationSource:
+    """The owning half of a cancellation state.
+
+    ``timeout`` is a deadline in seconds measured from construction. A zero
+    timeout is already exceeded, which is a meaningful request rather than an
+    error; a negative, infinite, or NaN timeout is rejected.
+
+    ```python
+    source = CancellationSource()
+    run = session.begin_stage("decode", prompt, cancellation=source.token())
+    threading.Timer(5.0, source.cancel).start()
+    ```
+
+    Cancellation is cooperative and never rolls anything back: the interrupted
+    call raises :class:`CancelledError` or :class:`DeadlineExceededError` and
+    leaves everything it already applied in place.
+    """
+
+    def __init__(self, timeout: float | None = None) -> None:
+        if timeout is not None:
+            timeout = float(timeout)
+            if not math.isfinite(timeout):
+                raise ValueError("timeout must be a finite number of seconds")
+            if timeout < 0:
+                raise ValueError("timeout must not be negative")
+        self._core = _native.CancellationSource(timeout)
+
+    def token(self) -> CancellationToken:
+        """An observer of this source, safe to pass to any cancellable call."""
+        return CancellationToken(self._core.token())
+
+    def cancel(self) -> None:
+        """Request cancellation. Safe from any thread, and idempotent.
+
+        Calling this while another thread is inside ``step``, ``finish``, or
+        ``run_stage`` is the supported way to stop that call: it never takes
+        the session lock.
+        """
+        self._core.cancel()
+
+    @property
+    def cancelled(self) -> bool:
+        return bool(self._core.cancelled)
+
+    @property
+    def reason(self) -> CancellationReasonName:
+        return str(self._core.reason)  # type: ignore[return-value]
+
+
+def _cancellation_token(
+    cancellation: CancellationToken | None,
+    timeout: float | None,
+) -> tuple[_native.CancellationToken | None, CancellationSource | None]:
+    """Resolve the two mutually exclusive ways to ask a call to stop.
+
+    Returns the native token to forward and, for a ``timeout``, the source
+    that owns it so a caller can keep it alive for the whole call.
+    """
+    if cancellation is not None and timeout is not None:
+        raise ValueError(
+            "Pass either cancellation or timeout, not both: a timeout creates "
+            "its own token"
+        )
+    if timeout is not None:
+        source = CancellationSource(timeout)
+        return source._core.token(), source
+    if cancellation is not None:
+        return cancellation._core, None
+    return None, None
 
 
 def _metadata_from_native(value: dict[str, Any]) -> ModelMetadata:
@@ -294,8 +398,22 @@ class OnnxModel:
     def run(
         self,
         inputs: Mapping[str, ArrayLike],
+        *,
+        cancellation: CancellationToken | None = None,
+        timeout: float | None = None,
     ) -> dict[str, NDArray[Any]]:
-        return self._core.run({name: np.asarray(value) for name, value in inputs.items()})
+        """Run the graph, optionally under a token or a per-call timeout.
+
+        ``cancellation`` and ``timeout`` are mutually exclusive. Cancellation is
+        checked before the backend call and after the outputs are validated;
+        ONNX Runtime itself can only stop between graph nodes, so a single long
+        kernel still finishes before the call unwinds.
+        """
+        token, _source = _cancellation_token(cancellation, timeout)
+        return self._core.run(
+            {name: np.asarray(value) for name, value in inputs.items()},
+            token,
+        )
 
 
 class Pipeline:
@@ -458,8 +576,11 @@ class StageRun:
     ``finished`` is true, and :meth:`finish` returns the same outputs
     :meth:`PipelineSession.run_stage` returns for the same arguments.
 
-    Stepping is synchronous: it blocks until that step finishes, and a step
-    already in flight cannot be cancelled. A session runs one stage at a time,
+    Stepping is synchronous: it blocks until that step finishes. It can be
+    stopped cooperatively -- :meth:`request_cancellation`, or cancelling the
+    token passed to :meth:`PipelineSession.begin_stage`, makes the running
+    step raise :class:`CancelledError` at its next boundary and never rolls
+    anything back. A session runs one stage at a time,
     so while this run is unfinished the session raises
     :class:`WorldModelError` from ``begin_stage``, ``run_stage``,
     ``step_stage``, ``snapshot``, ``restore``, ``fork``, ``checkpoint``,
@@ -520,8 +641,24 @@ class StageRun:
         self._exhausted = True
         return outputs
 
+    def request_cancellation(self) -> None:
+        """Ask the work this run is doing to stop, from any thread.
+
+        Unlike :meth:`close` this never takes the session lock, so it is the
+        one method that is safe to call while another thread is inside
+        :meth:`step` or :meth:`finish`. That call then raises
+        :class:`CancelledError` at its next boundary, releases the session,
+        and keeps everything the run already applied.
+        """
+        self._core.request_cancellation()
+
     def close(self) -> None:
-        """Abandon an unfinished run and release the session. Idempotent."""
+        """Abandon an unfinished run and release the session. Idempotent.
+
+        This is the local close-and-release operation: it takes the session
+        lock, so it waits for an in-flight step rather than interrupting it.
+        Use :meth:`request_cancellation` to stop work already running.
+        """
         if self._closed:
             return
         self._closed = True
@@ -576,12 +713,23 @@ class PipelineSession:
         *,
         overrides: Mapping[str, ArrayLike] | None = None,
         options: Mapping[str, bool | int | float | str] | None = None,
+        cancellation: CancellationToken | None = None,
+        timeout: float | None = None,
     ) -> dict[str, NDArray[Any]]:
+        """Run one stage to completion, optionally under a token or timeout.
+
+        ``cancellation`` and ``timeout`` are mutually exclusive; a ``timeout``
+        creates one deadline that covers this call only. A stopped call raises
+        :class:`CancelledError` or :class:`DeadlineExceededError` and keeps
+        everything the stage already applied.
+        """
+        token, _source = _cancellation_token(cancellation, timeout)
         return self._core.run_stage(
             stage,
             _array_mapping(inputs),
             _array_mapping(overrides),
             dict(options or {}),
+            token,
         )
 
     def step_stage(
@@ -591,12 +739,16 @@ class PipelineSession:
         *,
         overrides: Mapping[str, ArrayLike] | None = None,
         options: Mapping[str, bool | int | float | str] | None = None,
+        cancellation: CancellationToken | None = None,
+        timeout: float | None = None,
     ) -> dict[str, NDArray[Any]]:
+        token, _source = _cancellation_token(cancellation, timeout)
         return self._core.step_stage(
             stage,
             _array_mapping(inputs),
             _array_mapping(overrides),
             dict(options or {}),
+            token,
         )
 
     def begin_stage(
@@ -606,13 +758,21 @@ class PipelineSession:
         *,
         overrides: Mapping[str, ArrayLike] | None = None,
         options: Mapping[str, bool | int | float | str] | None = None,
+        cancellation: CancellationToken | None = None,
+        timeout: float | None = None,
     ) -> StageRun:
         """Start an incremental execution of ``stage``.
 
         The returned :class:`StageRun` owns this session's single run slot
         until it completes or is closed, so hold it in a ``with`` block when a
         caller may stop before the run finishes.
+
+        ``cancellation`` and ``timeout`` are mutually exclusive. A ``timeout``
+        is one absolute deadline for the whole run, checked at every step
+        boundary. Whichever is supplied, the run also honors
+        :meth:`StageRun.request_cancellation`.
         """
+        token, _source = _cancellation_token(cancellation, timeout)
         return StageRun(
             self,
             self._core.begin_stage(
@@ -620,6 +780,7 @@ class PipelineSession:
                 _array_mapping(inputs),
                 _array_mapping(overrides),
                 dict(options or {}),
+                token,
             ),
         )
 
@@ -630,6 +791,8 @@ class PipelineSession:
         *,
         overrides: Mapping[str, ArrayLike] | None = None,
         options: Mapping[str, bool | int | float | str] | None = None,
+        cancellation: CancellationToken | None = None,
+        timeout: float | None = None,
     ) -> Iterator[StageEvent]:
         """Iterate the events of one incremental execution of ``stage``.
 
@@ -646,6 +809,8 @@ class PipelineSession:
             inputs,
             overrides=overrides,
             options=options,
+            cancellation=cancellation,
+            timeout=timeout,
         )
         return _drain_stage_run(run)
 
@@ -656,7 +821,20 @@ class PipelineSession:
         stages: tuple[str, ...] | list[str] | None = None,
         overrides: Mapping[str, ArrayLike] | None = None,
         options: Mapping[str, bool | int | float | str] | None = None,
+        cancellation: CancellationToken | None = None,
+        timeout: float | None = None,
     ) -> dict[str, NDArray[Any]]:
+        """Run the selected stages in declaration order, releasing each one.
+
+        ``cancellation`` and ``timeout`` are mutually exclusive. A ``timeout``
+        is one absolute deadline for the whole sequence rather than a fresh
+        budget per stage, so a slow early stage eats into what the later ones
+        have left.
+        """
+        # Resolved once, before the loop, so one absolute deadline covers the
+        # whole sequence rather than restarting at every stage.
+        _token, source = _cancellation_token(cancellation, timeout)
+        stage_token = cancellation if source is None else source.token()
         if stages is None:
             selected = tuple(stage.name for stage in self._pipeline.stages)
         else:
@@ -681,6 +859,7 @@ class PipelineSession:
                     stage_inputs,
                     overrides=overrides,
                     options=options,
+                    cancellation=stage_token,
                 )
             )
             self.release_stage(stage)

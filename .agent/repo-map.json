@@ -1,12 +1,12 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T13:10:28.016Z",
+  "generatedAt": "2026-08-28T14:46:44.055Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "6ab518496d3036520c325be7ba79619aa64cdffd52a84f77037bd059f3ec8d65",
+  "sourceFingerprint": "459ad609ab565bb1bdbe6ebe37ac518edb19189665ee2acaab880bbb31c7bbc5",
   "modules": [
     {
       "path": "include/onnx_world_model",
-      "purpose": "Declares the installed public C++20 API of the `onnx_world_model` library: the tensor value type, the error taxonomy, model and pipeline session contracts, and the fixed latent-dynamics compatibility types.",
+      "purpose": "Declares the installed public C++20 API of the `onnx_world_model` library: the tensor value type, the error taxonomy, cancellation and deadline types, model and pipeline session contracts, and the fixed latent-dynamics compatibility types.",
       "guide": "include/onnx_world_model/MODULE.md"
     },
     {
@@ -16,7 +16,7 @@
     },
     {
       "path": "src",
-      "purpose": "Implements the `onnx_world_model` C++ library declared in `include/onnx_world_model`: ONNX Runtime loading and session management, tensor marshalling, Mobius pipeline manifest parsing and validation, staged pipeline execution, and the fixed latent-dynamics compatibility layer.",
+      "purpose": "Implements the `onnx_world_model` C++ library declared in `include/onnx_world_model`: ONNX Runtime loading and session management, tensor marshalling, cooperative cancellation and deadlines, Mobius pipeline manifest parsing and validation, staged pipeline execution, and the fixed latent-dynamics compatibility layer.",
       "guide": "src/MODULE.md"
     },
     {
@@ -38,6 +38,10 @@
       "publicSymbols": [
         "_native module",
         "WorldModelError",
+        "CancelledError",
+        "DeadlineExceededError",
+        "CancellationToken",
+        "CancellationSource",
         "available_execution_providers",
         "register_execution_provider_library",
         "supported_pipeline_capabilities",
@@ -62,6 +66,16 @@
         "StepOutput",
         "Backend",
         "BackendPtr"
+      ]
+    },
+    {
+      "path": "include/onnx_world_model/cancellation.hpp",
+      "kind": "source",
+      "purpose": "Declares explicit cancellation and deadline support: the CancellationReason taxonomy, the copyable observer CancellationToken, and the move-only CancellationSource that owns the cancellable state.",
+      "publicSymbols": [
+        "CancellationReason",
+        "CancellationToken",
+        "CancellationSource"
       ]
     },
     {
@@ -150,7 +164,11 @@
       "publicSymbols": [
         "ActionGenerator",
         "ActionOutput",
+        "CancellationSource",
+        "CancellationToken",
+        "CancelledError",
         "ConditioningFramePreprocessor",
+        "DeadlineExceededError",
         "GeneratorPromptPacker",
         "ImageGenerator",
         "ImageOutput",
@@ -198,7 +216,7 @@
     {
       "path": "python/onnx_world_model/_api.py",
       "kind": "source",
-      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, and latent-dynamics APIs.",
+      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, cancellation, and latent-dynamics APIs.",
       "publicSymbols": [
         "TensorSpec",
         "ModelMetadata",
@@ -209,6 +227,9 @@
         "StageEventKind",
         "StageEvent",
         "StageRun",
+        "CancellationReasonName",
+        "CancellationToken",
+        "CancellationSource",
         "ProviderOptionValue",
         "ProviderOptions",
         "available_execution_providers",
@@ -281,6 +302,39 @@
       ]
     },
     {
+      "path": "src/cancellation.cpp",
+      "kind": "source",
+      "purpose": "Implements the cancellation state machine behind CancellationToken and CancellationSource: first-reason-wins claiming, boundary deadline discovery, and the race-free callback registry that lets an in-flight ONNX Runtime call be terminated.",
+      "publicSymbols": [
+        "CancellationToken::cancelled",
+        "CancellationToken::reason",
+        "CancellationToken::deadline",
+        "CancellationToken::ThrowIfCancellationRequested",
+        "CancellationSource::CancellationSource",
+        "CancellationSource::WithDeadline",
+        "CancellationSource::WithTimeout",
+        "CancellationSource move operations and destructor",
+        "CancellationSource::token",
+        "CancellationSource::Cancel",
+        "CancellationSource::cancelled",
+        "CancellationSource::reason",
+        "CancellationSource::deadline",
+        "detail::CancellationState",
+        "detail::CancellationAccess",
+        "detail::CancellationRegistration"
+      ]
+    },
+    {
+      "path": "src/cancellation.hpp",
+      "kind": "source",
+      "purpose": "Declares the internal cancellation state, the CancellationAccess seam that lets src/ reach a token's or source's shared state, and the RAII CancellationRegistration that runs a callback when a token is cancelled.",
+      "publicSymbols": [
+        "onnx_world_model::detail::CancellationState",
+        "onnx_world_model::detail::CancellationAccess",
+        "onnx_world_model::detail::CancellationRegistration"
+      ]
+    },
+    {
       "path": "src/dynamic_library.cpp",
       "kind": "source",
       "purpose": "Loads the ONNX Runtime shared library at run time and binds the OrtApi function table once per process, so the library never links against a specific ORT binary.",
@@ -311,6 +365,7 @@
         "ValidateTensor",
         "ModelMetadata::Input",
         "ModelMetadata::Output",
+        "ModelBackend::Run",
         "Model::Model",
         "Model::Load",
         "Model::metadata",
@@ -438,6 +493,7 @@
         "StageRun::iteration",
         "StageRun::Step",
         "StageRun::Finish",
+        "StageRun::RequestCancellation",
         "StageRun::Cancel"
       ]
     },
@@ -479,9 +535,25 @@
       ]
     },
     {
+      "path": "tests/cpp/cancellation_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for CancellationToken and CancellationSource: default inertness, first-reason-wins claiming, boundary deadline discovery, saturating timeouts across the whole millisecond range, error codes, move semantics, and the thread-safety and callback-lifetime guarantees the public API establishes.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/model_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for Model, runtime option defaults, provider helpers, and the named-tensor metadata contract, using an in-process AddOneBackend stub.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
+      "path": "tests/cpp/pipeline_cancellation_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for pipeline cancellation and deadlines: it covers StageRun::RequestCancellation against a step that holds the session lock, externally supplied tokens, deadline_exceeded as a distinct outcome, run-slot ownership after a cancelled run, exception-safe restoration of the classifier-free guidance scratch state, and the promise that cancelling neither rolls back applied state nor materializes a device buffer.",
       "publicSymbols": [
         "main"
       ]
@@ -541,6 +613,12 @@
       "path": "tests/python/test_api.py",
       "kind": "test",
       "purpose": "Tests the Python wrapper API in `_api.py`: model loading, metadata, execution-provider selection and rejection, named-tensor validation, and latent-dynamics stepping and rollout state.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_cancellation.py",
+      "kind": "test",
+      "purpose": "Tests the Python CancellationSource and CancellationToken wrappers, the CancelledError and DeadlineExceededError hierarchy, and the cancellation and timeout arguments on PipelineSession, StageRun, and OnnxModel.",
       "publicSymbols": []
     },
     {

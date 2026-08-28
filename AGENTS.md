@@ -76,12 +76,13 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 6 of 6 passing; `pytest` reports 94 passed
+Expected baseline: `ctest` reports 8 of 8 passing; `pytest` reports 123 passed
 and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
-`tests/python/test_pipeline_snapshot.py` and
-`tests/python/test_pipeline_stream.py`.
+`tests/python/test_pipeline_snapshot.py`,
+`tests/python/test_pipeline_stream.py`, and
+`tests/python/test_cancellation.py`.
 
 C++ changes require `cmake --build --preset dev` before `ctest`, and a
 `--reinstall-package` rebuild before `pytest`.
@@ -92,7 +93,12 @@ C++ changes require `cmake --build --preset dev` before `ctest`, and a
   fallback for an unsupported capability, manifest field, stage kind, or
   execution provider.
 - All C++ failures throw `onnx_world_model::Error` with an `ErrorCode`; do not
-  introduce a second exception type.
+  introduce a second exception type. The Python binding maps that code onto
+  `CancelledError`, `DeadlineExceededError`, or their base `WorldModelError`,
+  so a new outcome is a new `ErrorCode`, never a message-text check.
+- Cancellation is cooperative: poll `PipelineRunOptions::cancellation` at
+  operation boundaries, never inside per-element loops, and never roll back
+  what a cancelled call already applied.
 - Keep ONNX Runtime headers confined to `src/dynamic_library.cpp` and
   `src/ort_backend.cpp`, and keep them out of `include/onnx_world_model/`.
 - Internal C++ helpers belong in `onnx_world_model::detail` in a non-installed

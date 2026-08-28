@@ -47,8 +47,8 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `Model`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
-| Core library | `src/` | ORT loading, tensor marshalling, manifest parsing and validation, staged execution. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
+| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
 | C++ tests | `tests/cpp/` | Stub-backend tests registered with CTest. |
@@ -58,11 +58,16 @@ There is no server, database, or outbound network call at run time.
 
 Within `src/` the runtime is layered:
 
+- `cancellation` owns the state behind `CancellationToken` and
+  `CancellationSource`: the claimed reason, the immutable deadline, and the
+  callback registry that lets a cancelling thread reach into work already
+  running.
 - `dynamic_library` loads the ORT shared library and binds `OrtApi` once per
   process.
 - `ort_backend` is the only other translation unit that touches ORT; it owns
-  the process-wide ORT environment, builds component sessions, and uses I/O
-  binding to wrap ORT-owned outputs in device-aware tensors.
+  the process-wide ORT environment, builds component sessions, uses I/O
+  binding to wrap ORT-owned outputs in device-aware tensors, and terminates an
+  in-flight `Session::Run` through a per-call `Ort::RunOptions`.
 - `model` validates named tensors against graph signatures.
 - `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
@@ -134,7 +139,26 @@ incremental and all-at-once execution cannot diverge. `RunStage` holds the
 session lock for its entire drain, preserving whole-stage serialization;
 explicit `Step()` releases it between events. Stepping is synchronous: an event
 is the result of work already done, not a notification, and there is no background
-thread, no cancellation of a step in flight, and no deadline in this milestone.
+thread.
+
+Stopping that work is cooperative and explicit. `PipelineRunOptions` carries a
+`CancellationToken`; `BeginStage` copies its deadline into the run's own
+`CancellationSource`, links the caller's token into that source with a
+reason-preserving registration, and publishes the resulting internal token as
+the run's options, so every downstream call observes both the caller's
+cancellation and `StageRun::RequestCancellation`. Boundaries — not per-element
+loops — poll it: before and after each component, between the two guidance
+passes, around guidance combination, around the state transforms, around token
+sampling, and at each `Step`, `Finish`, and direct `StepStage` entry. Inside
+one ONNX Runtime call, the ORT backend registers a callback that terminates a
+fresh per-call `Ort::RunOptions`, which ORT honors between graph nodes. A
+cancelled call throws `ErrorCode::cancelled` or `ErrorCode::deadline_exceeded`
+through the same path a failure takes: the run slot is released, the handle
+closes, and everything already applied stays applied. `RequestCancellation`
+never takes the session lock, so it is the one operation a second thread can
+perform while a step holds it; `Cancel()` does take the lock and only closes
+the handle. In this milestone a deadline is discovered by whichever thread
+polls next, so nothing fires it while one long ONNX Runtime call is blocked.
 
 A session has one run slot, held from `BeginStage` until the run completes, is
 cancelled, or is dropped. While it is held, `BeginStage`, `RunStage`,
@@ -193,10 +217,15 @@ Python:
   generation API, exposing `.text`, `.image`, `.video`, and `.action`, each with
   a `generate()` method.
 - `onnx_world_model.Pipeline` and `PipelineSession` — direct stage execution,
-  plus `begin_stage()` and `iter_stage()` for incremental execution, and
+  plus `begin_stage()` and `iter_stage()` for incremental execution,
   `snapshot()`, `restore()`, `fork()`, and the named `checkpoint()`,
   `restore_checkpoint()`, `drop_checkpoint()`, and `has_checkpoint()` methods
-  for in-memory session branching.
+  for in-memory session branching, and the keyword-only `cancellation` and
+  `timeout` arguments on every execution method.
+- `onnx_world_model.CancellationSource` and `CancellationToken` — explicit
+  cancellation and deadlines, with `CancelledError` and
+  `DeadlineExceededError` as the outcomes, both derived from
+  `WorldModelError`.
 - `onnx_world_model.OnnxModel` — one ONNX graph with named tensors.
 - `onnx_world_model.LatentDynamicsModel` and `Rollout` — the fixed
   latent-dynamics API.
@@ -213,7 +242,10 @@ C++:
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
   in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
-- `onnx_world_model::Model::Load` and `Model::Run`.
+- `onnx_world_model::Model::Load` and `Model::Run`, whose cancellable overload
+  takes a `CancellationToken`.
+- `onnx_world_model::CancellationSource` and `CancellationToken`, plus
+  `StageRun::RequestCancellation` for stopping work already running.
 - `onnx_world_model::WorldModel::Load`, `WorldModel::Step`, and `Rollout`.
 
 Command line:
@@ -231,7 +263,18 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   fields, unknown stage or generator kinds, unavailable execution providers, and
   mismatched tensor signatures raise instead of degrading silently.
 - **Single error type.** All C++ failures throw `onnx_world_model::Error` with an
-  `ErrorCode`; pybind11 surfaces it as `WorldModelError`.
+  `ErrorCode`; pybind11 maps that code onto the Python exception hierarchy, so
+  `ErrorCode::cancelled` becomes `CancelledError`,
+  `ErrorCode::deadline_exceeded` becomes `DeadlineExceededError`, and every
+  other code becomes their common base `WorldModelError`.
+- **Cancellation is cooperative and never a rollback.** A token is a one-way
+  latch: the first claimed reason wins, a cancelled token stays cancelled, and
+  reusing one cancels the next call immediately. A stopped call throws at its
+  next boundary, releases the session's run slot, and leaves everything it
+  already applied in place; a caller who wants to rewind takes a snapshot or a
+  checkpoint first. `StageRun::RequestCancellation` signals in-flight work and
+  takes no session lock, while `StageRun::Cancel` takes the lock and only
+  closes the handle.
 - **Validate at the boundary.** `Model::Run` checks every input and output
   tensor; manifest semantics are validated once at load time.
 - **Ownership split.** `Pipeline` is immutable and shareable; `PipelineSession`
@@ -281,7 +324,21 @@ and the `onnx-world-model` wheel built by scikit-build-core.
 Text, image, video, and action generation from Mobius packages; one image or
 video per text-generation request; image-to-video conditioning and
 classifier-free guidance for packages that declare them. Incremental stage
-execution is synchronous and single-consumer: cancelling a step already in
-flight, step deadlines, and snapshotting a session mid-run are not included.
+execution is synchronous and single-consumer, and snapshotting a session
+mid-run is not included.
+
+Cancellation and deadlines cover `PipelineSession`, `StageRun`, and the
+generic `Model`. Three limits are deliberate and documented rather than
+hidden:
+
+- Deadlines are enforced only at execution boundaries. Nothing fires one while
+  a single ONNX Runtime call is blocked; the next commit adds one process-wide
+  deadline service that does.
+- ONNX Runtime checks its termination flag between graph nodes, so a single
+  long-running kernel finishes before a cancelled call unwinds.
+- The high-level modality APIs on `WorldModel` and the fixed
+  `LatentDynamicsModel`, `WorldModel::Step`, and `Rollout` surfaces take no
+  token yet.
+
 Output media encoding is not included, and fixed-step stochastic FlowMatch
 schedules are not yet supported.

@@ -1,8 +1,8 @@
 /**
  * @agent-file
  * @agent-purpose: Implements execution-provider normalization and library registration, tensor-versus-signature validation, ModelMetadata lookups, and the validating Model facade.
- * @agent-public-api: NormalizeExecutionProviderName, AvailableExecutionProviders, RegisterExecutionProviderLibrary, ValidateTensor, ModelMetadata::Input, ModelMetadata::Output, Model::Model, Model::Load, Model::metadata, Model::Run
- * @agent-invariants: Model::Run rejects missing, unexpected, or mismatched tensors on both the input and the output side before and after the backend call; a negative spec dimension accepts any concrete extent; NormalizeExecutionProviderName strips non-alphanumeric characters and the ExecutionProvider suffix, then folds the directml, trtrtx, nvtensorrtx, and tensortrt aliases; a null backend throws ErrorCode::invalid_argument.
+ * @agent-public-api: NormalizeExecutionProviderName, AvailableExecutionProviders, RegisterExecutionProviderLibrary, ValidateTensor, ModelMetadata::Input, ModelMetadata::Output, ModelBackend::Run, Model::Model, Model::Load, Model::metadata, Model::Run
+ * @agent-invariants: Model::Run rejects missing, unexpected, or mismatched tensors on both the input and the output side before and after the backend call; a negative spec dimension accepts any concrete extent; NormalizeExecutionProviderName strips non-alphanumeric characters and the ExecutionProvider suffix, then folds the directml, trtrtx, nvtensorrtx, and tensortrt aliases; a null backend throws ErrorCode::invalid_argument. The cancellable Model::Run overload checks its token before the backend call and after output validation, and ModelBackend's default cancellable overload does the same around the one-argument Run, so a backend that cannot interrupt itself still stops at those two boundaries.
  * @agent-side-effects: Model::Load and AvailableExecutionProviders load the ONNX Runtime shared library; RegisterExecutionProviderLibrary also loads an EP library into the process; Model::Load reads model files.
  */
 
@@ -136,6 +136,19 @@ const TensorSpec& ModelMetadata::Output(std::string_view name) const {
   return *found;
 }
 
+// Every backend written before cancellation existed only implements the
+// one-argument Run, so the cancellable overload is defined here rather than
+// made pure: the token is honored at the two boundaries a non-interruptible
+// backend can offer, and a backend that can interrupt itself overrides it.
+NamedTensors ModelBackend::Run(
+    const NamedTensors& inputs,
+    const CancellationToken& cancellation) const {
+  cancellation.ThrowIfCancellationRequested();
+  NamedTensors outputs = Run(inputs);
+  cancellation.ThrowIfCancellationRequested();
+  return outputs;
+}
+
 Model::Model(ModelBackendPtr backend) : backend_(std::move(backend)) {
   if (backend_ == nullptr) {
     throw Error(ErrorCode::invalid_argument, "Backend cannot be null");
@@ -156,6 +169,17 @@ NamedTensors Model::Run(const NamedTensors& inputs) const {
   ValidateNames(inputs, metadata().inputs, "input");
   NamedTensors outputs = backend_->Run(inputs);
   ValidateNames(outputs, metadata().outputs, "output");
+  return outputs;
+}
+
+NamedTensors Model::Run(
+    const NamedTensors& inputs,
+    const CancellationToken& cancellation) const {
+  cancellation.ThrowIfCancellationRequested();
+  ValidateNames(inputs, metadata().inputs, "input");
+  NamedTensors outputs = backend_->Run(inputs, cancellation);
+  ValidateNames(outputs, metadata().outputs, "output");
+  cancellation.ThrowIfCancellationRequested();
   return outputs;
 }
 

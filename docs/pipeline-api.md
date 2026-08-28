@@ -347,8 +347,9 @@ The rules the API guarantees:
   iterative target are resolved once, when the run begins.
 - **Synchronous steps.** One `step()` blocks until one model or scheduler step
   finishes. Events are results, not notifications; there is no background
-  thread. Cancelling a step already in flight, and step deadlines, are a later
-  milestone.
+  thread. A step can be stopped cooperatively — see
+  [Cancellation and deadlines](#cancellation-and-deadlines) — but not
+  preempted.
 - **One terminal event.** A stopping condition — the end-of-sequence token in
   every lane, the token budget, or the last scheduler step — is reported by the
   *next* `step()` as the `"completed"` event, so every run ends the same way.
@@ -374,8 +375,89 @@ block or an explicit `close()` does that deterministically; a bare `break` out
 of `iter_stage()` waits for the generator to be closed or collected.
 
 The C++ API is the same shape: `PipelineSession::BeginStage` returns a
-move-only `StageRun` with `Step()`, `Finish()`, and `Cancel()`, and a
-`StageEvent` there keeps its device-resident tensors.
+move-only `StageRun` with `Step()`, `Finish()`, `RequestCancellation()`, and
+`Cancel()`, and a `StageEvent` there keeps its device-resident tensors.
+
+## Cancellation and deadlines
+
+Every execution entry point accepts either a `cancellation` token or a
+`timeout` in seconds. They are mutually exclusive: a `timeout` builds its own
+source, so passing both raises `ValueError`.
+
+```python
+import threading
+
+from onnx_world_model import CancellationSource, CancelledError, DeadlineExceededError
+
+# Stop on demand, from anywhere.
+source = CancellationSource()
+threading.Timer(5.0, source.cancel).start()
+try:
+    outputs = session.run_stage("world_generation", inputs, cancellation=source.token())
+except CancelledError:
+    partial = session.outputs        # everything the stage already applied
+
+# Or bound one call by wall-clock time.
+try:
+    outputs = session.run_stage("world_generation", inputs, timeout=30.0)
+except DeadlineExceededError:
+    ...
+```
+
+`StageRun` adds `request_cancellation()`, the one method that is safe to call
+from another thread while `step()` or `finish()` is running, because it takes
+no session lock:
+
+```python
+run = session.begin_stage("reasoner_decode", prompt)
+watchdog = threading.Timer(10.0, run.request_cancellation)
+watchdog.start()
+try:
+    for event in run:
+        consume(event)
+finally:
+    watchdog.cancel()
+    run.close()
+```
+
+The rules the API guarantees:
+
+- **Two outcomes, one base.** An explicit cancellation raises `CancelledError`
+  and an expired deadline raises `DeadlineExceededError`. Both derive from
+  `WorldModelError`, so an existing `except WorldModelError` handler still
+  catches them, and the C++ `ErrorCode` — `cancelled` or `deadline_exceeded` —
+  decides which one, never the message text.
+- **First reason wins.** A token is a one-way latch. Once a reason is claimed
+  it never changes, and a cancelled token stays cancelled: reusing it fails the
+  next call immediately. Build a new `CancellationSource` per request.
+- **Never a rollback.** A cancelled call stops at its next boundary, releases
+  the session's run slot, and leaves everything it already applied in place —
+  exactly like a failed call. The one thing it does undo is internal scratch
+  state that was never a result: a guided step that is stopped during its
+  unconditional pass restores the conditional conditioning input before it
+  unwinds, so the next step is not silently conditioned on the unconditional
+  value. Take a `snapshot()` or a `checkpoint()` first if you want to rewind.
+- **`request_cancellation()` is not `close()`.** `request_cancellation()`
+  signals work that is running and does not take the session lock.
+  `close()` takes the lock, so it waits for an in-flight step, and then only
+  abandons the handle and releases the slot. A stale handle can do neither to
+  a newer run.
+- **Boundaries, not preemption.** The token is checked before and after each
+  component, between the two classifier-free-guidance passes, around guidance
+  combination and the state transforms, around token sampling, and at each
+  step. Inside one ONNX Runtime call the runtime terminates the run through a
+  fresh per-call `Ort::RunOptions`, which ONNX Runtime honors *between graph
+  nodes* — a single long-running kernel still finishes first.
+- **Deadlines are polled, not timed.** In this milestone a deadline is
+  discovered by whichever thread reaches the next boundary, so nothing fires
+  one while a single ONNX Runtime call is blocked. A process-wide deadline
+  service that does is the next milestone.
+- **One deadline per `run()`.** `PipelineSession.run(..., timeout=...)` builds
+  its source once, so a single absolute deadline covers the whole stage
+  sequence rather than restarting at each stage.
+- **Not yet covered.** The `WorldModel` modality `generate()` methods and the
+  fixed `LatentDynamicsModel`, `WorldModel::Step`, and `Rollout` APIs do not
+  take a token; drive `PipelineSession` directly when you need one.
 
 ## Session snapshots and named checkpoints
 
@@ -569,6 +651,34 @@ deadlock. An empty name throws `ErrorCode::invalid_argument`; restoring or
 dropping a name the session does not hold throws `ErrorCode::state` and changes
 nothing.
 
+Cancellation in C++ is the same contract:
+
+```cpp
+CancellationSource source;                      // or WithTimeout(30s)
+PipelineRunOptions options;
+options.cancellation = source.token();
+
+StageRun run = session.BeginStage("world_generation", inputs, {}, options);
+std::jthread watchdog([&run] { run.RequestCancellation(); });
+try {
+  NamedTensors outputs = run.Finish();
+} catch (const Error& error) {
+  // ErrorCode::cancelled or ErrorCode::deadline_exceeded.
+}
+```
+
+`CancellationToken` has no public constructor beyond the default, inert one, so
+a cancellable token can only come from a `CancellationSource`. The source is
+move-only; the token is copyable and observes the same state. `Cancel()` is
+`noexcept` and safe from any thread.
+
+`Model::Run` has a second overload that takes a token, and `ModelBackend::Run`
+has a virtual cancellable overload whose default implementation checks the
+token before and after the historical one-argument `Run`. An external backend
+therefore keeps compiling and still stops at those boundaries; only a backend
+that can interrupt work already running needs to override it, as the ONNX
+Runtime backend does.
+
 ## Runtime scope
 
 - Dense FP16, BF16, FP32, integer, and boolean tensors.
@@ -581,6 +691,11 @@ nothing.
 - In-memory session snapshot, restore, fork, and named checkpoints. This is
   in-memory transaction support, not paged KV attention: nothing is serialized
   to disk and nothing crosses a process boundary.
+- Explicit cancellation and deadlines on stage execution and generic model
+  execution, enforced at execution boundaries and inside an ONNX Runtime call
+  at graph-node granularity. A background deadline service, and cancellation
+  on the `WorldModel` modality APIs and the fixed latent-dynamics API, are not
+  included.
 - FlowMatch Euler and flow-prediction UniPC order-1/order-2 schedulers.
 - Greedy and temperature/top-k/top-p autoregressive sampling.
 - Packed layout, attention masks, multimodal positions, scheduler timesteps,

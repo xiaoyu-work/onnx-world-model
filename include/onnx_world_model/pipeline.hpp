@@ -4,7 +4,7 @@
  * @agent-file
  * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
  * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal.
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -180,6 +180,10 @@ struct PipelineRunOptions {
   std::unordered_map<std::string, std::string> strings;
   std::unordered_map<std::string, std::int64_t> integers;
   std::unordered_map<std::string, double> numbers;
+  //: Stops this call at its next safe boundary. The default token is never
+  //: cancellable, so leaving it alone preserves the uncancellable behavior
+  //: every earlier release had.
+  CancellationToken cancellation;
 };
 
 class PipelineSession;
@@ -271,8 +275,14 @@ struct StageEvent {
 //: returned for the same arguments because both drain this state machine.
 //:
 //: A run is synchronous and single-consumer. Step() blocks until its step
-//: finishes; a step already in flight cannot be cancelled and carries no
-//: deadline. Concurrent calls on one handle serialize on the session lock and
+//: finishes. It can be stopped, but only cooperatively: RequestCancellation()
+//: signals the run and the work stops at the next boundary it checks --
+//: before and after each component, transform, guidance pass, and sampling
+//: step, and inside the ONNX Runtime call, which ONNX Runtime can only
+//: interrupt between graph nodes. A deadline supplied through
+//: PipelineRunOptions::cancellation is enforced at those same boundaries; in
+//: this milestone nothing fires it while one long ONNX Runtime call is
+//: blocked. Concurrent calls on one handle serialize on the session lock and
 //: only one of them advances the run.
 //:
 //: A session has one run slot. While this run holds it the session throws
@@ -320,9 +330,21 @@ class StageRun {
   //: after the run completed returns that cached result again without
   //: re-running anything.
   [[nodiscard]] NamedTensors Finish();
+  //: Signals the work this run is doing to stop. Unlike Cancel() this never
+  //: takes the session lock, so it is the one method a second thread can call
+  //: while Step() or Finish() is executing: it cancels the run's own
+  //: cancellation source, which the running step observes at its next
+  //: boundary and which terminates an ONNX Runtime call already in flight.
+  //: The interrupted Step() or Finish() then throws ErrorCode::cancelled,
+  //: releases the run slot, and leaves everything the run already applied in
+  //: place. Idempotent, safe on a moved-from or finished handle, and never a
+  //: rollback.
+  void RequestCancellation() noexcept;
   //: Abandons an unfinished run and releases the session's run slot, leaving
-  //: every effect the run already applied in place. Idempotent, and a no-op
-  //: on a completed, cancelled, or moved-from handle.
+  //: every effect the run already applied in place. This is the local
+  //: close-and-release operation, not a signal: it takes the session lock, so
+  //: it waits for an in-flight Step() instead of interrupting it. Idempotent,
+  //: and a no-op on a completed, cancelled, or moved-from handle.
   void Cancel() noexcept;
 
  private:

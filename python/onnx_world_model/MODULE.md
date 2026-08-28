@@ -20,21 +20,28 @@ expects.
 - Offer the modality-oriented `WorldModel` API (`text`, `image`, `video`,
   `action`) and report the capabilities the loaded package actually declares.
 - Keep the low-level `OnnxModel`, `Pipeline`, `PipelineSession`,
-  `PipelineSessionSnapshot`, `StageRun`, `LatentDynamicsModel`, and `Rollout`
-  APIs available.
+  `PipelineSessionSnapshot`, `StageRun`, `CancellationSource`,
+  `CancellationToken`, `LatentDynamicsModel`, and `Rollout` APIs available.
+- Expose cooperative cancellation and per-call deadlines: a keyword-only
+  `cancellation` token or `timeout` in seconds on the pipeline and model
+  entry points, `StageRun.request_cancellation` for stopping work already
+  running, and the `CancelledError` and `DeadlineExceededError` subclasses of
+  `WorldModelError`.
 
 ## Key Files
 
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
 | `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
 
 `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases for
-`Pipeline` and `LatentDynamicsModel`.
+`Pipeline` and `LatentDynamicsModel`. The modality `generate()` methods in
+`generation.py` do not accept a cancellation token yet; a caller who needs one
+drives `PipelineSession` directly.
 
 ## Dependencies
 
@@ -69,6 +76,9 @@ uvx ruff check python
 named-checkpoint wrappers,
 `tests/python/test_pipeline_stream.py` covers `StageEvent`, `StageRun`,
 `begin_stage`, and `iter_stage`,
+`tests/python/test_cancellation.py` covers `CancellationSource`,
+`CancellationToken`, the exception hierarchy, and the `cancellation` and
+`timeout` arguments,
 `tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
 and `tests/python/test_guided_generation.py` and
 `tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that

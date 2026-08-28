@@ -62,8 +62,14 @@ C++ API ───────────────┤                  │
   each step as a `StageEvent`, so a caller can stream decoded tokens or
   diffusion steps. Stepping is synchronous — one call blocks for one model or
   scheduler step — and `run_stage()` is that same run drained to the end, so
-  both paths produce identical results. Cancellation of a step already in
-  flight and step deadlines are a later milestone.
+  both paths produce identical results.
+- Cancellation is explicit and cooperative. Pass a `CancellationToken` or a
+  `timeout` in seconds to `run_stage()`, `step_stage()`, `begin_stage()`,
+  `iter_stage()`, `run()`, or `OnnxModel.run()`, or call
+  `StageRun.request_cancellation()` from another thread to stop a step already
+  running. The interrupted call raises `CancelledError` or
+  `DeadlineExceededError` — both subclasses of `WorldModelError` — releases
+  the session, and keeps everything it already applied.
 - `PipelineSession.snapshot()` captures all of that mutable state in memory,
   and `restore()` and `fork()` rewind or branch a trajectory from it without
   copying tensor data or leaving the process. `checkpoint(name)`,
@@ -100,8 +106,11 @@ The build SHA256-verifies downloaded ONNX Runtime 1.28 and nlohmann/json
 headers. Offline builds can set `ONNXRUNTIME_INCLUDE_DIR` and
 `NLOHMANN_JSON_INCLUDE_DIR`.
 
-Version 0.2 introduces the device-aware `TensorBuffer` ABI. C++ applications
-built against version 0.1 must be recompiled when upgrading.
+Version 0.2 introduces the device-aware `TensorBuffer` ABI, and version 0.3
+adds the cancellation surface: a `CancellationToken` member on
+`PipelineRunOptions`, a virtual cancellable `ModelBackend::Run`, and
+`StageRun::RequestCancellation`. C++ applications built against an earlier
+version must be recompiled when upgrading.
 
 ## Install
 
@@ -214,4 +223,9 @@ Low-level tensor and stage execution is documented in the
 - One image or video per text-generation request.
 - Image-to-video conditioning and classifier-free guidance for packages that
   declare them; output media encoding is not yet included.
+- Explicit cancellation and deadlines on `PipelineSession`, `StageRun`, and
+  `OnnxModel`. Deadlines are checked at execution boundaries, so nothing fires
+  one while a single ONNX Runtime call is blocked; ONNX Runtime itself only
+  stops between graph nodes; and the `WorldModel` modality `generate()` methods
+  and the fixed `LatentDynamicsModel` API do not take a token yet.
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

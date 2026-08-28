@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   onnx_world_model
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "Runtime engine for Mobius-exported ONNX world models"
   LANGUAGES CXX
 )
@@ -31,6 +31,7 @@ onnx_world_model_resolve_json_header(JSON_INCLUDE_DIR)
 
 add_library(
   onnx_world_model
+  src/cancellation.cpp
   src/dynamic_library.cpp
   src/model.cpp
   src/ort_backend.cpp
@@ -49,7 +50,7 @@ set_target_properties(
   PROPERTIES
     CXX_EXTENSIONS OFF
     POSITION_INDEPENDENT_CODE ON
-    SOVERSION 0.2
+    SOVERSION 0.3
     VERSION ${PROJECT_VERSION}
 )
 target_compile_definitions(
@@ -97,7 +98,18 @@ endif()
 
 if(ONNX_WORLD_MODEL_BUILD_TESTS)
   enable_testing()
-  foreach(test_name IN ITEMS tensor model pipeline pipeline_device pipeline_snapshot pipeline_stream)
+  foreach(
+    test_name
+    IN ITEMS
+      tensor
+      model
+      cancellation
+      pipeline
+      pipeline_device
+      pipeline_snapshot
+      pipeline_stream
+      pipeline_cancellation
+  )
     add_executable(${test_name}_test tests/cpp/${test_name}_test.cpp)
     target_link_libraries(${test_name}_test PRIVATE onnx_world_model)
     target_compile_features(${test_name}_test PRIVATE cxx_std_20)

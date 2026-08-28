@@ -1,8 +1,8 @@
 /**
  * @agent-file
  * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations and the StageRun state machine that drives every stage one step at a time.
- * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::BeginStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid, StageRun move operations and destructor, StageRun::stage, StageRun::done, StageRun::iteration, StageRun::Step, StageRun::Finish, StageRun::Cancel
- * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind, inputs, overrides, options, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target exactly once under the session lock. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing.
+ * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::BeginStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid, StageRun move operations and destructor, StageRun::stage, StageRun::done, StageRun::iteration, StageRun::Step, StageRun::Finish, StageRun::RequestCancellation, StageRun::Cancel
+ * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind, inputs, overrides, options, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target exactly once under the session lock. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing. Cancellation is cooperative and travels on PipelineRunOptions::cancellation: StageRun::Begin links the caller's token into the run's own CancellationSource -- copying its deadline and registering a reason-preserving callback whose registration is declared after the source so it is destroyed first -- and then replaces plan.options.cancellation with that internal token, so every downstream call observes both the caller's token and StageRun::RequestCancellation. RequestCancellation only signals that source and never takes the session mutex, which is what lets a second thread stop a step that already holds it. The token is polled at boundaries rather than per element: Step and Finish check before each step, StepStage checks on entry, between the two guidance passes, around guidance combination, and around the state transforms, RunStageComponents checks before and after each component, ApplyConnection checks before any host transform, and the autoregressive step brackets token sampling. A cancelled step throws through the existing failure path, so the run slot is released, the handle closes, and everything already applied stays applied. The one window that is not "leave it applied" is the classifier-free guidance scratch state: the unconditional pass temporarily replaces the endpoint map, the position cursors, and the conditioning tensor's existing slot in external_values, and the file-local GuidanceScratch guard restores all three by swap -- static-asserted nothrow -- on every exit, so a cancellation or a backend failure inside that pass can never leave the unconditional conditioning value behind for the next step.
   * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, Fork, and the checkpoint operations touch memory only; they perform no device transfer, no disk access, and no inference.
  */
 
@@ -23,10 +23,12 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include <nlohmann/json.hpp>
 
+#include "cancellation.hpp"
 #include "onnx_world_model/error.hpp"
 
 namespace onnx_world_model {
@@ -706,6 +708,69 @@ struct SessionState {
     position_cursors.swap(other.position_cursors);
     std::swap(random_engine, other.random_engine);
   }
+};
+
+// The scratch window a guided stage opens around its unconditional pass.
+// That pass overwrites the session's endpoint map, its position cursors, and
+// the one external conditioning tensor, and every one of those has to be back
+// in place before any Error leaves the window -- a cancellation claimed at one
+// of the new boundaries, a backend failure, or a guided output the second pass
+// did not produce. Restoration therefore performs no fallible work: the copies
+// are taken in the constructor, before anything is mutated, and Restore only
+// swaps. The static assertions are the justification for its noexcept.
+class GuidanceScratch {
+ public:
+  using PositionCursors =
+      std::unordered_map<std::string, std::vector<std::int64_t>>;
+
+  static_assert(std::is_nothrow_swappable_v<NamedTensors>);
+  static_assert(std::is_nothrow_swappable_v<PositionCursors>);
+  static_assert(std::is_nothrow_move_constructible_v<Tensor>);
+  static_assert(std::is_nothrow_move_assignable_v<Tensor>);
+  static_assert(std::is_nothrow_swappable_v<Tensor>);
+
+  // `conditioning` must name the conditioning tensor's existing slot in
+  // external_values. Nothing inside the window inserts into that map, so the
+  // reference stays valid and the restore never has to hash the key -- or
+  // allocate a node -- again.
+  GuidanceScratch(
+      NamedTensors& endpoints,
+      PositionCursors& cursors,
+      Tensor& conditioning)
+      : endpoints_(endpoints),
+        cursors_(cursors),
+        conditioning_(conditioning),
+        saved_endpoints_(endpoints),
+        saved_cursors_(cursors),
+        saved_conditioning_(conditioning) {}
+
+  GuidanceScratch(const GuidanceScratch&) = delete;
+  GuidanceScratch& operator=(const GuidanceScratch&) = delete;
+  GuidanceScratch(GuidanceScratch&&) = delete;
+  GuidanceScratch& operator=(GuidanceScratch&&) = delete;
+
+  ~GuidanceScratch() { Restore(); }
+
+  // Idempotent, so the success path calls it explicitly before publishing the
+  // combined predictions and the destructor then does nothing.
+  void Restore() noexcept {
+    if (!armed_) {
+      return;
+    }
+    armed_ = false;
+    endpoints_.swap(saved_endpoints_);
+    cursors_.swap(saved_cursors_);
+    std::swap(conditioning_, saved_conditioning_);
+  }
+
+ private:
+  NamedTensors& endpoints_;
+  PositionCursors& cursors_;
+  Tensor& conditioning_;
+  NamedTensors saved_endpoints_;
+  PositionCursors saved_cursors_;
+  Tensor saved_conditioning_;
+  bool armed_{true};
 };
 
 }  // namespace
@@ -2549,6 +2614,10 @@ struct PipelineSession::Impl : SessionState {
     if (!connection.transform.has_value()) {
       return source;
     }
+    // Every branch below is a host-evaluated transform over a whole tensor,
+    // so the token is checked once here rather than inside the per-element
+    // ReadFloat and WriteFloat loops those branches run.
+    options.cancellation.ThrowIfCancellationRequested();
     if (*connection.transform == "cast") {
       return CastTensor(
           source, manifest().Input(connection.target).data_type);
@@ -2811,6 +2880,10 @@ struct PipelineSession::Impl : SessionState {
       if (reuse_prefill_embedding) {
         continue;
       }
+      // Per component rather than per tensor: resolving one component's
+      // inputs can run generated-input programs and host transforms, and a
+      // cancelled run should not start another component's worth of them.
+      options.cancellation.ThrowIfCancellationRequested();
       NamedTensors model_inputs;
       model_inputs.reserve(component.metadata.inputs.size());
       for (const auto& spec : component.metadata.inputs) {
@@ -2819,14 +2892,16 @@ struct PipelineSession::Impl : SessionState {
         endpoint_values.insert_or_assign(endpoint.qualified(), value);
         model_inputs.emplace(spec.name, std::move(value));
       }
-      NamedTensors model_outputs =
-          package->Component(component.name).Run(model_inputs);
+      options.cancellation.ThrowIfCancellationRequested();
+      NamedTensors model_outputs = package->Component(component.name)
+                                       .Run(model_inputs, options.cancellation);
       for (auto& [name, tensor] : model_outputs) {
         // Component outputs keep whatever storage the backend produced, so a
         // device-backed output flows to the next component untouched.
         endpoint_values.insert_or_assign(
             component.name + "." + name, std::move(tensor));
       }
+      options.cancellation.ThrowIfCancellationRequested();
     }
   }
 
@@ -2857,6 +2932,7 @@ struct PipelineSession::Impl : SessionState {
       const NamedTensors& inputs,
       const NamedTensors& overrides,
       const PipelineRunOptions& options) {
+    options.cancellation.ThrowIfCancellationRequested();
     const PipelineStage& stage = FindStage(manifest(), stage_name);
     const NamedTensors external = ExtractGuidanceInputs(stage, inputs);
     StoreExternalInputs(external);
@@ -2868,8 +2944,6 @@ struct PipelineSession::Impl : SessionState {
       // The conditional pass owns the packed layout that the scheduler
       // update and the public outputs observe; the unconditional pass only
       // contributes its prediction.
-      NamedTensors conditional_endpoints = endpoint_values;
-      const auto conditional_cursors = position_cursors;
       NamedTensors conditional_outputs;
       for (const auto& name : guidance.outputs) {
         const auto produced = endpoint_values.find(name);
@@ -2886,9 +2960,23 @@ struct PipelineSession::Impl : SessionState {
         ExecutionError(
             "Guided input '" + conditioning + "' has no conditional value");
       }
-      const Tensor conditional_value = saved->second;
-      external_values.insert_or_assign(conditioning, guidance.unconditional);
+      // Arming the guard is the last thing that happens before the session's
+      // conditional state is overwritten, so every exit below -- including a
+      // cancellation claimed between the passes or inside the unconditional
+      // one -- unwinds through it and leaves the conditional endpoints,
+      // cursors, and conditioning tensor exactly as the conditional pass left
+      // them. This is scratch state only; nothing the run legitimately
+      // applied outside the window is touched.
+      GuidanceScratch scratch(
+          endpoint_values, position_cursors, saved->second);
+      saved->second = guidance.unconditional;
+      // Between the two passes: the conditional prediction is already held,
+      // so stopping here costs one pass rather than two.
+      options.cancellation.ThrowIfCancellationRequested();
       RunStageComponents(stage, external.empty(), overrides, options);
+      // Guidance combination is a host transform over every guided output,
+      // so it is bracketed rather than checked per element.
+      options.cancellation.ThrowIfCancellationRequested();
       NamedTensors combined;
       for (const auto& name : guidance.outputs) {
         const auto produced = endpoint_values.find(name);
@@ -2904,14 +2992,18 @@ struct PipelineSession::Impl : SessionState {
                 produced->second,
                 guidance.scale));
       }
-      endpoint_values = std::move(conditional_endpoints);
-      position_cursors = conditional_cursors;
-      external_values.insert_or_assign(conditioning, conditional_value);
+      options.cancellation.ThrowIfCancellationRequested();
+      // Closes the scratch window before the combined predictions are
+      // published, so what follows writes into the conditional endpoint map.
+      scratch.Restore();
       for (auto& [name, tensor] : combined) {
         endpoint_values.insert_or_assign(name, std::move(tensor));
       }
     }
 
+    // The state transforms below are host-evaluated scheduler steps and
+    // finalizations, so the token is checked once before them and once after.
+    options.cancellation.ThrowIfCancellationRequested();
     for (const auto& state : manifest().states()) {
       if (!Contains(stage.components, state.output.component)) {
         continue;
@@ -2928,6 +3020,7 @@ struct PipelineSession::Impl : SessionState {
           ApplyConnection(
               connection, produced->second, overrides, options));
     }
+    options.cancellation.ThrowIfCancellationRequested();
     ++stage_iterations[stage.name];
     return CollectOutputs();
   }
@@ -3221,6 +3314,14 @@ struct StageRun::Impl {
   NamedTensors overrides;
   PipelineRunOptions options;
 
+  // Every run owns its cancellation source, so RequestCancellation always has
+  // something to signal even when the caller supplied no token. `external`
+  // links a caller-supplied token into it. Declaration order is the lifetime
+  // contract: `external` is destroyed before `source`, so the callback that
+  // targets `source` cannot run against a destroyed object.
+  CancellationSource source;
+  std::optional<detail::CancellationRegistration> external;
+
   // The stage's own inputs are bound by the first step that actually runs, and
   // never again, exactly as the old loops passed them only on their first
   // iteration.
@@ -3255,6 +3356,10 @@ struct StageRun::Impl {
       const NamedTensors& inputs,
       const NamedTensors& overrides,
       const PipelineRunOptions& options) {
+    // Checked before anything is resolved or stored, so a token that is
+    // already cancelled -- including a reused one -- fails without claiming
+    // the session's run slot and without touching the session.
+    options.cancellation.ThrowIfCancellationRequested();
     const PipelineStage& stage = FindStage(owner->manifest(), stage_name);
     auto plan = std::make_unique<Impl>();
     plan->session = owner;
@@ -3263,6 +3368,7 @@ struct StageRun::Impl {
     plan->inputs = inputs;
     plan->overrides = overrides;
     plan->options = options;
+    plan->LinkCancellation(options.cancellation);
 
     if (stage.kind == "autoregressive") {
       owner->StoreExternalInputs(inputs);
@@ -3296,6 +3402,34 @@ struct StageRun::Impl {
     return plan;
   }
 
+  // Gives this run one effective token that fires for both its own
+  // RequestCancellation and the caller's token, and publishes that token as
+  // the run's options so every downstream call observes both. The external
+  // deadline is copied rather than watched, so it is claimed by whichever
+  // side polls first and stays a deadline instead of turning into a plain
+  // cancellation.
+  void LinkCancellation(const CancellationToken& caller) {
+    if (const auto deadline = caller.deadline(); deadline.has_value()) {
+      source = CancellationSource::WithDeadline(*deadline);
+    }
+    options.cancellation = source.token();
+    if (!caller.cancellable()) {
+      return;
+    }
+    external.emplace(
+        caller,
+        [target = &source](CancellationReason reason) {
+          detail::CancellationAccess::Cancel(*target, reason);
+        });
+    // A caller token that was already cancelled ran that callback inline, so
+    // this run is cancelled before it claims the session's run slot.
+    options.cancellation.ThrowIfCancellationRequested();
+  }
+
+  // Never takes the session lock: this is the one operation a second thread
+  // can perform while Step() or Finish() is executing.
+  void RequestCancellation() noexcept { source.Cancel(); }
+
   void ReleaseSlotLocked() noexcept {
     if (session->active_run_id.has_value() &&
         *session->active_run_id == run_id) {
@@ -3328,10 +3462,12 @@ struct StageRun::Impl {
     std::scoped_lock lock(session->mutex);
     EnsureActiveLocked();
     try {
+      options.cancellation.ThrowIfCancellationRequested();
       return StepLocked();
     } catch (...) {
       // The session keeps everything the run already applied, exactly as a
-      // failing RunStage left it; only the run slot and this handle close.
+      // failing RunStage left it; only the run slot and this handle close. A
+      // cancellation travels this same path, so it is never a rollback.
       ReleaseSlotLocked();
       closed = true;
       throw;
@@ -3353,6 +3489,7 @@ struct StageRun::Impl {
     EnsureActiveLocked();
     try {
       while (!completed) {
+        options.cancellation.ThrowIfCancellationRequested();
         (void)StepLocked();
       }
       return final_outputs;
@@ -3420,11 +3557,15 @@ struct StageRun::Impl {
     }
     NamedTensors step_outputs = session->StepStage(
         stage.name, RunInputsLocked(), overrides, options);
+    // Sampling reads the whole logits tensor on the host, so it is bracketed
+    // rather than checked inside its per-token loops.
+    options.cancellation.ThrowIfCancellationRequested();
     Tensor tokens =
         do_sample
             ? session->SampleTokens(
                   session->StageLogits(stage), sampling, options, generated)
             : session->GreedyTokens(session->StageLogits(stage));
+    options.cancellation.ThrowIfCancellationRequested();
     auto mutable_values = std::span(
         reinterpret_cast<std::int64_t*>(tokens.mutable_bytes().data()),
         tokens.element_count());
@@ -3607,6 +3748,12 @@ NamedTensors StageRun::Finish() {
     ClosedRunError();
   }
   return impl_->Finish();
+}
+
+void StageRun::RequestCancellation() noexcept {
+  if (impl_ != nullptr) {
+    impl_->RequestCancellation();
+  }
 }
 
 void StageRun::Cancel() noexcept {

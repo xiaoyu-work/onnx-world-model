@@ -19,6 +19,33 @@ outputs = model.run(
 It accepts the same `providers` and `provider_options` arguments as
 `WorldModel`.
 
+`run()` also accepts a keyword-only `cancellation` token or a `timeout` in
+seconds, which are mutually exclusive:
+
+```python
+from onnx_world_model import CancellationSource, DeadlineExceededError
+
+source = CancellationSource()
+outputs = model.run(inputs, cancellation=source.token())   # source.cancel() stops it
+
+try:
+    outputs = model.run(inputs, timeout=5.0)
+except DeadlineExceededError:
+    ...
+```
+
+The token is checked before the graph runs and after its outputs are
+validated, and the runtime terminates an in-flight `Session::Run` through a
+fresh per-call `Ort::RunOptions`. ONNX Runtime honors that flag between graph
+nodes, so a single long-running kernel finishes before the call unwinds. See
+[Cancellation and deadlines](pipeline-api.md#cancellation-and-deadlines) for
+the full contract.
+
+In C++ this is `Model::Run(inputs, cancellation)`. `ModelBackend` declares the
+cancellable overload virtually with a default implementation that checks the
+token around the historical one-argument `Run`, so an external backend keeps
+compiling and still stops at those boundaries.
+
 ## Device-aware C++ tensors
 
 The installed C++ `Tensor` API can wrap an immutable `TensorBuffer` supplied by
@@ -75,6 +102,9 @@ rollout.reset(batch_size=1)
 ```
 
 `LegacyWorldModel` is an explicit alias for `LatentDynamicsModel`.
+
+This fixed API does not accept a cancellation token in this milestone; use
+`Pipeline` and `PipelineSession` when a call must be interruptible.
 
 ## Pipeline
 

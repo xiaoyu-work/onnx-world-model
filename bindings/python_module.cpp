@@ -1,13 +1,18 @@
 /**
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
- * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, StageRun, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call and every session or run method that takes the session lock: run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, done, and iteration. A C++ Error is translated into the Python WorldModelError. PipelineSessionSnapshot and StageRun are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot() and PipelineSession.begin_stage(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync.
+ * @agent-public-api: _native module, WorldModelError, CancelledError, DeadlineExceededError, CancellationToken, CancellationSource, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, StageRun, Rollout
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call and every session or run method that takes the session lock: run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, request_cancellation, done, and iteration. A C++ Error is translated by one custom translator that maps ErrorCode::cancelled to CancelledError and ErrorCode::deadline_exceeded to DeadlineExceededError, and every other code to their common base WorldModelError, so the code rather than the message decides the Python type and existing WorldModelError handlers still catch everything. A cancellation token crosses as its own argument rather than through the scalar options dictionary, because a token is not a bool, int, float, or str. PipelineSessionSnapshot, StageRun, and CancellationToken are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot(), PipelineSession.begin_stage(), and CancellationSource.token(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync.
  * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
+#include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,6 +31,8 @@ namespace {
 
 using onnx_world_model::DataType;
 using onnx_world_model::AvailableExecutionProviders;
+using onnx_world_model::CancellationSource;
+using onnx_world_model::CancellationToken;
 using onnx_world_model::Model;
 using onnx_world_model::ModelMetadata;
 using onnx_world_model::NamedTensors;
@@ -353,13 +360,168 @@ using onnx_world_model::WorldModel;
       TensorToNumpy(output.continuation));
 }
 
+// The three exception types are owned by the module dictionary, so a
+// non-owning handle is enough here and avoids a py::object static that would
+// outlive the interpreter.
+py::handle& WorldModelErrorType() {
+  static py::handle type;
+  return type;
+}
+
+py::handle& CancelledErrorType() {
+  static py::handle type;
+  return type;
+}
+
+py::handle& DeadlineExceededErrorType() {
+  static py::handle type;
+  return type;
+}
+
+[[nodiscard]] py::handle ErrorTypeFor(onnx_world_model::ErrorCode code) {
+  switch (code) {
+    case onnx_world_model::ErrorCode::cancelled:
+      return CancelledErrorType();
+    case onnx_world_model::ErrorCode::deadline_exceeded:
+      return DeadlineExceededErrorType();
+    default:
+      return WorldModelErrorType();
+  }
+}
+
+// Replaces pybind11's generated single-type translator so the ErrorCode, not
+// the message text, decides which Python exception a failure becomes. Any
+// exception that is not an Error escapes this function, which is how pybind11
+// is told to keep looking for a translator that handles it.
+void TranslateWorldModelError(std::exception_ptr pointer) {
+  if (!pointer) {
+    return;
+  }
+  try {
+    std::rethrow_exception(pointer);
+  } catch (const onnx_world_model::Error& error) {
+    py::set_error(ErrorTypeFor(error.code()), error.what());
+  }
+}
+
+[[nodiscard]] const char* CancellationReasonName(
+    onnx_world_model::CancellationReason reason) {
+  switch (reason) {
+    case onnx_world_model::CancellationReason::none:
+      return "none";
+    case onnx_world_model::CancellationReason::cancelled:
+      return "cancelled";
+    case onnx_world_model::CancellationReason::deadline_exceeded:
+      return "deadline_exceeded";
+  }
+  throw py::value_error("Unsupported cancellation reason");
+}
+
+[[nodiscard]] CancellationSource MakeCancellationSource(
+    std::optional<double> timeout_seconds) {
+  if (!timeout_seconds.has_value()) {
+    return CancellationSource();
+  }
+  const double seconds = *timeout_seconds;
+  if (!std::isfinite(seconds)) {
+    throw py::value_error("timeout must be a finite number of seconds");
+  }
+  if (seconds < 0.0) {
+    throw py::value_error("timeout must not be negative");
+  }
+  // Milliseconds are the coarsest unit the deadline needs, but Python hands
+  // out doubles with far more range than an int64 millisecond count, so both
+  // the scaling and the cast have to saturate: `seconds * 1000.0` alone
+  // overflows the representable range for a value such as 1e300, and casting
+  // an out-of-range double to int64 is undefined. This limit is 2^63 exactly,
+  // one past the largest representable count, so any double strictly below it
+  // casts safely. Everything at or above it becomes milliseconds::max, which
+  // CancellationSource::WithTimeout saturates to the clock's furthest instant
+  // rather than wrapping into a deadline that has already passed.
+  constexpr double kMillisecondLimit =
+      static_cast<double>(std::numeric_limits<std::int64_t>::max());
+  constexpr double kSecondLimit = kMillisecondLimit / 1000.0;
+  if (seconds >= kSecondLimit) {
+    return CancellationSource::WithTimeout(std::chrono::milliseconds::max());
+  }
+  const double milliseconds = seconds * 1000.0;
+  if (milliseconds >= kMillisecondLimit) {
+    return CancellationSource::WithTimeout(std::chrono::milliseconds::max());
+  }
+  return CancellationSource::WithTimeout(
+      std::chrono::milliseconds(static_cast<std::int64_t>(milliseconds)));
+}
+
+// Scalar options and the cancellation token cross separately: a token is not
+// a bool, int, float, or str, so folding it into the options dictionary would
+// mean inventing a magic key the C++ contract does not have.
+[[nodiscard]] PipelineRunOptions PipelineOptionsFromPython(
+    const py::dict& values,
+    const std::optional<CancellationToken>& cancellation) {
+  PipelineRunOptions options = PipelineOptionsFromDictionary(values);
+  if (cancellation.has_value()) {
+    options.cancellation = *cancellation;
+  }
+  return options;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_native, module) {
   module.doc() = "Native C++ runtime for Mobius world models";
-  py::register_exception<onnx_world_model::Error>(
-      module,
-      "WorldModelError");
+  // WorldModelError stays the base of every failure this runtime raises, and
+  // the two cancellation outcomes derive from it, so existing `except
+  // WorldModelError` handlers keep catching everything they used to.
+  const py::object world_model_error =
+      py::exception<void>(module, "WorldModelError");
+  WorldModelErrorType() = world_model_error;
+  CancelledErrorType() = py::exception<void>(
+      module, "CancelledError", world_model_error.ptr());
+  DeadlineExceededErrorType() = py::exception<void>(
+      module, "DeadlineExceededError", world_model_error.ptr());
+  py::register_exception_translator(&TranslateWorldModelError);
+
+  // Opaque: only a CancellationSource hands out a token, so Python cannot
+  // fabricate one that claims to be cancellable.
+  py::class_<CancellationToken>(module, "CancellationToken")
+      .def_property_readonly(
+          "cancellable",
+          [](const CancellationToken& token) { return token.cancellable(); })
+      .def_property_readonly(
+          "cancelled",
+          [](const CancellationToken& token) { return token.cancelled(); })
+      .def_property_readonly(
+          "reason",
+          [](const CancellationToken& token) {
+            return CancellationReasonName(token.reason());
+          });
+
+  py::class_<CancellationSource>(module, "CancellationSource")
+      .def(
+          py::init([](std::optional<double> timeout_seconds) {
+            return MakeCancellationSource(timeout_seconds);
+          }),
+          py::arg("timeout_seconds") = py::none())
+      .def(
+          "token",
+          [](const CancellationSource& source) { return source.token(); })
+      .def(
+          "cancel",
+          [](CancellationSource& source) {
+            // Never blocks on a session lock, so it must stay callable while
+            // another thread runs a step with the GIL released.
+            py::gil_scoped_release release;
+            source.Cancel();
+          })
+      .def_property_readonly(
+          "cancelled",
+          [](const CancellationSource& source) { return source.cancelled(); })
+      .def_property_readonly(
+          "reason",
+          [](const CancellationSource& source) {
+            return CancellationReasonName(source.reason());
+          });
+
   module.def(
       "available_execution_providers",
       [](const std::string& ort_library_path) {
@@ -425,16 +587,21 @@ PYBIND11_MODULE(_native, module) {
           })
       .def(
           "run",
-          [](const Model& model, const py::dict& inputs) {
+          [](const Model& model,
+             const py::dict& inputs,
+             const std::optional<CancellationToken>& cancellation) {
             NamedTensors input_tensors = NamedTensorsFromDictionary(inputs);
+            const CancellationToken token =
+                cancellation.value_or(CancellationToken{});
             NamedTensors outputs;
             {
               py::gil_scoped_release release;
-              outputs = model.Run(input_tensors);
+              outputs = model.Run(input_tensors, token);
             }
             return NamedTensorsToDictionary(outputs);
           },
-          py::arg("inputs"));
+          py::arg("inputs"),
+          py::arg("cancellation") = py::none());
 
   py::class_<WorldModel>(module, "WorldModel")
       .def(
@@ -590,6 +757,14 @@ PYBIND11_MODULE(_native, module) {
             return NamedTensorsToDictionary(outputs);
           })
       .def(
+          "request_cancellation",
+          [](StageRun& run) {
+            // Deliberately takes no session lock, so a second thread can call
+            // this while step or finish is running with the GIL released.
+            py::gil_scoped_release release;
+            run.RequestCancellation();
+          })
+      .def(
           "cancel",
           [](StageRun& run) {
             py::gil_scoped_release release;
@@ -603,13 +778,14 @@ PYBIND11_MODULE(_native, module) {
              const std::string& stage,
              const py::dict& inputs,
              const py::dict& overrides,
-             const py::dict& options) {
+             const py::dict& options,
+             const std::optional<CancellationToken>& cancellation) {
             NamedTensors input_tensors =
                 NamedTensorsFromDictionary(inputs);
             NamedTensors override_tensors =
                 NamedTensorsFromDictionary(overrides);
             PipelineRunOptions run_options =
-                PipelineOptionsFromDictionary(options);
+                PipelineOptionsFromPython(options, cancellation);
             NamedTensors outputs;
             {
               py::gil_scoped_release release;
@@ -624,20 +800,22 @@ PYBIND11_MODULE(_native, module) {
           py::arg("stage"),
           py::arg("inputs") = py::dict(),
           py::arg("overrides") = py::dict(),
-          py::arg("options") = py::dict())
+          py::arg("options") = py::dict(),
+          py::arg("cancellation") = py::none())
       .def(
           "step_stage",
           [](PipelineSession& session,
              const std::string& stage,
              const py::dict& inputs,
              const py::dict& overrides,
-             const py::dict& options) {
+             const py::dict& options,
+             const std::optional<CancellationToken>& cancellation) {
             NamedTensors input_tensors =
                 NamedTensorsFromDictionary(inputs);
             NamedTensors override_tensors =
                 NamedTensorsFromDictionary(overrides);
             PipelineRunOptions run_options =
-                PipelineOptionsFromDictionary(options);
+                PipelineOptionsFromPython(options, cancellation);
             NamedTensors outputs;
             {
               py::gil_scoped_release release;
@@ -652,20 +830,22 @@ PYBIND11_MODULE(_native, module) {
           py::arg("stage"),
           py::arg("inputs") = py::dict(),
           py::arg("overrides") = py::dict(),
-          py::arg("options") = py::dict())
+          py::arg("options") = py::dict(),
+          py::arg("cancellation") = py::none())
       .def(
           "begin_stage",
           [](PipelineSession& session,
              const std::string& stage,
              const py::dict& inputs,
              const py::dict& overrides,
-             const py::dict& options) {
+             const py::dict& options,
+             const std::optional<CancellationToken>& cancellation) {
             NamedTensors input_tensors =
                 NamedTensorsFromDictionary(inputs);
             NamedTensors override_tensors =
                 NamedTensorsFromDictionary(overrides);
             PipelineRunOptions run_options =
-                PipelineOptionsFromDictionary(options);
+                PipelineOptionsFromPython(options, cancellation);
             py::gil_scoped_release release;
             return std::make_unique<StageRun>(session.BeginStage(
                 stage,
@@ -676,7 +856,8 @@ PYBIND11_MODULE(_native, module) {
           py::arg("stage"),
           py::arg("inputs") = py::dict(),
           py::arg("overrides") = py::dict(),
-          py::arg("options") = py::dict())
+          py::arg("options") = py::dict(),
+          py::arg("cancellation") = py::none())
       .def_property_readonly(
           "outputs",
           [](const PipelineSession& session) {
