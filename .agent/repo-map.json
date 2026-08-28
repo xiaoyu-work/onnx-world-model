@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T14:46:44.055Z",
+  "generatedAt": "2026-08-28T15:35:02.971Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "459ad609ab565bb1bdbe6ebe37ac518edb19189665ee2acaab880bbb31c7bbc5",
+  "sourceFingerprint": "10be8df7d26ab7f0544dc2186a4f96280d89c7c3574df4bafd28ba6411082744",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -304,12 +304,13 @@
     {
       "path": "src/cancellation.cpp",
       "kind": "source",
-      "purpose": "Implements the cancellation state machine behind CancellationToken and CancellationSource: first-reason-wins claiming, boundary deadline discovery, and the race-free callback registry that lets an in-flight ONNX Runtime call be terminated.",
+      "purpose": "Implements the cancellation state machine behind CancellationToken and CancellationSource -- first-reason-wins claiming, blocking waits, the race-free callback registry that lets an in-flight ONNX Runtime call be terminated -- and the one process-wide DeadlineService that claims a deadline on time without a thread per request.",
       "publicSymbols": [
         "CancellationToken::cancelled",
         "CancellationToken::reason",
         "CancellationToken::deadline",
         "CancellationToken::ThrowIfCancellationRequested",
+        "CancellationToken::WaitForCancellation",
         "CancellationSource::CancellationSource",
         "CancellationSource::WithDeadline",
         "CancellationSource::WithTimeout",
@@ -319,6 +320,8 @@
         "CancellationSource::cancelled",
         "CancellationSource::reason",
         "CancellationSource::deadline",
+        "CancellationSource::WaitForCancellation",
+        "detail::DeadlineService",
         "detail::CancellationState",
         "detail::CancellationAccess",
         "detail::CancellationRegistration"
@@ -327,8 +330,9 @@
     {
       "path": "src/cancellation.hpp",
       "kind": "source",
-      "purpose": "Declares the internal cancellation state, the CancellationAccess seam that lets src/ reach a token's or source's shared state, and the RAII CancellationRegistration that runs a callback when a token is cancelled.",
+      "purpose": "Declares the internal cancellation state, the process-wide DeadlineService that claims deadlines without a per-request thread, the CancellationAccess seam that lets src/ reach a token's or source's shared state, and the RAII CancellationRegistration that runs a callback when a token is cancelled.",
       "publicSymbols": [
+        "onnx_world_model::detail::DeadlineService",
         "onnx_world_model::detail::CancellationState",
         "onnx_world_model::detail::CancellationAccess",
         "onnx_world_model::detail::CancellationRegistration"
@@ -537,7 +541,7 @@
     {
       "path": "tests/cpp/cancellation_test.cpp",
       "kind": "test",
-      "purpose": "Standalone test executable for CancellationToken and CancellationSource: default inertness, first-reason-wins claiming, boundary deadline discovery, saturating timeouts across the whole millisecond range, error codes, move semantics, and the thread-safety and callback-lifetime guarantees the public API establishes.",
+      "purpose": "Standalone test executable for CancellationToken and CancellationSource: default inertness, first-reason-wins claiming, boundary deadline discovery, the shared deadline watchdog that releases a blocking WaitForCancellation, saturating timeouts across the whole millisecond range, error codes, move semantics, and the thread-safety and callback-lifetime guarantees the public API establishes.",
       "publicSymbols": [
         "main"
       ]
@@ -553,7 +557,7 @@
     {
       "path": "tests/cpp/pipeline_cancellation_test.cpp",
       "kind": "test",
-      "purpose": "Standalone test executable for pipeline cancellation and deadlines: it covers StageRun::RequestCancellation against a step that holds the session lock, externally supplied tokens, deadline_exceeded as a distinct outcome, run-slot ownership after a cancelled run, exception-safe restoration of the classifier-free guidance scratch state, and the promise that cancelling neither rolls back applied state nor materializes a device buffer.",
+      "purpose": "Standalone test executable for pipeline cancellation and deadlines: it covers StageRun::RequestCancellation against a step that holds the session lock, externally supplied tokens, deadline_exceeded as a distinct outcome, the shared deadline watchdog stopping a backend that is already blocked inside a call, run-slot ownership after a cancelled run, exception-safe restoration of the classifier-free guidance scratch state, and the promise that cancelling neither rolls back applied state nor materializes a device buffer.",
       "publicSymbols": [
         "main"
       ]
@@ -618,7 +622,7 @@
     {
       "path": "tests/python/test_cancellation.py",
       "kind": "test",
-      "purpose": "Tests the Python CancellationSource and CancellationToken wrappers, the CancelledError and DeadlineExceededError hierarchy, and the cancellation and timeout arguments on PipelineSession, StageRun, and OnnxModel.",
+      "purpose": "Tests the Python CancellationSource and CancellationToken wrappers, their blocking wait and the shared deadline watchdog behind it, the CancelledError and DeadlineExceededError hierarchy, and the cancellation and timeout arguments on PipelineSession, StageRun, and OnnxModel.",
       "publicSymbols": []
     },
     {

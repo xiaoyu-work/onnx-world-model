@@ -21,9 +21,10 @@ latent-dynamics compatibility layer.
   in a single `RunStage` call or step through a `StageRun`.
 - Stop that execution cooperatively: every boundary polls the run's
   `CancellationToken`, `StageRun::RequestCancellation` signals a step already
-  in flight without taking the session lock, and the ORT backend terminates
-  an in-flight `Session::Run` through a per-call `Ort::RunOptions`. A
-  cancellation is never a rollback.
+  in flight without taking the session lock, one shared process-wide deadline
+  watchdog claims a deadline on time so blocked work does not wait for the
+  next boundary, and the ORT backend terminates an in-flight `Session::Run`
+  through a per-call `Ort::RunOptions`. A cancellation is never a rollback.
 - Keep `Pipeline` immutable and shareable while `PipelineSession` owns one
   request's mutable state, and let a session capture that state as an
   immutable in-memory `PipelineSessionSnapshot` it can restore or fork from, or
@@ -36,7 +37,7 @@ latent-dynamics compatibility layer.
 
 | File | Responsibility |
 |---|---|
-| `cancellation.hpp/.cpp` | The cancellation state machine behind `CancellationToken` and `CancellationSource`: first-reason-wins claiming, boundary deadline discovery, the race-free callback registry, the `detail::CancellationAccess` seam, and the RAII `detail::CancellationRegistration`. |
+| `cancellation.hpp/.cpp` | The cancellation state machine behind `CancellationToken` and `CancellationSource`: first-reason-wins claiming, deadline claiming from both a poll and the one process-wide `detail::DeadlineService` watchdog, the blocking `WaitForCancellation`, the race-free callback registry, the `detail::CancellationAccess` seam, and the RAII `detail::CancellationRegistration`. |
 | `dynamic_library.hpp/.cpp` | RAII shared-library handle; binds the `OrtApi` table once per process. |
 | `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, retains I/O-bound outputs in ORT-owned device buffers, and terminates an in-flight `Session::Run` through a per-call `Ort::RunOptions`. |
 | `tensor.cpp` | Canonical tensor devices, owned CPU buffers, checked shape arithmetic, explicit CPU materialization, and copy-on-write mutation. |

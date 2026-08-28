@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Standalone test executable for pipeline cancellation and deadlines: it covers StageRun::RequestCancellation against a step that holds the session lock, externally supplied tokens, deadline_exceeded as a distinct outcome, run-slot ownership after a cancelled run, exception-safe restoration of the classifier-free guidance scratch state, and the promise that cancelling neither rolls back applied state nor materializes a device buffer.
+ * @agent-purpose: Standalone test executable for pipeline cancellation and deadlines: it covers StageRun::RequestCancellation against a step that holds the session lock, externally supplied tokens, deadline_exceeded as a distinct outcome, the shared deadline watchdog stopping a backend that is already blocked inside a call, run-slot ownership after a cancelled run, exception-safe restoration of the classifier-free guidance scratch state, and the promise that cancelling neither rolls back applied state nor materializes a device buffer.
  * @agent-public-api: main
- * @agent-invariants: Registered with CTest as pipeline_cancellation_test; it counts failures through local Check, CheckThrowsCode, and CheckThrowsState helpers and returns a non-zero exit code when any check fails. It includes public headers only, every component is a stub ModelBackend, and every PipelinePackage is built in memory from an embedded manifest string, so the run needs no ONNX Runtime library, no ONNX model, and no filesystem access. Every concurrency assertion is driven by BlockingControl's condition variable rather than by a sleep: the blocking backend signals that it entered, waits to be released, and only then checks its token, so a cancellation requested while another thread holds the session lock is observed deterministically. CountingDeviceBuffer's shared copy counter asserts that cancelling never triggers a host materialization. GuidancePromptRecorder cancels its source on its second pass -- the unconditional half of a guided step -- and records every prompt it saw, so a later step run at guidance scale 1 with no replacement inputs proves the conditional conditioning tensor was restored rather than left holding the unconditional prompt.
+ * @agent-invariants: Registered with CTest as pipeline_cancellation_test; it counts failures through local Check, CheckThrowsCode, and CheckThrowsState helpers and returns a non-zero exit code when any check fails. It includes public headers only, every component is a stub ModelBackend, and every PipelinePackage is built in memory from an embedded manifest string, so the run needs no ONNX Runtime library, no ONNX model, and no filesystem access. Every explicit-cancellation assertion is driven by BlockingControl's condition variable rather than by a sleep: the blocking backend signals that it entered, waits to be released, and only then checks its token, so a cancellation requested while another thread holds the session lock is observed deterministically. DeadlineWaitingBackend is the opposite case on purpose -- it parks on CancellationToken::WaitForCancellation and never polls -- so only a watchdog claim can return from that component pass; RunBounded gives those two tests a two-second ceiling and cancels their source if it is exhausted, so a broken watchdog fails rather than hanging CTest. CountingDeviceBuffer's shared copy counter asserts that cancelling never triggers a host materialization. GuidancePromptRecorder cancels its source on its second pass -- the unconditional half of a guided step -- and records every prompt it saw, so a later step run at guidance scale 1 with no replacement inputs proves the conditional conditioning tensor was restored rather than left holding the unconditional prompt.
  * @agent-side-effects: Writes failure descriptions to stderr.
  */
 
@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -202,6 +203,62 @@ class BlockingCancellableBackend final
         result.element_count());
     value[0] += 1.0F;
     return {{"next_state", std::move(result)}};
+  }
+
+ private:
+  ModelMetadata metadata_;
+  std::shared_ptr<BlockingControl> control_;
+};
+
+// Stands in for a backend that blocks with no boundary of its own -- a long
+// ONNX Runtime call, or a wait on an external event. It announces that it
+// entered and then parks on the token itself. Nothing here polls: no
+// reason(), no cancelled(), no loop. The only thing that can return from this
+// call is a claim made by another thread, which is exactly what the shared
+// deadline watchdog is for.
+class DeadlineWaitingBackend final : public onnx_world_model::ModelBackend {
+ public:
+  explicit DeadlineWaitingBackend(std::shared_ptr<BlockingControl> control)
+      : control_(std::move(control)) {
+    metadata_.inputs.push_back({
+        .name = "state",
+        .data_type = DataType::float32,
+        .shape = {1},
+    });
+    metadata_.outputs.push_back({
+        .name = "next_state",
+        .data_type = DataType::float32,
+        .shape = {1},
+    });
+  }
+
+  [[nodiscard]] const ModelMetadata& metadata() const noexcept override {
+    return metadata_;
+  }
+
+  [[nodiscard]] NamedTensors Run(const NamedTensors&) const override {
+    // Parking on a token nothing can cancel would never return, so this
+    // backend refuses the uncancellable overload outright. PipelineSession
+    // always calls the cancellable one.
+    throw onnx_world_model::Error(
+        ErrorCode::invalid_argument,
+        "Deadline-waiting backend requires a cancellable token");
+  }
+
+  [[nodiscard]] NamedTensors Run(
+      const NamedTensors& inputs,
+      const CancellationToken& cancellation) const override {
+    {
+      std::scoped_lock lock(control_->mutex);
+      ++control_->calls;
+      control_->entered = true;
+    }
+    control_->condition.notify_all();
+    (void)cancellation.WaitForCancellation();
+    // Reached only once the run was stopped, so this throws the reason the
+    // watchdog or the caller claimed.
+    cancellation.ThrowIfCancellationRequested();
+    return {{"next_state", inputs.at("state")}};
   }
 
  private:
@@ -588,6 +645,15 @@ class GuidancePromptRecorder final : public onnx_world_model::ModelBackend {
   models.emplace(
       "counter",
       Model(std::make_shared<BlockingCancellableBackend>(control)));
+  return Pipeline(PipelinePackage(
+      {}, PipelineManifest::Parse(kIterativeManifest), std::move(models)));
+}
+
+[[nodiscard]] Pipeline MakeDeadlineWaitingPipeline(
+    const std::shared_ptr<BlockingControl>& control) {
+  std::unordered_map<std::string, Model> models;
+  models.emplace(
+      "counter", Model(std::make_shared<DeadlineWaitingBackend>(control)));
   return Pipeline(PipelinePackage(
       {}, PipelineManifest::Parse(kIterativeManifest), std::move(models)));
 }
@@ -984,6 +1050,96 @@ void TestModelRunHonorsTheDefaultBackendOverload() {
       "Model::Run reports an expired deadline as deadline_exceeded");
 }
 
+// Long enough that ordinary scheduling noise cannot exhaust it, short enough
+// that a watchdog that never fires fails the run quickly instead of hanging
+// CTest.
+constexpr std::chrono::seconds kRunBudget{2};
+
+// Runs `work` on another thread with a hard time bound. If the budget is
+// exhausted the failure is recorded and `source` is cancelled, which is the
+// only other thing that can release a backend parked on its token, so the
+// worker is always joinable.
+template <typename Function>
+void RunBounded(
+    Function&& work,
+    CancellationSource& source,
+    const char* message) {
+  std::future<void> worker =
+      std::async(std::launch::async, std::forward<Function>(work));
+  if (worker.wait_for(kRunBudget) != std::future_status::ready) {
+    Check(false, message);
+    source.Cancel();
+  }
+  worker.get();
+}
+
+// The claim this milestone exists to make: a backend that is already inside a
+// call, blocked, with no boundary left to poll, is stopped by the deadline
+// itself rather than by the next thing that happens to look at the token.
+void TestAWatchdogDeadlineUnblocksARunStageInFlight() {
+  auto control = std::make_shared<BlockingControl>();
+  const Pipeline pipeline = MakeDeadlineWaitingPipeline(control);
+  PipelineSession session = pipeline.CreateSession();
+  CancellationSource source =
+      CancellationSource::WithTimeout(std::chrono::milliseconds{20});
+
+  std::optional<ErrorCode> observed;
+  RunBounded(
+      [&session, &source, &observed] {
+        try {
+          (void)session.RunStage(
+              "iterate", {}, {}, OptionsWith(source.token()));
+        } catch (const onnx_world_model::Error& error) {
+          observed = error.code();
+        }
+      },
+      source,
+      "A deadline unblocks a RunStage whose backend is parked on its token");
+
+  Check(
+      observed.has_value() && *observed == ErrorCode::deadline_exceeded,
+      "An in-flight blocking backend is stopped with deadline_exceeded");
+  Check(
+      Calls(*control) == 1,
+      "The blocked component pass ran exactly once");
+  // The failing drain released the slot, so the session is usable again.
+  StageRun fresh = session.BeginStage("iterate");
+  Check(
+      !fresh.done(),
+      "A run stopped by its deadline frees the session's run slot");
+  fresh.Cancel();
+}
+
+void TestAWatchdogDeadlineUnblocksAStageRunInFlight() {
+  auto control = std::make_shared<BlockingControl>();
+  const Pipeline pipeline = MakeDeadlineWaitingPipeline(control);
+  PipelineSession session = pipeline.CreateSession();
+  CancellationSource source =
+      CancellationSource::WithTimeout(std::chrono::milliseconds{20});
+  StageRun run =
+      session.BeginStage("iterate", {}, {}, OptionsWith(source.token()));
+
+  std::optional<ErrorCode> observed;
+  RunBounded(
+      [&run, &observed] {
+        try {
+          (void)run.Step();
+        } catch (const onnx_world_model::Error& error) {
+          observed = error.code();
+        }
+      },
+      source,
+      "A deadline unblocks a Step whose backend is parked on its token");
+
+  Check(
+      observed.has_value() && *observed == ErrorCode::deadline_exceeded,
+      "An incremental step is stopped by the same watchdog claim");
+  Check(run.done(), "A run stopped by its deadline reports itself done");
+  Check(
+      source.reason() == CancellationReason::deadline_exceeded,
+      "The caller's own source records that its deadline is what fired");
+}
+
 }  // namespace
 
 int main() {
@@ -999,6 +1155,8 @@ int main() {
   TestCancellingNeverMaterializesADeviceBuffer();
   TestCancelledUnconditionalPassRestoresConditionalState();
   TestModelRunHonorsTheDefaultBackendOverload();
+  TestAWatchdogDeadlineUnblocksARunStageInFlight();
+  TestAWatchdogDeadlineUnblocksAStageRunInFlight();
 
   if (failures != 0) {
     std::cerr << failures << " pipeline cancellation checks failed\n";

@@ -59,9 +59,11 @@ There is no server, database, or outbound network call at run time.
 Within `src/` the runtime is layered:
 
 - `cancellation` owns the state behind `CancellationToken` and
-  `CancellationSource`: the claimed reason, the immutable deadline, and the
+  `CancellationSource`: the claimed reason, the immutable deadline, the
   callback registry that lets a cancelling thread reach into work already
-  running.
+  running, the blocking `WaitForCancellation`, and the one process-wide
+  deadline watchdog that claims a deadline on time without a thread per
+  request.
 - `dynamic_library` loads the ORT shared library and binds `OrtApi` once per
   process.
 - `ort_backend` is the only other translation unit that touches ORT; it owns
@@ -157,8 +159,21 @@ through the same path a failure takes: the run slot is released, the handle
 closes, and everything already applied stays applied. `RequestCancellation`
 never takes the session lock, so it is the one operation a second thread can
 perform while a step holds it; `Cancel()` does take the lock and only closes
-the handle. In this milestone a deadline is discovered by whichever thread
-polls next, so nothing fires it while one long ONNX Runtime call is blocked.
+the handle.
+
+A deadline no longer waits for a boundary. `CancellationSource::WithDeadline`
+arms any still-future deadline on one lazily created, process-wide watchdog:
+a single detached thread over a `multimap` of deadlines that holds each state
+weakly, sleeps until the earliest one, and then claims `deadline_exceeded`
+itself. There is no thread per request and no per-request timer; a source that
+is destroyed or claimed early disarms its own entry, and a deadline that was
+already due when the source was created is deliberately left to the next poll
+so an immediate `Cancel()` can still win the first-reason race. That claim is
+what releases `CancellationToken::WaitForCancellation`, the blocking wait work
+with no boundary of its own uses instead of polling, and what fires the ORT
+termination callback while a `Session::Run` is in flight. ONNX Runtime checks
+that flag between graph nodes, so a single long-running kernel still finishes
+before the call unwinds.
 
 A session has one run slot, held from `BeginStage` until the run completes, is
 cancelled, or is dropped. While it is held, `BeginStage`, `RunStage`,
@@ -225,7 +240,8 @@ Python:
 - `onnx_world_model.CancellationSource` and `CancellationToken` — explicit
   cancellation and deadlines, with `CancelledError` and
   `DeadlineExceededError` as the outcomes, both derived from
-  `WorldModelError`.
+  `WorldModelError`, plus the blocking `wait()` that releases the GIL until a
+  reason is claimed.
 - `onnx_world_model.OnnxModel` — one ONNX graph with named tensors.
 - `onnx_world_model.LatentDynamicsModel` and `Rollout` — the fixed
   latent-dynamics API.
@@ -244,7 +260,8 @@ C++:
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
 - `onnx_world_model::Model::Load` and `Model::Run`, whose cancellable overload
   takes a `CancellationToken`.
-- `onnx_world_model::CancellationSource` and `CancellationToken`, plus
+- `onnx_world_model::CancellationSource` and `CancellationToken`, whose
+  `WaitForCancellation` blocks until a reason is claimed, plus
   `StageRun::RequestCancellation` for stopping work already running.
 - `onnx_world_model::WorldModel::Load`, `WorldModel::Step`, and `Rollout`.
 
@@ -274,7 +291,13 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   already applied in place; a caller who wants to rewind takes a snapshot or a
   checkpoint first. `StageRun::RequestCancellation` signals in-flight work and
   takes no session lock, while `StageRun::Cancel` takes the lock and only
-  closes the handle.
+  closes the handle. `CancellationToken::WaitForCancellation` blocks without
+  polling and reports the claimed reason rather than throwing it.
+- **One deadline watchdog for the process.** Deadlines are claimed by one
+  lazily created, immortal service with a single detached worker, never by a
+  thread or timer per request. It holds each state weakly, so arming a
+  deadline never keeps a source alive, and it never runs a callback, a state
+  destructor, or its own singleton accessor while holding its schedule lock.
 - **Validate at the boundary.** `Model::Run` checks every input and output
   tensor; manifest semantics are validated once at load time.
 - **Ownership split.** `Pipeline` is immutable and shareable; `PipelineSession`
@@ -328,14 +351,14 @@ execution is synchronous and single-consumer, and snapshotting a session
 mid-run is not included.
 
 Cancellation and deadlines cover `PipelineSession`, `StageRun`, and the
-generic `Model`. Three limits are deliberate and documented rather than
+generic `Model`. Two limits are deliberate and documented rather than
 hidden:
 
-- Deadlines are enforced only at execution boundaries. Nothing fires one while
-  a single ONNX Runtime call is blocked; the next commit adds one process-wide
-  deadline service that does.
-- ONNX Runtime checks its termination flag between graph nodes, so a single
-  long-running kernel finishes before a cancelled call unwinds.
+- One shared process-wide watchdog claims every armed deadline, so a deadline
+  fires while work is blocked rather than at the next boundary. Inside an
+  ONNX Runtime call that claim reaches ORT's termination flag, which ORT
+  checks between graph nodes, so a single long-running kernel can overrun the
+  deadline by however long that one kernel takes.
 - The high-level modality APIs on `WorldModel` and the fixed
   `LatentDynamicsModel`, `WorldModel::Step`, and `Rollout` surfaces take no
   token yet.

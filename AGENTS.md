@@ -76,7 +76,7 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 8 of 8 passing; `pytest` reports 123 passed
+Expected baseline: `ctest` reports 8 of 8 passing; `pytest` reports 129 passed
 and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
@@ -98,7 +98,10 @@ C++ changes require `cmake --build --preset dev` before `ctest`, and a
   so a new outcome is a new `ErrorCode`, never a message-text check.
 - Cancellation is cooperative: poll `PipelineRunOptions::cancellation` at
   operation boundaries, never inside per-element loops, and never roll back
-  what a cancelled call already applied.
+  what a cancelled call already applied. Deadlines are claimed by the one
+  process-wide watchdog in `src/cancellation.cpp`; do not add a thread or a
+  timer per request, and do not make work block on a token without going
+  through `CancellationToken::WaitForCancellation`.
 - Keep ONNX Runtime headers confined to `src/dynamic_library.cpp` and
   `src/ort_backend.cpp`, and keep them out of `include/onnx_world_model/`.
 - Internal C++ helpers belong in `onnx_world_model::detail` in a non-installed

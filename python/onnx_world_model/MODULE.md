@@ -25,8 +25,10 @@ expects.
 - Expose cooperative cancellation and per-call deadlines: a keyword-only
   `cancellation` token or `timeout` in seconds on the pipeline and model
   entry points, `StageRun.request_cancellation` for stopping work already
-  running, and the `CancelledError` and `DeadlineExceededError` subclasses of
-  `WorldModelError`.
+  running, the blocking `CancellationToken.wait` and `CancellationSource.wait`
+  that release the GIL until an explicit cancel or the shared native deadline
+  watchdog claims a reason, and the `CancelledError` and
+  `DeadlineExceededError` subclasses of `WorldModelError`.
 
 ## Key Files
 

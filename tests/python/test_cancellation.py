@@ -4,19 +4,23 @@ The token, source, and exception tests need no package and no optional
 dependency, so they always run. The pipeline tests build a small counter
 package in-process with ``onnx_ir`` and cancel at step boundaries rather than
 racing a graph that finishes in microseconds, so nothing here is timing
-dependent.
+dependent. The blocking-wait tests are bounded by a worker thread and a
+generous safety-net deadline, so a watchdog that never fires fails the suite
+instead of hanging it.
 """
 
 # @agent-file
-# @agent-purpose: Tests the Python CancellationSource and CancellationToken wrappers, the CancelledError and DeadlineExceededError hierarchy, and the cancellation and timeout arguments on PipelineSession, StageRun, and OnnxModel.
+# @agent-purpose: Tests the Python CancellationSource and CancellationToken wrappers, their blocking wait and the shared deadline watchdog behind it, the CancelledError and DeadlineExceededError hierarchy, and the cancellation and timeout arguments on PipelineSession, StageRun, and OnnxModel.
 # @agent-public-api: none
-# @agent-invariants: The source, token, exception-hierarchy, and mutual-exclusion tests use no package and no optional dependency, so they always run. The pipeline tests build their graph in-process with `pytest.importorskip("onnx_ir")` and never need the Mobius exporter. Cancellation is always requested at a step boundary or before a call, never by racing an in-flight graph, so no assertion depends on timing. A cancelled run must leave the state it already applied in place and must free the session's run slot, a `timeout` and a `cancellation` token may never be supplied together, and any finite non-negative `timeout` -- including one far past the steady clock's range -- must saturate rather than become an already-expired deadline.
-# @agent-side-effects: Writes ONNX models and package files into pytest temporary directories and runs ONNX Runtime inference.
+# @agent-invariants: The source, token, wait, exception-hierarchy, and mutual-exclusion tests use no package and no optional dependency, so they always run. The pipeline tests build their graph in-process with `pytest.importorskip("onnx_ir")` and never need the Mobius exporter. Cancellation is always requested at a step boundary or before a call, never by racing an in-flight graph, so no assertion depends on timing. Every `wait` runs on a worker thread through `_wait_bounded`, whose source is cancelled once its budget is exhausted, and the GIL test carries a long safety-net deadline, so no test can hang the suite and none asserts an upper bound on watchdog latency. A cancelled run must leave the state it already applied in place and must free the session's run slot, a `timeout` and a `cancellation` token may never be supplied together, and any finite non-negative `timeout` -- including one far past the steady clock's range -- must saturate rather than become an already-expired deadline.
+# @agent-side-effects: Writes ONNX models and package files into pytest temporary directories, runs ONNX Runtime inference, and starts short-lived worker threads that block on a cancellation token.
 
 from __future__ import annotations
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -227,6 +231,111 @@ def test_cancellation_errors_derive_from_world_model_error() -> None:
     assert issubclass(CancelledError, WorldModelError)
     assert issubclass(DeadlineExceededError, WorldModelError)
     assert CancelledError is not DeadlineExceededError
+
+
+# --- Blocking waits and the shared deadline watchdog ------------------------
+
+_WAIT_BUDGET = 5.0
+
+
+def _wait_bounded(source: CancellationSource, wait: Any) -> str:
+    """Run ``wait`` on a worker thread with a hard time bound.
+
+    A watchdog that never fires must fail the suite rather than hang it, so an
+    exhausted budget cancels ``source`` — the only other thing that can
+    release the waiter — and then reports the failure.
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(wait)
+        try:
+            return str(future.result(timeout=_WAIT_BUDGET))
+        except FutureTimeoutError:
+            source.cancel()
+            future.result(timeout=_WAIT_BUDGET)
+            raise AssertionError("wait was never released") from None
+
+
+def test_a_timeout_wakes_a_waiting_thread() -> None:
+    """Nothing polls the token, so only the watchdog can release the wait."""
+    source = CancellationSource(timeout=0.02)
+    token = source.token()
+
+    assert _wait_bounded(source, token.wait) == "deadline_exceeded"
+    assert token.reason == "deadline_exceeded"
+    assert source.reason == "deadline_exceeded"
+
+
+def test_a_source_can_be_waited_on_directly() -> None:
+    source = CancellationSource(timeout=0.02)
+
+    assert _wait_bounded(source, source.wait) == "deadline_exceeded"
+
+
+def test_waiting_on_an_already_stopped_source_returns_immediately() -> None:
+    cancelled = CancellationSource()
+    cancelled.cancel()
+    expired = CancellationSource(timeout=0)
+
+    assert _wait_bounded(cancelled, cancelled.token().wait) == "cancelled"
+    assert _wait_bounded(expired, expired.token().wait) == "deadline_exceeded"
+
+
+def test_cancel_wakes_a_waiting_thread() -> None:
+    """An explicit cancel from another thread releases a blocked waiter."""
+    source = CancellationSource()
+    token = source.token()
+    waiting = threading.Event()
+
+    def waiter() -> str:
+        waiting.set()
+        return token.wait()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(waiter)
+        assert waiting.wait(timeout=_WAIT_BUDGET)
+        source.cancel()
+        assert future.result(timeout=_WAIT_BUDGET) == "cancelled"
+
+
+def test_wait_releases_the_gil() -> None:
+    """A blocked wait must leave the interpreter usable by other threads.
+
+    The deadline here is only a safety net: if ``wait`` held the GIL the main
+    thread below could never run, and this would deadlock rather than fail.
+    """
+    source = CancellationSource(timeout=30.0)
+    token = source.token()
+    waiting = threading.Event()
+
+    def waiter() -> str:
+        waiting.set()
+        return token.wait()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(waiter)
+            assert waiting.wait(timeout=_WAIT_BUDGET)
+            # Ordinary Python work executed while the worker is blocked.
+            executed = sum(1 for _ in range(10_000))
+            source.cancel()
+            assert future.result(timeout=_WAIT_BUDGET) == "cancelled"
+    finally:
+        source.cancel()
+
+    assert executed == 10_000
+
+
+def test_a_cancel_before_a_deadline_is_not_demoted_by_it() -> None:
+    """A later deadline firing proves the earlier one passed without demoting."""
+    cancelled = CancellationSource(timeout=0.04)
+    token = cancelled.token()
+    cancelled.cancel()
+
+    assert _wait_bounded(cancelled, token.wait) == "cancelled"
+
+    sentinel = CancellationSource(timeout=0.08)
+    assert _wait_bounded(sentinel, sentinel.token().wait) == "deadline_exceeded"
+    assert token.reason == "cancelled"
 
 
 # --- Pipeline cancellation --------------------------------------------------

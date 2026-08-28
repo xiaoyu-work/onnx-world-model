@@ -4,8 +4,8 @@
  * @agent-file
  * @agent-purpose: Declares explicit cancellation and deadline support: the CancellationReason taxonomy, the copyable observer CancellationToken, and the move-only CancellationSource that owns the cancellable state.
  * @agent-public-api: CancellationReason, CancellationToken, CancellationSource
- * @agent-invariants: A default-constructed CancellationToken owns no state, is never cancellable, and never throws; only a CancellationSource produces a cancellable token. A source's optional deadline is fixed at construction and never changes. The first non-none reason wins: an explicit Cancel() after a deadline was already observed leaves the reason deadline_exceeded, and a deadline that passes after Cancel() leaves it cancelled. Cancel() is noexcept and safe to call from any thread, including while another thread blocks inside the work the token guards. Deadlines are enforced where a token is polled -- ThrowIfCancellationRequested, cancelled(), and reason() all claim deadline_exceeded when the deadline has passed -- so this milestone fires a deadline at execution boundaries rather than from a background timer. A moved-from source owns no state, so its token is the never-cancellable token and its Cancel() does nothing.
- * @agent-side-effects: Cancel(), and a poll that observes a passed deadline, run the callbacks internal consumers registered on the state; those callbacks never escape an exception.
+ * @agent-invariants: A default-constructed CancellationToken owns no state, is never cancellable, and never throws; only a CancellationSource produces a cancellable token. A source's optional deadline is fixed at construction and never changes. The first non-none reason wins: an explicit Cancel() after a deadline was already observed leaves the reason deadline_exceeded, and a deadline that passes after Cancel() leaves it cancelled. Cancel() is noexcept and safe to call from any thread, including while another thread blocks inside the work the token guards. A deadline is enforced two ways that claim the same state: every poll -- ThrowIfCancellationRequested, cancelled(), and reason() -- claims deadline_exceeded once the deadline has passed, and one shared process-wide watchdog claims it at the deadline even when nothing polls, which is what releases WaitForCancellation. WaitForCancellation blocks without polling, returns the claimed reason rather than throwing it, and rejects a token or source that owns no state with ErrorCode::invalid_argument instead of blocking forever. A moved-from source owns no state, so its token is the never-cancellable token and its Cancel() does nothing.
+ * @agent-side-effects: Cancel(), a poll that observes a passed deadline, and the shared watchdog run the callbacks internal consumers registered on the state; those callbacks never escape an exception. WaitForCancellation blocks the calling thread.
  */
 
 #include <chrono>
@@ -50,8 +50,8 @@ class CancellationToken {
     return state_ != nullptr;
   }
   //: True once this token's source was cancelled or its deadline passed.
-  //: Polling is what discovers a passed deadline in this milestone, so this
-  //: can become true without any other thread doing anything.
+  //: A deadline becomes visible here either because this poll claimed it or
+  //: because the shared watchdog already did.
   [[nodiscard]] bool cancelled() const noexcept;
   //: The first reason that was claimed, or `none` while the work may proceed.
   [[nodiscard]] CancellationReason reason() const noexcept;
@@ -63,6 +63,17 @@ class CancellationToken {
   //: when this token has a reason, and returns otherwise. This is the check
   //: every cancellable operation makes at its own boundaries.
   void ThrowIfCancellationRequested() const;
+  //: Blocks until this token has a reason and returns it. This is how work
+  //: that has no boundary of its own -- a backend parked on an external
+  //: event -- waits to be stopped without burning a thread on polling: an
+  //: explicit Cancel() or the shared deadline watchdog releases it.
+  //:
+  //: It reports the reason rather than throwing it, so a caller decides
+  //: whether to unwind; ThrowIfCancellationRequested() is still the boundary
+  //: check. A token that is not cancellable could never be released, so
+  //: waiting on one throws ErrorCode::invalid_argument instead of blocking
+  //: forever.
+  [[nodiscard]] CancellationReason WaitForCancellation() const;
 
  private:
   explicit CancellationToken(
@@ -114,6 +125,10 @@ class CancellationSource {
   [[nodiscard]] CancellationReason reason() const noexcept;
   [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> deadline()
       const noexcept;
+  //: Blocks until this source has a reason and returns it, exactly as
+  //: token().WaitForCancellation() does. A moved-from source owns no state
+  //: and therefore throws ErrorCode::invalid_argument.
+  [[nodiscard]] CancellationReason WaitForCancellation() const;
 
  private:
   explicit CancellationSource(

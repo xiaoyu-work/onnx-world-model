@@ -448,10 +448,23 @@ The rules the API guarantees:
   step. Inside one ONNX Runtime call the runtime terminates the run through a
   fresh per-call `Ort::RunOptions`, which ONNX Runtime honors *between graph
   nodes* — a single long-running kernel still finishes first.
-- **Deadlines are polled, not timed.** In this milestone a deadline is
-  discovered by whichever thread reaches the next boundary, so nothing fires
-  one while a single ONNX Runtime call is blocked. A process-wide deadline
-  service that does is the next milestone.
+- **Deadlines fire on time, from one shared watchdog.** A deadline still in
+  the future is armed on a single lazily started, process-wide watchdog
+  thread. There is no thread and no timer per request: it holds every armed
+  source weakly, sleeps until the earliest deadline, and claims it there. So a
+  deadline stops work that is already blocked inside an ONNX Runtime call
+  rather than waiting for the next boundary — bounded only by ORT's
+  between-nodes termination check, so a single long kernel can overrun it. A
+  deadline that has *already* passed when the source is created is left to the
+  next poll instead, which is what lets `source.cancel()` immediately after
+  `CancellationSource(timeout=0)` still win the first-reason race.
+- **`wait()` blocks without polling.** `CancellationToken.wait()` and
+  `CancellationSource.wait()` block until a reason is claimed and return it —
+  `"cancelled"` or `"deadline_exceeded"` — rather than raising. They release
+  the GIL, so another Python thread can still cancel, and they are what work
+  with no boundary of its own uses instead of a polling loop. Waiting on a
+  token nothing can cancel raises `WorldModelError` instead of blocking
+  forever.
 - **One deadline per `run()`.** `PipelineSession.run(..., timeout=...)` builds
   its source once, so a single absolute deadline covers the whole stage
   sequence rather than restarting at each stage.
@@ -672,6 +685,25 @@ a cancellable token can only come from a `CancellationSource`. The source is
 move-only; the token is copyable and observes the same state. `Cancel()` is
 `noexcept` and safe from any thread.
 
+`CancellationToken::WaitForCancellation()` blocks until a reason is claimed and
+returns it, so a backend with no boundary of its own can park on the token
+instead of polling:
+
+```cpp
+NamedTensors MyBackend::Run(
+    const NamedTensors& inputs,
+    const CancellationToken& cancellation) const {
+  StartTheWork();
+  (void)cancellation.WaitForCancellation();   // released by cancel or deadline
+  cancellation.ThrowIfCancellationRequested();
+  ...
+}
+```
+
+It reports the reason rather than throwing it, and it rejects a token that is
+not cancellable with `ErrorCode::invalid_argument` instead of blocking forever.
+`CancellationSource::WaitForCancellation()` is the same wait for the owner.
+
 `Model::Run` has a second overload that takes a token, and `ModelBackend::Run`
 has a virtual cancellable overload whose default implementation checks the
 token before and after the historical one-argument `Run`. An external backend
@@ -692,10 +724,11 @@ Runtime backend does.
   in-memory transaction support, not paged KV attention: nothing is serialized
   to disk and nothing crosses a process boundary.
 - Explicit cancellation and deadlines on stage execution and generic model
-  execution, enforced at execution boundaries and inside an ONNX Runtime call
-  at graph-node granularity. A background deadline service, and cancellation
-  on the `WorldModel` modality APIs and the fixed latent-dynamics API, are not
-  included.
+  execution, enforced at execution boundaries, by one shared process-wide
+  deadline watchdog, and inside an ONNX Runtime call at graph-node
+  granularity — so a single long-running kernel can overrun its deadline.
+  Cancellation on the `WorldModel` modality APIs and the fixed
+  latent-dynamics API is not included.
 - FlowMatch Euler and flow-prediction UniPC order-1/order-2 schedulers.
 - Greedy and temperature/top-k/top-p autoregressive sampling.
 - Packed layout, attention masks, multimodal positions, scheduler timesteps,

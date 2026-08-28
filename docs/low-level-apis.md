@@ -36,15 +36,20 @@ except DeadlineExceededError:
 
 The token is checked before the graph runs and after its outputs are
 validated, and the runtime terminates an in-flight `Session::Run` through a
-fresh per-call `Ort::RunOptions`. ONNX Runtime honors that flag between graph
-nodes, so a single long-running kernel finishes before the call unwinds. See
+fresh per-call `Ort::RunOptions`. A deadline reaches that termination callback
+from one shared process-wide watchdog rather than from the next boundary, so a
+`timeout` stops a call that is already blocked. ONNX Runtime honors the flag
+between graph nodes, so a single long-running kernel still finishes before the
+call unwinds. See
 [Cancellation and deadlines](pipeline-api.md#cancellation-and-deadlines) for
 the full contract.
 
 In C++ this is `Model::Run(inputs, cancellation)`. `ModelBackend` declares the
 cancellable overload virtually with a default implementation that checks the
 token around the historical one-argument `Run`, so an external backend keeps
-compiling and still stops at those boundaries.
+compiling and still stops at those boundaries. A backend that can block with no
+boundary of its own can park on `CancellationToken::WaitForCancellation()`
+instead of polling.
 
 ## Device-aware C++ tensors
 

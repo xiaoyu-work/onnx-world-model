@@ -69,7 +69,10 @@ C++ API ───────────────┤                  │
   `StageRun.request_cancellation()` from another thread to stop a step already
   running. The interrupted call raises `CancelledError` or
   `DeadlineExceededError` — both subclasses of `WorldModelError` — releases
-  the session, and keeps everything it already applied.
+  the session, and keeps everything it already applied. A deadline is claimed
+  by one shared background watchdog, so it fires while work is blocked rather
+  than at the next boundary, and `CancellationToken.wait()` blocks — with the
+  GIL released — until that happens.
 - `PipelineSession.snapshot()` captures all of that mutable state in memory,
   and `restore()` and `fork()` rewind or branch a trajectory from it without
   copying tensor data or leaving the process. `checkpoint(name)`,
@@ -224,8 +227,9 @@ Low-level tensor and stage execution is documented in the
 - Image-to-video conditioning and classifier-free guidance for packages that
   declare them; output media encoding is not yet included.
 - Explicit cancellation and deadlines on `PipelineSession`, `StageRun`, and
-  `OnnxModel`. Deadlines are checked at execution boundaries, so nothing fires
-  one while a single ONNX Runtime call is blocked; ONNX Runtime itself only
-  stops between graph nodes; and the `WorldModel` modality `generate()` methods
+  `OnnxModel`. One shared process-wide watchdog claims every deadline, so one
+  fires while a call is blocked rather than at the next boundary; inside ONNX
+  Runtime that claim is honored between graph nodes, so a single long kernel
+  can overrun the deadline; and the `WorldModel` modality `generate()` methods
   and the fixed `LatentDynamicsModel` API do not take a token yet.
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

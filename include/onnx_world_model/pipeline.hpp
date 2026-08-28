@@ -280,10 +280,11 @@ struct StageEvent {
 //: before and after each component, transform, guidance pass, and sampling
 //: step, and inside the ONNX Runtime call, which ONNX Runtime can only
 //: interrupt between graph nodes. A deadline supplied through
-//: PipelineRunOptions::cancellation is enforced at those same boundaries; in
-//: this milestone nothing fires it while one long ONNX Runtime call is
-//: blocked. Concurrent calls on one handle serialize on the session lock and
-//: only one of them advances the run.
+//: PipelineRunOptions::cancellation is enforced at those same boundaries and,
+//: independently, by the shared deadline watchdog, so it also stops a call
+//: that is already blocked; a single long-running ONNX Runtime kernel is the
+//: one thing that can still overrun it. Concurrent calls on one handle
+//: serialize on the session lock and only one of them advances the run.
 //:
 //: A session has one run slot. While this run holds it the session throws
 //: ErrorCode::state from every execution and state-mutating method --

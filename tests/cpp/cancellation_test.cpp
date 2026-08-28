@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Standalone test executable for CancellationToken and CancellationSource: default inertness, first-reason-wins claiming, boundary deadline discovery, saturating timeouts across the whole millisecond range, error codes, move semantics, and the thread-safety and callback-lifetime guarantees the public API establishes.
+ * @agent-purpose: Standalone test executable for CancellationToken and CancellationSource: default inertness, first-reason-wins claiming, boundary deadline discovery, the shared deadline watchdog that releases a blocking WaitForCancellation, saturating timeouts across the whole millisecond range, error codes, move semantics, and the thread-safety and callback-lifetime guarantees the public API establishes.
  * @agent-public-api: main
- * @agent-invariants: Registered with CTest as cancellation_test; it counts failures through local Check and CheckThrowsCode helpers and returns a non-zero exit code when any check fails. It includes public headers only and touches no filesystem, no ONNX Runtime library, and no model, so it always runs. Every concurrency assertion is driven by a condition variable or a joined thread rather than by a sleep, so the file has no timing-dependent result.
+ * @agent-invariants: Registered with CTest as cancellation_test; it counts failures through local Check and CheckThrowsCode helpers and returns a non-zero exit code when any check fails. It includes public headers only and touches no filesystem, no ONNX Runtime library, and no model, so it always runs. No assertion sleeps and none asserts an upper bound on latency: every wait runs on a separate thread through WaitBounded, which fails and then cancels its source if the watchdog has not fired within two seconds, so a broken watchdog reports a failure instead of hanging CTest. The only timing assertions are lower bounds -- a waiter never reports before its own deadline -- and "a later deadline already fired" is used in place of sleeping to prove an earlier reason was not overwritten.
  * @agent-side-effects: Writes failure descriptions to stderr.
  */
 
@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -25,6 +26,12 @@ using onnx_world_model::CancellationReason;
 using onnx_world_model::CancellationSource;
 using onnx_world_model::CancellationToken;
 using onnx_world_model::ErrorCode;
+
+using Clock = std::chrono::steady_clock;
+
+// Long enough that an ordinary scheduling hiccup cannot exhaust it, short
+// enough that a broken watchdog fails the run quickly.
+constexpr std::chrono::seconds kWaitBudget{2};
 
 int failures = 0;
 
@@ -49,6 +56,37 @@ void CheckThrowsCode(
       ++failures;
     }
   }
+}
+
+// What a bounded wait observed: whether it finished inside the budget, the
+// reason it reported, and when it came back.
+struct WaitOutcome {
+  bool completed{false};
+  CancellationReason reason{CancellationReason::none};
+  Clock::time_point woke{};
+};
+
+// Waits on `token` from another thread with a hard time bound. A watchdog
+// that never fires must not hang CTest, so an exhausted budget records the
+// failure and then cancels `source` to release the waiter before joining it.
+[[nodiscard]] WaitOutcome WaitBounded(
+    const CancellationToken& token,
+    CancellationSource& source,
+    const char* message) {
+  std::future<WaitOutcome> waiter = std::async(std::launch::async, [token] {
+    WaitOutcome outcome;
+    outcome.reason = token.WaitForCancellation();
+    outcome.woke = Clock::now();
+    outcome.completed = true;
+    return outcome;
+  });
+  if (waiter.wait_for(kWaitBudget) != std::future_status::ready) {
+    Check(false, message);
+    source.Cancel();
+    (void)waiter.get();
+    return WaitOutcome{};
+  }
+  return waiter.get();
 }
 
 void TestDefaultTokenIsInert() {
@@ -305,6 +343,164 @@ void TestCancelUnblocksAnotherThreadAtItsNextBoundary() {
       "A cancel from another thread is observed at the next boundary");
 }
 
+void TestWaitingOnAnUncancellableStateIsRejected() {
+  const CancellationToken token;
+  CheckThrowsCode(
+      [&token] { (void)token.WaitForCancellation(); },
+      ErrorCode::invalid_argument,
+      "Waiting on the default token is rejected instead of blocking forever");
+
+  CancellationSource source;
+  const CancellationSource moved = std::move(source);
+  Check(
+      moved.token().cancellable(),
+      "The moved-to source still owns a cancellable state");
+  CheckThrowsCode(
+      [&source] {
+        (void)source.WaitForCancellation();  // NOLINT(bugprone-use-after-move)
+      },
+      ErrorCode::invalid_argument,
+      "Waiting on a moved-from source is rejected");
+}
+
+// The whole point of the watchdog: nothing in this test ever polls the token,
+// so only a background claim can release the waiter.
+void TestTheWatchdogReleasesAWaiterAtItsDeadline() {
+  CancellationSource source =
+      CancellationSource::WithTimeout(std::chrono::milliseconds{20});
+  const CancellationToken token = source.token();
+  const Clock::time_point deadline = source.deadline().value();
+
+  const WaitOutcome outcome = WaitBounded(
+      token,
+      source,
+      "A future deadline releases a waiter that never polls");
+
+  Check(outcome.completed, "The waiter came back inside its budget");
+  Check(
+      outcome.reason == CancellationReason::deadline_exceeded,
+      "A waiter released by the watchdog reports deadline_exceeded");
+  Check(
+      !outcome.completed || outcome.woke >= deadline,
+      "The watchdog never releases a waiter before its deadline");
+  Check(
+      token.reason() == CancellationReason::deadline_exceeded,
+      "The state stays claimed after the waiter returned");
+}
+
+void TestAnExplicitCancelReleasesAWaiter() {
+  CancellationSource source;
+  const CancellationToken token = source.token();
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool waiter_ready = false;
+  // Wait() polls once before it blocks, so this handshake only narrows the
+  // window; the reported reason is correct either way.
+  std::future<CancellationReason> waiter =
+      std::async(std::launch::async, [&, token] {
+        {
+          std::scoped_lock lock(mutex);
+          waiter_ready = true;
+        }
+        condition.notify_all();
+        return token.WaitForCancellation();
+      });
+  {
+    std::unique_lock lock(mutex);
+    condition.wait(lock, [&waiter_ready] { return waiter_ready; });
+  }
+  source.Cancel();
+
+  if (waiter.wait_for(kWaitBudget) != std::future_status::ready) {
+    Check(false, "An explicit cancel releases a waiter");
+    return;
+  }
+  Check(
+      waiter.get() == CancellationReason::cancelled,
+      "A waiter released by an explicit cancel reports cancelled");
+  Check(
+      !source.deadline().has_value(),
+      "A source with no deadline still releases its waiters");
+}
+
+void TestACancelBeforeADeadlineSurvivesALaterOne() {
+  CancellationSource cancelled =
+      CancellationSource::WithTimeout(std::chrono::milliseconds{40});
+  const CancellationToken token = cancelled.token();
+  cancelled.Cancel();
+
+  const WaitOutcome first = WaitBounded(
+      token,
+      cancelled,
+      "A cancelled source releases its waiter immediately");
+  Check(
+      first.reason == CancellationReason::cancelled,
+      "A cancel that lands before the deadline is the reason a waiter sees");
+
+  // Rather than sleeping past the first deadline and asserting that nothing
+  // happened, wait for a strictly later one to fire: once the watchdog has
+  // demonstrably passed that instant it has also passed the earlier one.
+  CancellationSource sentinel =
+      CancellationSource::WithTimeout(std::chrono::milliseconds{80});
+  const WaitOutcome later = WaitBounded(
+      sentinel.token(),
+      sentinel,
+      "A sentinel deadline later than the cancelled one fires");
+  Check(
+      later.reason == CancellationReason::deadline_exceeded,
+      "The sentinel source stopped because its own deadline passed");
+  Check(
+      !later.completed || later.woke > *cancelled.deadline(),
+      "The sentinel woke after the cancelled source's deadline had passed");
+  Check(
+      token.reason() == CancellationReason::cancelled,
+      "A deadline that passes after an explicit cancel never demotes it");
+}
+
+void TestSeveralDeadlinesFireIndependently() {
+  struct Scheduled {
+    CancellationSource source;
+    Clock::time_point deadline;
+  };
+
+  // Registered out of order so the schedule is exercised as an ordered
+  // container rather than a queue that happens to be sorted already.
+  std::vector<Scheduled> scheduled;
+  for (const int milliseconds : {60, 20, 80, 40}) {
+    CancellationSource source =
+        CancellationSource::WithTimeout(std::chrono::milliseconds{milliseconds});
+    const Clock::time_point deadline = source.deadline().value();
+    scheduled.push_back(Scheduled{std::move(source), deadline});
+  }
+
+  for (Scheduled& entry : scheduled) {
+    const WaitOutcome outcome = WaitBounded(
+        entry.source.token(),
+        entry.source,
+        "Every scheduled deadline releases its own waiter");
+    Check(
+        outcome.reason == CancellationReason::deadline_exceeded,
+        "Each source reports its own deadline rather than a neighbour's");
+    Check(
+        !outcome.completed || outcome.woke >= entry.deadline,
+        "No waiter is released before its own deadline");
+  }
+
+  // Dropping every source unregisters its watchdog entry; a later deadline
+  // still fires, which is what proves the schedule survived the removals.
+  scheduled.clear();
+  CancellationSource after =
+      CancellationSource::WithTimeout(std::chrono::milliseconds{20});
+  const WaitOutcome outcome = WaitBounded(
+      after.token(),
+      after,
+      "The watchdog still fires after every earlier source was dropped");
+  Check(
+      outcome.reason == CancellationReason::deadline_exceeded,
+      "A deadline armed after a batch of removals still fires");
+}
+
 }  // namespace
 
 int main() {
@@ -318,6 +514,11 @@ int main() {
   TestMovedFromSourceIsInert();
   TestConcurrentCancelClaimsExactlyOneReason();
   TestCancelUnblocksAnotherThreadAtItsNextBoundary();
+  TestWaitingOnAnUncancellableStateIsRejected();
+  TestTheWatchdogReleasesAWaiterAtItsDeadline();
+  TestAnExplicitCancelReleasesAWaiter();
+  TestACancelBeforeADeadlineSurvivesALaterOne();
+  TestSeveralDeadlinesFireIndependently();
 
   if (failures != 0) {
     std::cerr << failures << " cancellation checks failed\n";

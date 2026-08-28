@@ -24,7 +24,7 @@ types.
 | File | Contents |
 |---|---|
 | `error.hpp` | `ErrorCode` categories and the `Error` exception thrown by every entry point. |
-| `cancellation.hpp` | `CancellationReason`, the copyable observer `CancellationToken`, and the move-only `CancellationSource` that owns the cancellable state and its optional deadline. |
+| `cancellation.hpp` | `CancellationReason`, the copyable observer `CancellationToken` with its boundary `ThrowIfCancellationRequested` and blocking `WaitForCancellation`, and the move-only `CancellationSource` that owns the cancellable state and its optional deadline. |
 | `tensor.hpp` | `DataType`, canonical `TensorDevice` identities, the ORT-independent `TensorBuffer` contract, and the device-aware copy-on-write `Tensor`. |
 | `backend.hpp` | `TensorSpec`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
 | `model.hpp` | `RuntimeOptions`, device-output policy, provider discovery and library registration, `NamedTensors`, `ModelBackend` with its default cancellable `Run` overload, and `Model`. |
@@ -49,9 +49,12 @@ Outside this directory these headers depend only on the C++ standard library.
 `CMakeLists.txt` installs this directory verbatim, so a change to any
 declaration is a change to the installed ABI and to the exported CMake package
 `onnx_world_model::onnx_world_model`. The cancellation surface added in
-version 0.3.0 is such a change: `CancellationToken` is a new member of
+version 0.3.0 was such a change: `CancellationToken` is a new member of
 `PipelineRunOptions`, `ModelBackend` gained a virtual method, and `StageRun`
-gained `RequestCancellation`, so the library carries `SOVERSION 0.3`.
+gained `RequestCancellation`. Version 0.4.0 adds
+`CancellationToken::WaitForCancellation` and
+`CancellationSource::WaitForCancellation`, which is another declaration
+change, so the library carries `SOVERSION 0.4`.
 
 ## Tests
 

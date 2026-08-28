@@ -15,11 +15,12 @@ package, including the compiled `_native` extension, through its public API.
 - Verify incremental stage execution: the `StageEvent` dataclass, the
   `StageRun` iterator and lifetime protocol, `begin_stage`, and `iter_stage`.
 - Verify explicit cancellation and deadlines: the `CancellationSource` and
-  `CancellationToken` wrappers, the `CancelledError` and
-  `DeadlineExceededError` hierarchy under `WorldModelError`, the keyword-only
-  `cancellation` and `timeout` arguments and their mutual exclusion, and the
-  guarantee that a cancelled run frees the session without rolling anything
-  back.
+  `CancellationToken` wrappers, the blocking `wait` on both and the shared
+  native deadline watchdog that releases it while the GIL is free, the
+  `CancelledError` and `DeadlineExceededError` hierarchy under
+  `WorldModelError`, the keyword-only `cancellation` and `timeout` arguments
+  and their mutual exclusion, and the guarantee that a cancelled run frees the
+  session without rolling anything back.
 - Verify the in-memory `PipelineSessionSnapshot` wrapper: snapshot, restore,
   fork, the named-checkpoint methods, and the pipeline-identity check that
   mirrors the native one.
@@ -36,7 +37,7 @@ package, including the compiled `_native` extension, through its public API.
 | `test_pipeline.py` | `Pipeline` and `PipelineSession` contract and stage execution. |
 | `test_pipeline_snapshot.py` | `PipelineSessionSnapshot` plus `PipelineSession.snapshot`, `restore`, `fork`, `checkpoint`, `restore_checkpoint`, `drop_checkpoint`, and `has_checkpoint` on a counter package built with `onnx_ir`. |
 | `test_pipeline_stream.py` | `StageEvent`, `StageRun`, `PipelineSession.begin_stage`, and `iter_stage`: payload conversion and iteration against a local fake native handle, plus event, parity, active-run, and token-shape assertions on counter and decoder packages built with `onnx_ir`. |
-| `test_cancellation.py` | `CancellationSource`, `CancellationToken`, the `CancelledError` and `DeadlineExceededError` hierarchy, `StageRun.request_cancellation`, and the `cancellation` and `timeout` arguments on `PipelineSession` and `OnnxModel`, using a counter package built with `onnx_ir`. |
+| `test_cancellation.py` | `CancellationSource`, `CancellationToken`, the blocking `wait` on both and the GIL release around it, the `CancelledError` and `DeadlineExceededError` hierarchy, `StageRun.request_cancellation`, and the `cancellation` and `timeout` arguments on `PipelineSession` and `OnnxModel`, using a counter package built with `onnx_ir`. |
 | `test_preprocessing.py` | `preprocessing.py` and `media.py`, including latent-token round trips. |
 | `test_guided_generation.py` | Classifier-free guidance on graphs synthesized with `onnx_ir`. |
 | `test_image_to_video_smoke.py` | The `tools/image_to_video_smoke.py` dry run and generation path. |

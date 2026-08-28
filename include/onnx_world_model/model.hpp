@@ -61,7 +61,9 @@ class ModelBackend {
   //: Runs the graph under `cancellation`. The default implementation checks
   //: the token before and after the one-argument Run, so every existing
   //: backend gains boundary cancellation without being modified. A backend
-  //: that can interrupt work already in flight overrides this instead.
+  //: that can interrupt work already in flight overrides this instead, either
+  //: by registering its own interruption or by parking on
+  //: CancellationToken::WaitForCancellation.
   [[nodiscard]] virtual NamedTensors Run(
       const NamedTensors& inputs,
       const CancellationToken& cancellation) const;

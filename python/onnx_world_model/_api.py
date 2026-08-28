@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, cancellation, and latent-dynamics APIs.
 # @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ class CancellationToken:
 
     Only :meth:`CancellationSource.token` produces one. A token cannot cancel
     and cannot change its source's deadline; it is what a call reads at its own
-    boundaries to decide whether to stop.
+    boundaries to decide whether to stop, or blocks on through :meth:`wait`.
     """
 
     def __init__(self, core: _native.CancellationToken) -> None:
@@ -131,6 +131,20 @@ class CancellationToken:
         """``"none"``, ``"cancelled"``, or ``"deadline_exceeded"``."""
         return str(self._core.reason)  # type: ignore[return-value]
 
+    def wait(self) -> CancellationReasonName:
+        """Block until this token has a reason, and return it.
+
+        This is for work that has no boundary of its own — a thread parked on
+        an external event — and it never polls: an explicit
+        :meth:`CancellationSource.cancel` or the shared deadline watchdog
+        releases it. The GIL is released for the whole wait, so other Python
+        threads keep running.
+
+        It returns the reason rather than raising it; use the returned value,
+        or read :attr:`reason`, to decide whether to unwind.
+        """
+        return str(self._core.wait())  # type: ignore[return-value]
+
 
 @final
 class CancellationSource:
@@ -149,6 +163,10 @@ class CancellationSource:
     Cancellation is cooperative and never rolls anything back: the interrupted
     call raises :class:`CancelledError` or :class:`DeadlineExceededError` and
     leaves everything it already applied in place.
+
+    A deadline is claimed by one shared process-wide watchdog as well as by
+    every poll, so :meth:`CancellationToken.wait` and work blocked inside a
+    call are released at the deadline rather than at the next boundary.
     """
 
     def __init__(self, timeout: float | None = None) -> None:
@@ -180,6 +198,14 @@ class CancellationSource:
     @property
     def reason(self) -> CancellationReasonName:
         return str(self._core.reason)  # type: ignore[return-value]
+
+    def wait(self) -> CancellationReasonName:
+        """Block until this source has a reason, and return it.
+
+        The same wait :meth:`CancellationToken.wait` performs, offered here so
+        the owner does not have to make a token first.
+        """
+        return str(self._core.wait())  # type: ignore[return-value]
 
 
 def _cancellation_token(
