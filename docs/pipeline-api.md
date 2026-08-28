@@ -21,6 +21,150 @@ All component sessions are loaded eagerly. `Pipeline` owns immutable model
 sessions and can be shared; each `PipelineSession` owns one request or
 trajectory's state.
 
+## Concurrency limits
+
+A `Pipeline` can cap how many executions run through it at once. This is
+*admission scheduling*: it decides how many executions are inside the runtime
+and in what order queued ones enter. It is **not** batching — nothing is
+merged, split, reordered, or preempted.
+
+```python
+pipeline = Pipeline(
+    "output/cosmos3-edge",
+    max_concurrent_executions=4,
+    max_concurrent_by_stage_kind={"iterative": 2},
+)
+
+print(pipeline.max_concurrent_executions)        # 4
+print(dict(pipeline.max_concurrent_by_stage_kind))  # {'iterative': 2}
+```
+
+`WorldModel` takes the same two keyword arguments and forwards them.
+`OnnxModel` and `LatentDynamicsModel` do not: they are single graphs, not
+pipelines.
+
+- `0`, and any stage kind left out of the mapping, means unlimited. That is
+  the default, and it is exactly what every earlier release did.
+- An execution is admitted only when there is room under both the non-zero
+  global cap and the non-zero cap for its own stage kind.
+- Keys must name a stage kind the runtime executes: `single_pass`,
+  `autoregressive`, `iterative`, `state_transition`, `composite`, or
+  `on_demand`. An unknown or empty key raises `WorldModelError` when the
+  pipeline is constructed, rather than silently never applying. A count must
+  be a plain non-negative `int`; `True` raises `TypeError` and `-1` raises
+  `ValueError`.
+
+**What counts as one execution.** Exactly four calls are executions, and each
+takes exactly one permit for its whole duration:
+
+| Call | Permits |
+|---|---|
+| `run_stage()` | one, held for the whole stage |
+| `step_stage()` | one, held for that pass |
+| `StageRun.step()` | one, held only during the call |
+| `StageRun.finish()` with steps left to drain | one, held for the whole drain |
+| `begin_stage()` | none — it resolves a plan and executes nothing |
+| `StageRun.finish()` on a completed run | none — it returns the cached result |
+| An idle `StageRun` between `step()` calls | none |
+| `close()`, `request_cancellation()`, `outputs`, `state()`, `snapshot()`, `restore()`, `fork()`, the checkpoint methods | none |
+
+The rules the API guarantees:
+
+- **Shared by the pipeline, not by the session.** The cap belongs to the
+  `Pipeline`. Every session it creates, every `fork()` of those sessions, and
+  every `StageRun` they produce compete for the same permits. Two separately
+  constructed `Pipeline` objects — even over the same package directory — get
+  independent caps.
+- **Fair within a kind, non-blocking across kinds.** Queued requests are
+  admitted oldest first. A stage kind that is at its own cap is skipped rather
+  than blocking the head of the queue, so a different, eligible kind still
+  enters; within one kind, no later request passes an earlier one.
+- **Work conserving.** A freed permit immediately admits the oldest eligible
+  waiter. Nothing waits while capacity is idle.
+- **Queued work is still cancellable.** A request waiting for a permit keeps
+  observing its `cancellation` token and `timeout`. Cancelling it raises
+  `CancelledError`, an expired deadline raises `DeadlineExceededError`, and in
+  both cases the stage never started, so nothing was applied and the queue
+  position is released.
+- **Permits are never leaked.** A failed component, a cancelled step, and an
+  exception on the way out all return the permit, because it is released by
+  scope exit rather than by a success path.
+- **Admission comes before the session.** A request is admitted before it
+  takes the session lock, so a queued call can still find the session busy
+  with another `StageRun` once it is let in and raise `WorldModelError` then.
+  That ordering is deliberate: checking the session before waiting would only
+  read staler state.
+
+**Not included: batching.** There is no continuous batching, dynamic batching,
+request merging or splitting, priority, or preemption. Adding batching would
+need machinery this runtime does not have — request compatibility keys, tensor
+concatenation and result splitting across lane boundaries, per-lane recurrent
+state and RNG streams, and a KV-cache manager that can admit and evict lanes
+in the middle of a stage.
+
+The C++ equivalent is `PipelineSchedulingOptions`, passed to the `Pipeline`
+constructor or as the third argument of `Pipeline::Load`. Both are defaulted,
+so existing code keeps compiling and keeps its unlimited behavior; the
+`Pipeline` layout changed, so C++ consumers must be recompiled.
+
+## Scheduling stats
+
+`Pipeline.scheduling_stats` reads the admission scheduler right now. It is
+operational observability for admission only — how much is admitted and how
+much is waiting. It reports no timings and no throughput, and it is not a
+profiler.
+
+```python
+pipeline = Pipeline("output/cosmos3-edge", max_concurrent_executions=4)
+
+stats = pipeline.scheduling_stats
+print(stats.active_executions)                      # 0
+print(stats.queued_executions)                      # 0
+print(stats.active_by_stage_kind["iterative"])      # 0
+print(stats.queued_by_stage_kind["autoregressive"])  # 0
+```
+
+`PipelineSchedulingStats` is a frozen dataclass, and both mappings are
+read-only views:
+
+| Field | Meaning |
+|---|---|
+| `active_executions` | executions holding a permit right now |
+| `queued_executions` | executions waiting for a permit right now |
+| `active_by_stage_kind` | the active count broken down by stage kind |
+| `queued_by_stage_kind` | the waiting count broken down by stage kind |
+
+- **Every stage kind is always present.** Both mappings contain all six
+  executable kinds — `single_pass`, `autoregressive`, `iterative`,
+  `state_transition`, `composite`, and `on_demand` — so a kind can be read
+  without testing for its key. A kind with nothing happening maps to `0`.
+- **These are permit counts, not execution counts.** A stage kind capped by
+  neither the global limit nor its own is admitted without taking a permit at
+  all, so an unlimited pipeline reports zeros no matter how much work is
+  inside it. Under a global limit every admitted execution is counted, in the
+  total and against its own stage kind, whether or not that kind has a cap of
+  its own.
+- **It is a value, not a live view.** The whole reading is taken at one moment
+  under the scheduler's own lock, so its fields agree with each other, and it
+  never changes afterwards. Read it again to see a newer moment. Any field may
+  already be stale by the time it is inspected, because other threads keep
+  running.
+- **Reading changes nothing.** It admits nothing, queues nothing, takes no
+  session lock, and cannot block an execution.
+- **Copies share one scheduler,** so copies of a pipeline report the same
+  numbers, and every session and `StageRun` created from any of them is
+  counted.
+
+The C++ equivalent is `Pipeline::scheduling_stats()`, which returns the same
+fields as a `PipelineSchedulingStats` value:
+
+```cpp
+const PipelineSchedulingStats stats = pipeline.scheduling_stats();
+if (stats.queued_executions > stats.active_executions) {
+  // Admission, not the model, is the bottleneck right now.
+}
+```
+
 ## Execution providers
 
 Provider names are case-insensitive and may use short names such as `cuda`,
@@ -627,7 +771,13 @@ runtime.provider_options["cuda"] = {
     {"gpu_mem_limit", "25769803776"},
 };
 
-Pipeline pipeline = Pipeline::Load("output/cosmos3-edge", runtime);
+Pipeline pipeline = Pipeline::Load(
+    "output/cosmos3-edge",
+    runtime,
+    PipelineSchedulingOptions{
+        .max_concurrent_executions = 4,
+        .max_concurrent_by_stage_kind = {{"iterative", 2}},
+    });
 PipelineSession session = pipeline.CreateSession();
 
 NamedTensors outputs = session.RunStage(

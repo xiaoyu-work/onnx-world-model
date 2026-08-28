@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, cancellation, and latent-dynamics APIs.
-# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
+# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import sysconfig
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, final
 
 import numpy as np
@@ -64,6 +65,33 @@ class PipelineStageSpec:
     components: tuple[str, ...]
     run_on: str
     options: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class PipelineSchedulingStats:
+    """One instantaneous reading of a pipeline's admission scheduler.
+
+    This is operational observability for admission only. It reports how many
+    executions hold a permit and how many are waiting for one; it says nothing
+    about batching, throughput, or latency, and it is not a profiler.
+
+    ``active_by_stage_kind`` and ``queued_by_stage_kind`` always contain every
+    stage kind the runtime executes -- ``single_pass``, ``autoregressive``,
+    ``iterative``, ``state_transition``, ``composite``, and ``on_demand`` -- so
+    a kind can be read without testing for its key, and a kind with nothing
+    happening maps to ``0``. Both are read-only views.
+
+    The counts are permits, not executions: a stage kind capped by neither the
+    global limit nor its own is admitted without a permit, so an unlimited
+    pipeline reports zeros however much work is inside it. The whole reading is
+    taken at one moment under the scheduler's lock, so its fields agree with
+    each other, and any of them may be stale as soon as it is returned.
+    """
+
+    active_executions: int
+    queued_executions: int
+    active_by_stage_kind: Mapping[str, int]
+    queued_by_stage_kind: Mapping[str, int]
 
 
 @dataclass(frozen=True)
@@ -442,8 +470,37 @@ class OnnxModel:
         )
 
 
+def _scheduling_stats(payload: Mapping[str, Any]) -> PipelineSchedulingStats:
+    """Freezes one native admission reading into its typed value."""
+    return PipelineSchedulingStats(
+        active_executions=int(payload["active_executions"]),
+        queued_executions=int(payload["queued_executions"]),
+        active_by_stage_kind=MappingProxyType(
+            dict(payload["active_by_stage_kind"])
+        ),
+        queued_by_stage_kind=MappingProxyType(
+            dict(payload["queued_by_stage_kind"])
+        ),
+    )
+
+
 class Pipeline:
-    """A validated Mobius pipeline package with shareable model sessions."""
+    """A validated Mobius pipeline package with shareable model sessions.
+
+    ``max_concurrent_executions`` and ``max_concurrent_by_stage_kind`` are
+    admission scheduling only: they cap how many executions may be inside the
+    runtime at once and queue the rest fairly. Nothing is merged, split,
+    reordered, or preempted. ``0`` -- and any stage kind left out of the
+    mapping -- means unlimited, which is the default. One execution is one
+    ``run_stage``, one ``step_stage``, one ``StageRun.step``, or one
+    ``StageRun.finish`` that still has work to drain; ``begin_stage`` and an
+    idle handle hold nothing.
+
+    Every key of ``max_concurrent_by_stage_kind`` must name a stage kind the
+    runtime executes -- ``single_pass``, ``autoregressive``, ``iterative``,
+    ``state_transition``, ``composite``, or ``on_demand`` -- and an unknown or
+    empty key raises :class:`WorldModelError` here rather than being ignored.
+    """
 
     def __init__(
         self,
@@ -457,6 +514,8 @@ class Pipeline:
         device_outputs: bool = False,
         providers: Sequence[str] | None = None,
         provider_options: ProviderOptions | None = None,
+        max_concurrent_executions: int = 0,
+        max_concurrent_by_stage_kind: Mapping[str, int] | None = None,
     ) -> None:
         package = Path(package_path)
         with (package / "pipeline.json").open(encoding="utf-8") as file:
@@ -465,6 +524,7 @@ class Pipeline:
             Path(ort_library_path) if ort_library_path is not None else _find_ort_library()
         )
         provider_names, options = _provider_arguments(providers, provider_options)
+        stage_kind_limits = dict(max_concurrent_by_stage_kind or {})
         self._core = _native.Pipeline(
             os.fspath(package),
             os.fspath(library_path),
@@ -475,6 +535,14 @@ class Pipeline:
             device_outputs,
             provider_names,
             options,
+            max_concurrent_executions,
+            stage_kind_limits,
+        )
+        # Recorded only after the native constructor accepted them, so these
+        # report the limits actually in force rather than what was requested.
+        self._max_concurrent_executions = max_concurrent_executions
+        self._max_concurrent_by_stage_kind: Mapping[str, int] = MappingProxyType(
+            stage_kind_limits
         )
         self._manifest: dict[str, Any] = self._document["manifest"]
         components = {
@@ -557,6 +625,26 @@ class Pipeline:
             component: tuple(providers)
             for component, providers in self._core.execution_providers.items()
         }
+
+    @property
+    def max_concurrent_executions(self) -> int:
+        """Executions admitted at once across every session, or 0 for no cap."""
+        return self._max_concurrent_executions
+
+    @property
+    def max_concurrent_by_stage_kind(self) -> Mapping[str, int]:
+        """Per-stage-kind admission caps; a missing kind has no cap."""
+        return self._max_concurrent_by_stage_kind
+
+    @property
+    def scheduling_stats(self) -> PipelineSchedulingStats:
+        """How many executions this pipeline has admitted and queued right now.
+
+        Copies of one pipeline share an admission scheduler, so they report the
+        same numbers, and every session and :class:`StageRun` created from any
+        of them is counted. Reading admits, queues, and blocks nothing.
+        """
+        return _scheduling_stats(self._core.scheduling_stats)
 
     def create_session(self) -> PipelineSession:
         return PipelineSession(self, self._core.create_session())

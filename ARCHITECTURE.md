@@ -47,8 +47,8 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
-| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, staged execution. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
+| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, admission scheduling, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
 | C++ tests | `tests/cpp/` | Stub-backend tests registered with CTest. |
@@ -74,9 +74,16 @@ Within `src/` the runtime is layered:
 - `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
   share.
+- `pipeline_scheduler` is the shared admission controller: the supported
+  stage-kind list and its validation, the per-kind permit buckets, the
+  cancellation- and deadline-aware FIFO queue with its oldest-eligible pump,
+  the RAII lease that returns a permit exactly once, and the consistent
+  snapshot of that state a `Pipeline` reports. It decides only when an
+  execution may start; it never runs, resumes, or inspects one.
 - `pipeline_session` executes stages, owns per-trajectory state, drives one
-  stage at a time through the `StageRun` state machine, and captures or
-  restores that state as an in-memory snapshot.
+  stage at a time through the `StageRun` state machine, captures or
+  restores that state as an in-memory snapshot, and defines `Pipeline`, which
+  hands every session it creates that one scheduler.
 - `world_model` provides the fixed latent-dynamics compatibility API.
 
 ## Dependency Rules
@@ -198,6 +205,63 @@ across processes. A snapshot records the `PipelinePackage` instance it came
 from, so restoring it into a session built on any other package instance fails
 with `ErrorCode::state`.
 
+Concurrency across sessions is bounded by one shared admission controller per
+`Pipeline`. `PipelineSchedulingOptions` sets a global ceiling and an optional
+per-stage-kind ceiling; `0`, and a stage kind absent from the map, mean
+unlimited, which is the default. A key that is not one of the six stage kinds
+the runtime executes — `single_pass`, `autoregressive`, `iterative`,
+`state_transition`, `composite`, `on_demand` — is `ErrorCode::invalid_argument`
+at construction, because a limit no manifest could ever match would silently
+do nothing. `Pipeline` holds that controller beside its package and shares
+both the same way: an implicit copy, every session it creates, every fork of
+those sessions, and every `StageRun` they produce compete for the same
+permits, while a separately constructed `Pipeline` gets its own.
+
+An execution is exactly one of four things, and each takes exactly one permit
+for its whole duration: one `RunStage`, one `StepStage`, one `StageRun::Step`,
+or one `StageRun::Finish` that still has steps to drain. `BeginStage` executes
+nothing, a `Finish` on an already-completed run returns a cached value, and
+`Cancel`, `RequestCancellation`, `outputs()`, `state()`, `Snapshot`,
+`Restore`, `Fork`, and the checkpoint methods are not executions, so none of
+them take a permit and an idle `StageRun` between `Step` calls holds nothing.
+The permit is a stack-scoped RAII lease that is never stored on a run or a
+session, so a cancellation, a deadline, or a backend failure returns it on the
+way out.
+
+Admission is work conserving and fair within a stage kind. A caller that fits
+is granted without blocking; one that does not takes a ticket. The pump walks
+the queue oldest first, skips a waiter whose kind is full so a different
+eligible kind still enters, and stops once the global ceiling is reached, so a
+saturated kind never blocks the head of the queue and no later waiter of the
+same kind passes an earlier one. A queued request keeps observing its own
+token: an explicit cancel or a deadline claimed by the shared watchdog removes
+it from the queue and throws `ErrorCode::cancelled` or
+`ErrorCode::deadline_exceeded` without the execution ever starting. Admission
+happens before the session lock, so a queued caller can still find a
+conflicting active run once it is admitted and fail then; peeking at session
+state before waiting would be a staler race, not a safer one.
+
+This is admission scheduling, not batching. Nothing merges two requests into
+one model call, splits one apart, reorders work within a stage, or preempts an
+execution that already started. Continuous or dynamic batching would need
+things this runtime does not have: request compatibility keys, tensor
+concatenation and result splitting across lane boundaries, per-lane recurrent
+state and RNG streams, and a KV-cache manager that can admit and evict lanes
+mid-stage.
+
+`Pipeline::scheduling_stats()` is the operational reading of that controller
+and the only way to observe it. It returns a detached `PipelineSchedulingStats`
+value — the admitted and queued totals plus both per-stage-kind breakdowns —
+taken at one moment under the scheduler's own mutex, so its fields agree with
+each other and none of them changes afterwards. Both maps always carry all six
+executable stage kinds, so a caller never tests for a key. The counts are
+permits rather than executions: an unlimited stage kind takes the lock-free
+fast path and no permit at all, so an unconfigured `Pipeline` reports zeros
+however much work is inside it. Reading takes no session lock, runs no
+callback, admits nothing, and queues nothing, so observing admission cannot
+perturb it. This is observability for admission only; it reports no timing,
+no throughput, and nothing about batching.
+
 Named checkpoints are control metadata held on the session beside that
 execution state rather than inside it. A snapshot therefore never carries a
 checkpoint namespace: checkpoints survive stage execution and ordinary
@@ -235,8 +299,10 @@ Python:
   plus `begin_stage()` and `iter_stage()` for incremental execution,
   `snapshot()`, `restore()`, `fork()`, and the named `checkpoint()`,
   `restore_checkpoint()`, `drop_checkpoint()`, and `has_checkpoint()` methods
-  for in-memory session branching, and the keyword-only `cancellation` and
-  `timeout` arguments on every execution method.
+  for in-memory session branching, the keyword-only `cancellation` and
+  `timeout` arguments on every execution method, and the keyword-only
+  `max_concurrent_executions` and `max_concurrent_by_stage_kind` constructor
+  arguments that cap concurrent executions.
 - `onnx_world_model.CancellationSource` and `CancellationToken` — explicit
   cancellation and deadlines, with `CancelledError` and
   `DeadlineExceededError` as the outcomes, both derived from
@@ -254,7 +320,10 @@ Python:
 C++:
 
 - `onnx_world_model::Pipeline::Load` then `Pipeline::CreateSession` and
-  `PipelineSession::RunStage`, `BeginStage`, or `StepStage`.
+  `PipelineSession::RunStage`, `BeginStage`, or `StepStage`. `Pipeline`'s
+  constructor and `Load` take an optional `PipelineSchedulingOptions` that
+  caps concurrent executions globally and per stage kind, and
+  `Pipeline::scheduling_stats` reads how many are admitted and queued now.
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
   in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
@@ -317,6 +386,17 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   half-executed stage. `RunStage` and `BeginStage` use the same internal state
   machine rather than two implementations that can drift apart; ordinary
   concurrent `RunStage` calls still serialize for the whole stage.
+- **Admission scheduling, never batching.** The shared scheduler decides how
+  many executions run at once and in what order queued ones enter, and that is
+  all it decides. It never merges, splits, reorders, or preempts work, and the
+  documentation must not describe it as batching of any kind. Its lock order
+  is fixed and one-way: `CancellationState`'s callback mutex, then the
+  scheduler mutex, then the session mutex, then ONNX Runtime. A cancellation
+  registration is therefore never created or destroyed while the scheduler
+  mutex is held, and every execution takes its permit before the session lock.
+  `Pipeline::scheduling_stats` observes that controller and nothing else: it
+  reports admitted and queued counts, never timings or throughput, and reading
+  it cannot admit, queue, or block anything.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
   CPU buffer is cloned before mutation. Device buffers expose immutable
   storage and an explicit synchronous CPU-copy operation.

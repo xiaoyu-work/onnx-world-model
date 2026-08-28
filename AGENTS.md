@@ -76,13 +76,22 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 8 of 8 passing; `pytest` reports 129 passed
+Expected baseline: `ctest` reports 9 of 9 passing; `pytest` reports 161 passed
 and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
 `tests/python/test_pipeline_snapshot.py`,
-`tests/python/test_pipeline_stream.py`, and
-`tests/python/test_cancellation.py`.
+`tests/python/test_pipeline_stream.py`,
+`tests/python/test_cancellation.py`, and
+`tests/python/test_scheduling.py`.
+
+`pipeline_scheduler_test` is the one concurrent CTest executable. Run it
+repeatedly after changing `src/pipeline_scheduler.cpp`, `src/cancellation.cpp`,
+or any call site that takes an admission lease:
+
+```console
+ctest --preset dev -R pipeline_scheduler_test --repeat until-fail:20
+```
 
 C++ changes require `cmake --build --preset dev` before `ctest`, and a
 `--reinstall-package` rebuild before `pytest`.
@@ -104,6 +113,13 @@ C++ changes require `cmake --build --preset dev` before `ctest`, and a
   through `CancellationToken::WaitForCancellation`.
 - Keep ONNX Runtime headers confined to `src/dynamic_library.cpp` and
   `src/ort_backend.cpp`, and keep them out of `include/onnx_world_model/`.
+- Concurrency limits are admission scheduling only. Do not describe them as
+  batching, and do not add continuous or dynamic batching, request merging or
+  splitting, priority, or preemption under this name. Preserve the one-way
+  lock order — `CancellationState` callback mutex, then scheduler mutex, then
+  session mutex, then ONNX Runtime — by taking every admission lease before
+  the session lock and never creating or destroying a cancellation
+  registration while the scheduler mutex is held.
 - Internal C++ helpers belong in `onnx_world_model::detail` in a non-installed
   `src/*.hpp`.
 - Python targets 3.10, uses `from __future__ import annotations`, full type

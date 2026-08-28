@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T15:35:02.971Z",
+  "generatedAt": "2026-08-28T21:43:44.032Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "10be8df7d26ab7f0544dc2186a4f96280d89c7c3574df4bafd28ba6411082744",
+  "sourceFingerprint": "2c09a4ab437a7ff83d6fa61f24227546d29b5c1d023307f7872c6a3841b29643",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -112,7 +112,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -126,6 +126,8 @@
         "PipelineManifest",
         "PipelinePackage",
         "PipelineRunOptions",
+        "PipelineSchedulingOptions",
+        "PipelineSchedulingStats",
         "Pipeline",
         "PipelineSessionSnapshot",
         "StageEventKind",
@@ -183,6 +185,7 @@
         "Pipeline",
         "PipelineInputSpec",
         "PipelineOutputSpec",
+        "PipelineSchedulingStats",
         "PipelineSession",
         "PipelineSessionSnapshot",
         "PipelineStageSpec",
@@ -223,6 +226,7 @@
         "PipelineInputSpec",
         "PipelineOutputSpec",
         "PipelineStageSpec",
+        "PipelineSchedulingStats",
         "StepResult",
         "StageEventKind",
         "StageEvent",
@@ -398,7 +402,7 @@
     {
       "path": "src/pipeline.cpp",
       "kind": "source",
-      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, opens their ONNX sessions, and builds the shareable Pipeline.",
+      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root and opens their ONNX sessions as a PipelinePackage.",
       "publicSymbols": [
         "Endpoint::Parse",
         "Endpoint::qualified",
@@ -411,9 +415,7 @@
         "PipelineManifest::Output",
         "PipelinePackage::PipelinePackage",
         "PipelinePackage::Load",
-        "PipelinePackage accessors",
-        "Pipeline::Pipeline",
-        "Pipeline::Load"
+        "PipelinePackage accessors"
       ]
     },
     {
@@ -468,13 +470,50 @@
       ]
     },
     {
+      "path": "src/pipeline_scheduler.cpp",
+      "kind": "source",
+      "purpose": "Implements the shared admission controller behind PipelineSchedulingOptions: per-stage-kind permit buckets, an oldest-first work-conserving pump over a FIFO queue of waiters, cancellation- and deadline-aware waiting, the RAII PipelineLease that returns a permit exactly once, and the consistent snapshot of the live admission state that Pipeline::scheduling_stats() reports.",
+      "publicSymbols": [
+        "detail::SupportedStageKinds",
+        "detail::ValidatePipelineSchedulingOptions",
+        "detail::MakePipelineScheduler",
+        "detail::PipelineScheduler::PipelineScheduler",
+        "detail::PipelineScheduler::Acquire",
+        "detail::PipelineScheduler::ReleasePermit",
+        "detail::PipelineScheduler::Stats",
+        "detail::SnapshotSchedulingStats",
+        "detail::PipelineLease constructors",
+        "destructor",
+        "move operations and Release",
+        "detail::AcquireExecutionLease"
+      ]
+    },
+    {
+      "path": "src/pipeline_scheduler.hpp",
+      "kind": "source",
+      "purpose": "Declares the internal admission controller a Pipeline shares with every session it creates -- the per-stage-kind permit buckets, the cancellation-aware FIFO waiting queue, the RAII PipelineLease that owns one admitted execution's permit, and the read-only snapshot of that admission state a Pipeline reports as PipelineSchedulingStats.",
+      "publicSymbols": [
+        "onnx_world_model::detail::SupportedStageKinds",
+        "onnx_world_model::detail::ValidatePipelineSchedulingOptions",
+        "onnx_world_model::detail::MakePipelineScheduler",
+        "onnx_world_model::detail::StageKindPermits",
+        "onnx_world_model::detail::PipelineScheduler",
+        "onnx_world_model::detail::PipelineLease",
+        "onnx_world_model::detail::AcquireExecutionLease",
+        "onnx_world_model::detail::SnapshotSchedulingStats"
+      ]
+    },
+    {
       "path": "src/pipeline_session.cpp",
       "kind": "source",
-      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations and the StageRun state machine that drives every stage one step at a time.",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and reports that scheduler's live counts.",
       "publicSymbols": [
+        "Pipeline::Pipeline",
+        "Pipeline::Load",
         "Pipeline::manifest",
         "Pipeline::execution_providers",
         "Pipeline::CreateSession",
+        "Pipeline::scheduling_stats",
         "PipelineSession move operations and destructor",
         "PipelineSession::RunStage",
         "PipelineSession::BeginStage",
@@ -571,6 +610,14 @@
       ]
     },
     {
+      "path": "tests/cpp/pipeline_scheduler_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for shared stage-aware admission scheduling: the unlimited default, a global ceiling, a per-stage-kind ceiling that never blocks a different kind, cancellation and deadlines while queued -- including a queued StageRun::Step or StageRun::Finish that must still close its handle and release its session's active-run slot -- permit recovery after a backend failure, which calls are executions and which are not, whether two Pipeline values share or separate their ceiling, and the PipelineSchedulingStats reading that every queue assertion here synchronizes on.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/pipeline_snapshot_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for the in-memory PipelineSession snapshot, restore, fork, and named-checkpoint contract: recurrent-state round trips, parent/child independence, package identity, device-buffer sharing, random-engine determinism, and checkpoint create/replace/restore/drop semantics.",
@@ -659,6 +706,12 @@
       "path": "tests/python/test_preprocessing.py",
       "kind": "test",
       "purpose": "Tests the preprocessing and media layers: chat templating, tokenization, image and video patch packing, latent-token round trips, conditioning contracts, and guidance prompt handling.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_scheduling.py",
+      "kind": "test",
+      "purpose": "Tests the keyword-only max_concurrent_executions and max_concurrent_by_stage_kind arguments on Pipeline and WorldModel -- defaults, accepted values, bool/non-int/negative rejection, unknown and empty stage-kind rejection, that a limited pipeline still runs a stage -- the Pipeline.scheduling_stats reading of the admission scheduler, and that a step or finish stopped by cancellation or a deadline during admission closes its run and leaves the session reusable.",
       "publicSymbols": []
     },
     {

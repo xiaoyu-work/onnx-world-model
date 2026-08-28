@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Implements the modality-oriented `WorldModel` generation API by mapping text, image, video, and action requests onto the manifest stages of one Mobius pipeline package.
 # @agent-public-api: WorldModel, TextGenerator, TextOutput, ImageGenerator, ImageOutput, VideoGenerator, VideoOutput, ActionGenerator, ActionOutput
-# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline.
+# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything.
 # @agent-side-effects: Loads a pipeline package and its ONNX components, runs ONNX Runtime inference, reads image and video files supplied by the caller, and records per-stage wall-clock timings.
 
 from __future__ import annotations
@@ -53,7 +53,13 @@ class ActionOutput:
 
 
 class WorldModel:
-    """A modality-oriented API over one Mobius world-model package."""
+    """A modality-oriented API over one Mobius world-model package.
+
+    ``max_concurrent_executions`` and ``max_concurrent_by_stage_kind`` are
+    forwarded to the underlying :class:`Pipeline`. They are admission
+    scheduling only -- how many executions run at once and in what order
+    queued ones enter -- and never batch, merge, or preempt anything.
+    """
 
     def __init__(
         self,
@@ -67,6 +73,8 @@ class WorldModel:
         log_severity: int = 3,
         graph_optimization: str = "all",
         device_outputs: bool = False,
+        max_concurrent_executions: int = 0,
+        max_concurrent_by_stage_kind: Mapping[str, int] | None = None,
     ) -> None:
         runtime = _GenerationRuntime(
             package_path,
@@ -78,6 +86,8 @@ class WorldModel:
             log_severity=log_severity,
             graph_optimization=graph_optimization,
             device_outputs=device_outputs,
+            max_concurrent_executions=max_concurrent_executions,
+            max_concurrent_by_stage_kind=max_concurrent_by_stage_kind,
         )
         self._runtime = runtime
         self.text = TextGenerator(runtime)

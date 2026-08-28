@@ -109,9 +109,14 @@ rollout.reset(batch_size=1)
 `LegacyWorldModel` is an explicit alias for `LatentDynamicsModel`.
 
 This fixed API does not accept a cancellation token in this milestone; use
-`Pipeline` and `PipelineSession` when a call must be interruptible.
+`Pipeline` and `PipelineSession` when a call must be interruptible. It also
+takes no concurrency limits: `max_concurrent_executions` and
+`max_concurrent_by_stage_kind` are pipeline-only options, so `OnnxModel` and
+`LatentDynamicsModel` do not accept them.
 
 ## Pipeline
 
-For package-level tensor and stage execution, see the
+For package-level tensor and stage execution — including the admission
+scheduling that caps concurrent executions and the `scheduling_stats` reading
+of it — see the
 [Pipeline API](pipeline-api.md).

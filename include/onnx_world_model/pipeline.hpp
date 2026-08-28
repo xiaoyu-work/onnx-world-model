@@ -2,9 +2,9 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
- * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back.
+ * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
+ * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, PipelineSchedulingOptions, PipelineSchedulingStats, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back. PipelineSchedulingOptions is admission scheduling only and never batching: a Pipeline's limits are fixed at construction, shared by every copy of that Pipeline and by every session and StageRun it produces, and an unknown or empty per-kind key is rejected with ErrorCode::invalid_argument at construction. Exactly four calls are one execution and take exactly one permit for their whole duration -- RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain -- while BeginStage, a completed Finish, an idle StageRun between Step calls, Cancel, RequestCancellation, and every query and state method take none. PipelineSchedulingStats is a detached value, not a view: Pipeline::scheduling_stats() reads the shared controller under its own lock and returns counts that never change afterwards, both per-kind maps always carry all six executable stage kinds, and the counts are permits rather than executions, so an unlimited stage kind -- which is admitted without one -- is reported as zero.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -19,6 +19,15 @@
 #include "onnx_world_model/model.hpp"
 
 namespace onnx_world_model {
+
+namespace detail {
+
+//: The shared admission controller a Pipeline hands to every session it
+//: creates. Its shape is an implementation detail of src/, so only the
+//: pointer appears here.
+class PipelineScheduler;
+
+}  // namespace detail
 
 struct Endpoint {
   std::string component;
@@ -188,21 +197,114 @@ struct PipelineRunOptions {
 
 class PipelineSession;
 
+//: The shared admission limits one Pipeline applies to every execution that
+//: runs through it. This is admission scheduling only: it decides how many
+//: executions may be inside the runtime at once, and in what order queued
+//: ones are let in. It never merges, splits, reorders, or batches the work
+//: itself, and it never preempts an execution that was already admitted.
+//:
+//: A limit of 0 -- and a stage kind that is absent from
+//: `max_concurrent_by_stage_kind` -- means unlimited, which is the default
+//: and the behavior every earlier release had. An execution is admitted only
+//: when there is room under both the non-zero global limit and the non-zero
+//: limit of its own stage kind.
+//:
+//: Every key of `max_concurrent_by_stage_kind` must be one of the stage kinds
+//: this runtime executes -- `single_pass`, `autoregressive`, `iterative`,
+//: `state_transition`, `composite`, or `on_demand`. An empty or unknown key
+//: throws ErrorCode::invalid_argument when the Pipeline is constructed rather
+//: than being ignored.
+struct PipelineSchedulingOptions {
+  //: How many executions may run through this Pipeline at once, across every
+  //: session and every stage kind. 0 means unlimited.
+  std::size_t max_concurrent_executions{0};
+  //: Per-stage-kind ceilings layered under the global one. A missing key, or
+  //: a key mapped to 0, means that kind is unlimited.
+  std::unordered_map<std::string, std::size_t> max_concurrent_by_stage_kind;
+};
+
+//: One instantaneous reading of a Pipeline's admission controller: how many
+//: executions it has admitted and how many are waiting for a permit. It is a
+//: plain value with no link back to the scheduler, so it never changes after
+//: it is returned and reading it needs no lock.
+//:
+//: This is operational observability for admission only. It says nothing
+//: about batching, throughput, latency, or how long anything took, and it is
+//: not a profiler: the two counters are exactly the state the admission
+//: queue is in at the moment it was read.
+//:
+//: Both maps always contain every stage kind this runtime executes --
+//: `single_pass`, `autoregressive`, `iterative`, `state_transition`,
+//: `composite`, and `on_demand` -- so a caller reads a kind directly rather
+//: than checking for its key first; a kind with nothing active or queued
+//: maps to 0. A queued execution whose stage kind is not one of those six is
+//: still counted in `queued_executions`, so the per-kind counts sum to at
+//: most the totals rather than exactly to them.
+//:
+//: These are permit counts, not execution counts. A stage kind constrained
+//: by neither the global limit nor its own is admitted without taking a
+//: permit at all -- that is the lock-free fast path every default-configured
+//: Pipeline takes -- so it is never counted here. An unlimited Pipeline
+//: therefore reports zeros no matter how much work is inside it, and a
+//: Pipeline that caps only one kind counts only that kind's executions
+//: unless it also has a global limit.
+//:
+//: The reading is a snapshot of a live system taken under the scheduler's
+//: own lock, so every field is consistent with every other field at that one
+//: moment, and any of them may already be stale by the time the caller looks
+//: at it. Reading stats never admits, queues, blocks, or cancels anything.
+struct PipelineSchedulingStats {
+  //: Executions currently holding a permit, across every session and stage
+  //: kind. It never exceeds a non-zero
+  //: PipelineSchedulingOptions::max_concurrent_executions, and it stays 0 for
+  //: an execution that needed no permit.
+  std::size_t active_executions{0};
+  //: Executions currently waiting for a permit. It is 0 for an unlimited
+  //: pipeline, which never queues anything.
+  std::size_t queued_executions{0};
+  //: Active executions broken down by the stage kind they are running. A
+  //: permit is counted against its own kind whether or not that kind has a
+  //: limit of its own, so a purely global limit still produces a breakdown.
+  std::unordered_map<std::string, std::size_t> active_by_stage_kind;
+  //: Waiting executions broken down by the stage kind they want to run.
+  std::unordered_map<std::string, std::size_t> queued_by_stage_kind;
+};
+
 class Pipeline {
  public:
-  explicit Pipeline(PipelinePackage package);
+  //: Builds a pipeline over `package` with its own admission controller.
+  //: Copies of the returned Pipeline share that controller, so their sessions
+  //: compete for the same permits; a separately constructed Pipeline over the
+  //: same package gets an independent one.
+  explicit Pipeline(
+      PipelinePackage package,
+      PipelineSchedulingOptions scheduling = {});
 
   static Pipeline Load(
       const std::filesystem::path& directory,
-      const RuntimeOptions& options = {});
+      const RuntimeOptions& options = {},
+      const PipelineSchedulingOptions& scheduling = {});
 
   [[nodiscard]] const PipelineManifest& manifest() const noexcept;
   [[nodiscard]] std::unordered_map<std::string, std::vector<std::string>>
   execution_providers() const;
   [[nodiscard]] PipelineSession CreateSession() const;
 
+  //: Reads this pipeline's admission controller right now. Copies of one
+  //: Pipeline share a controller, so they report the same numbers, and every
+  //: session and StageRun created from any of them is counted here.
+  //:
+  //: An unlimited stage kind is admitted without a permit, so a pipeline with
+  //: no limits at all always reports zeros. Two consecutive readings may
+  //: differ with no call in between, because other threads keep running.
+  [[nodiscard]] PipelineSchedulingStats scheduling_stats() const;
+
  private:
   std::shared_ptr<const PipelinePackage> package_;
+  //: Held beside the package and shared the same way: an implicit Pipeline
+  //: copy shares both, so one configured ceiling covers every session created
+  //: from any copy.
+  std::shared_ptr<detail::PipelineScheduler> scheduler_;
 
   friend class PipelineSession;
 };
@@ -324,12 +426,17 @@ class StageRun {
   //: it on the next Step() rather than folding it into the last step event,
   //: and Step() after it throws ErrorCode::state. A failing step releases the
   //: session's run slot, closes this handle, keeps whatever the run already
-  //: applied to the session, and rethrows.
+  //: applied to the session, and rethrows. One Step() is one execution: it
+  //: takes one admission permit before it takes the session lock and returns
+  //: it when the step ends, so a handle sitting idle between Step() calls
+  //: holds no permit at all.
   [[nodiscard]] StageEvent Step();
   //: Drains the remaining steps under one session-lock acquisition and
   //: returns the same outputs RunStage returns for this stage. Calling it
   //: after the run completed returns that cached result again without
-  //: re-running anything.
+  //: re-running anything and without taking an admission permit; a drain that
+  //: still has work takes exactly one permit and holds it for the whole
+  //: drain.
   [[nodiscard]] NamedTensors Finish();
   //: Signals the work this run is doing to stop. Unlike Cancel() this never
   //: takes the session lock, so it is the one method a second thread can call
@@ -366,6 +473,12 @@ class PipelineSession {
   PipelineSession(const PipelineSession&) = delete;
   PipelineSession& operator=(const PipelineSession&) = delete;
 
+  //: Executes `stage` to completion. This is one execution: it takes one
+  //: admission permit from the Pipeline's scheduler before it takes the
+  //: session lock and holds that permit for the whole stage. A queued call
+  //: observes its own cancellation token and deadline while it waits, so it
+  //: can fail with ErrorCode::cancelled or ErrorCode::deadline_exceeded
+  //: without ever reaching a component.
   [[nodiscard]] NamedTensors RunStage(
       std::string_view stage,
       const NamedTensors& inputs = {},
@@ -378,6 +491,8 @@ class PipelineSession {
   //: allows -- are resolved once, here, so a streamed run cannot drift from
   //: the equivalent RunStage call. A session runs one stage at a time: this
   //: throws ErrorCode::state while another StageRun is still active.
+  //: Beginning a run is not an execution and takes no admission permit; the
+  //: Step() and Finish() calls that drive it each take their own.
   [[nodiscard]] StageRun BeginStage(
       std::string_view stage,
       const NamedTensors& inputs = {},
@@ -386,7 +501,8 @@ class PipelineSession {
   //: Executes exactly one pass of `stage` for a caller that drives its own
   //: loop. This is the low-level primitive underneath BeginStage, so it
   //: throws ErrorCode::state while a StageRun is active rather than
-  //: interleaving with it.
+  //: interleaving with it. One call is one execution and takes one admission
+  //: permit.
   [[nodiscard]] NamedTensors StepStage(
       std::string_view stage,
       const NamedTensors& inputs = {},
@@ -436,7 +552,9 @@ class PipelineSession {
 
  private:
   struct Impl;
-  explicit PipelineSession(std::shared_ptr<const PipelinePackage> package);
+  explicit PipelineSession(
+      std::shared_ptr<const PipelinePackage> package,
+      std::shared_ptr<detail::PipelineScheduler> scheduler);
 
   //: Shared rather than unique so a StageRun can hold the same execution
   //: state: a run outlives a moved or destroyed session wrapper instead of

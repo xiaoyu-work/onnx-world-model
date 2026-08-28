@@ -82,6 +82,15 @@ C++ API ───────────────┤                  │
   nothing is serialized to disk or crosses a process boundary. An unfinished
   stage run holds the session, so these calls and every other state-mutating
   call fail while one is active.
+- Concurrency is bounded by admission scheduling, not by batching. Pass
+  `max_concurrent_executions` and `max_concurrent_by_stage_kind` to
+  `Pipeline` or `WorldModel` to cap how many executions run at once, globally
+  and per stage kind; everything else queues fairly and enters oldest-first,
+  and a full stage kind never blocks a different one. Nothing is merged,
+  split, reordered, or preempted. A queued request still honors its
+  `cancellation` token and `timeout`, so it can be stopped before it ever
+  starts. `Pipeline.scheduling_stats` reads how many executions are admitted
+  and how many are queued right now, per stage kind as well as in total.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in
@@ -109,11 +118,15 @@ The build SHA256-verifies downloaded ONNX Runtime 1.28 and nlohmann/json
 headers. Offline builds can set `ONNXRUNTIME_INCLUDE_DIR` and
 `NLOHMANN_JSON_INCLUDE_DIR`.
 
-Version 0.2 introduces the device-aware `TensorBuffer` ABI, and version 0.3
-adds the cancellation surface: a `CancellationToken` member on
+Version 0.2 introduces the device-aware `TensorBuffer` ABI, version 0.3
+adds the cancellation surface — a `CancellationToken` member on
 `PipelineRunOptions`, a virtual cancellable `ModelBackend::Run`, and
-`StageRun::RequestCancellation`. C++ applications built against an earlier
-version must be recompiled when upgrading.
+`StageRun::RequestCancellation` — and version 0.5 changes the `Pipeline`
+layout by giving it a shared admission scheduler and a defaulted
+`PipelineSchedulingOptions` parameter on its constructor and on
+`Pipeline::Load`. C++ applications built against an earlier version must be
+recompiled when upgrading; source that already compiled keeps compiling,
+because every new parameter is defaulted.
 
 ## Install
 
@@ -232,4 +245,11 @@ Low-level tensor and stage execution is documented in the
   Runtime that claim is honored between graph nodes, so a single long kernel
   can overrun the deadline; and the `WorldModel` modality `generate()` methods
   and the fixed `LatentDynamicsModel` API do not take a token yet.
+- Shared admission scheduling: a global and a per-stage-kind cap on how many
+  executions run at once, with cancellation-aware fair queuing for the rest,
+  plus a `scheduling_stats` reading of what is admitted and what is queued.
+  Continuous or dynamic batching is **not** included and is not planned by
+  this change; it would additionally need request compatibility keys, tensor
+  concatenation and result splitting, per-lane recurrent state and RNG
+  streams, and a KV-cache manager that can admit and evict lanes mid-stage.
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

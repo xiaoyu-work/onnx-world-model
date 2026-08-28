@@ -14,8 +14,10 @@ types.
 - Keep implementation details out of the installed surface: `PipelineSession`,
   `PipelineSessionSnapshot`, and `StageRun` hide their state behind a private
   `Impl` pointer, `CancellationToken` and `CancellationSource` hide theirs
-  behind an opaque `detail::CancellationState`, and `Model` and `WorldModel`
-  hold abstract backend pointers rather than ONNX Runtime types.
+  behind an opaque `detail::CancellationState`, `Pipeline` holds its shared
+  admission controller as an opaque `detail::PipelineScheduler` pointer, and
+  `Model` and `WorldModel` hold abstract backend pointers rather than ONNX
+  Runtime types.
 - Stay free of ONNX Runtime and nlohmann/json includes so that consumers do not
   need those headers on their include path.
 
@@ -28,7 +30,7 @@ types.
 | `tensor.hpp` | `DataType`, canonical `TensorDevice` identities, the ORT-independent `TensorBuffer` contract, and the device-aware copy-on-write `Tensor`. |
 | `backend.hpp` | `TensorSpec`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
 | `model.hpp` | `RuntimeOptions`, device-output policy, provider discovery and library registration, `NamedTensors`, `ModelBackend` with its default cancellable `Run` overload, and `Model`. |
-| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `PipelinePackage`, `Pipeline`, `PipelineSession` with its incremental `BeginStage` and named-checkpoint methods, `PipelineSessionSnapshot`, `StageEventKind`, `StageEvent`, `StageRun`, `PipelineRunOptions`. |
+| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `PipelinePackage`, `Pipeline` with its shared `PipelineSchedulingOptions` admission limits and its `PipelineSchedulingStats` reading of them, `PipelineSession` with its incremental `BeginStage` and named-checkpoint methods, `PipelineSessionSnapshot`, `StageEventKind`, `StageEvent`, `StageRun`, `PipelineRunOptions`. |
 | `world_model.hpp` | `WorldModel` and `Rollout`, the fixed three-input/four-output latent-dynamics API. |
 | `onnx_world_model.hpp` | Umbrella header that includes all of the above. |
 
@@ -53,8 +55,15 @@ version 0.3.0 was such a change: `CancellationToken` is a new member of
 `PipelineRunOptions`, `ModelBackend` gained a virtual method, and `StageRun`
 gained `RequestCancellation`. Version 0.4.0 adds
 `CancellationToken::WaitForCancellation` and
-`CancellationSource::WaitForCancellation`, which is another declaration
-change, so the library carries `SOVERSION 0.4`.
+`CancellationSource::WaitForCancellation`. Version 0.5.0 adds
+`PipelineSchedulingOptions`, a second `Pipeline` constructor parameter, a
+third `Pipeline::Load` parameter, the `PipelineSchedulingStats` value type
+with `Pipeline::scheduling_stats` that reports the shared controller's
+admitted and queued counts, and a `Pipeline` data member holding that
+controller, which changes the class layout; the library
+therefore carries `SOVERSION 0.5` and a C++ consumer built against 0.4 must be
+recompiled. Every one of those parameters is defaulted, so source that already
+compiled keeps compiling and keeps its unlimited behavior.
 
 ## Tests
 
@@ -69,7 +78,8 @@ ctest --preset dev
 covers `model.hpp` and `backend.hpp`,
 `tests/cpp/cancellation_test.cpp` covers `cancellation.hpp`, and
 `tests/cpp/pipeline_test.cpp`, `tests/cpp/pipeline_snapshot_test.cpp`,
-`tests/cpp/pipeline_stream_test.cpp`, and
-`tests/cpp/pipeline_cancellation_test.cpp` cover `pipeline.hpp`.
+`tests/cpp/pipeline_stream_test.cpp`,
+`tests/cpp/pipeline_cancellation_test.cpp`, and
+`tests/cpp/pipeline_scheduler_test.cpp` cover `pipeline.hpp`.
 `tests/python/` reaches the same declarations through the `_native` extension
 module.

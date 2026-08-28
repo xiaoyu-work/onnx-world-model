@@ -19,6 +19,13 @@ expects.
   image and video patch packing, latent-token layout, and conditioning frames.
 - Offer the modality-oriented `WorldModel` API (`text`, `image`, `video`,
   `action`) and report the capabilities the loaded package actually declares.
+- Forward the pipeline-only admission-scheduling options —
+  `max_concurrent_executions` and `max_concurrent_by_stage_kind` — from
+  `Pipeline` and `WorldModel` to the native layer, and report the accepted
+  values back as read-only properties. `Pipeline.scheduling_stats` reads the
+  same controller and returns a frozen `PipelineSchedulingStats` with the
+  admitted and queued counts, in total and per stage kind. `OnnxModel` and
+  `LatentDynamicsModel` do not accept them, because they are not pipelines.
 - Keep the low-level `OnnxModel`, `Pipeline`, `PipelineSession`,
   `PipelineSessionSnapshot`, `StageRun`, `CancellationSource`,
   `CancellationToken`, `LatentDynamicsModel`, and `Rollout` APIs available.
@@ -35,7 +42,7 @@ expects.
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline` with its admission-scheduling limits and its frozen `PipelineSchedulingStats` reading, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
 | `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
@@ -81,6 +88,9 @@ named-checkpoint wrappers,
 `tests/python/test_cancellation.py` covers `CancellationSource`,
 `CancellationToken`, the exception hierarchy, and the `cancellation` and
 `timeout` arguments,
+`tests/python/test_scheduling.py` covers the `max_concurrent_executions` and
+`max_concurrent_by_stage_kind` arguments on `Pipeline` and `WorldModel` plus
+the shape and immutability of the `Pipeline.scheduling_stats` reading,
 `tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
 and `tests/python/test_guided_generation.py` and
 `tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that
