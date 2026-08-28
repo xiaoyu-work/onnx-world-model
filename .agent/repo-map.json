@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T05:14:57.689Z",
+  "generatedAt": "2026-08-28T07:31:17.989Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "322f267ce34aea7ebf1ba42252d2e09de6be746c3aa92c42f7b586c96752c0a8",
+  "sourceFingerprint": "d18c7c4d12cfd3e4b5356b0e30c560c49f7c717a34c45cc3236d303cf2c74ab8",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -73,12 +73,13 @@
     {
       "path": "include/onnx_world_model/model.hpp",
       "kind": "source",
-      "purpose": "Declares runtime session configuration (RuntimeOptions, provider naming helpers) and Model, the generic named-tensor ONNX graph session used by every higher-level API.",
+      "purpose": "Declares runtime session and device-output configuration, execution-provider helpers and registration, and Model, the generic named-tensor ONNX graph session used by every higher-level API.",
       "publicSymbols": [
         "GraphOptimizationLevel",
         "RuntimeOptions",
         "NormalizeExecutionProviderName",
         "AvailableExecutionProviders",
+        "RegisterExecutionProviderLibrary",
         "NamedTensors",
         "ModelBackend",
         "ModelBackendPtr",
@@ -286,10 +287,11 @@
     {
       "path": "src/model.cpp",
       "kind": "source",
-      "purpose": "Implements execution-provider name normalization, tensor-versus-signature validation, ModelMetadata lookups, and the Model facade that validates every named tensor around a backend run.",
+      "purpose": "Implements execution-provider normalization and library registration, tensor-versus-signature validation, ModelMetadata lookups, and the validating Model facade.",
       "publicSymbols": [
         "NormalizeExecutionProviderName",
         "AvailableExecutionProviders",
+        "RegisterExecutionProviderLibrary",
         "ValidateTensor",
         "ModelMetadata::Input",
         "ModelMetadata::Output",
@@ -302,7 +304,7 @@
     {
       "path": "src/ort_backend.cpp",
       "kind": "source",
-      "purpose": "Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.",
+      "purpose": "Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, and uses I/O binding to retain ORT-owned output tensors on their assigned devices.",
       "publicSymbols": [
         "CreateOrtBackend",
         "GetAvailableOrtProviders"
@@ -311,10 +313,11 @@
     {
       "path": "src/ort_backend.hpp",
       "kind": "source",
-      "purpose": "Declares the factory that builds an ONNX Runtime backed ModelBackend and the query for execution providers a given ORT library offers.",
+      "purpose": "Declares the factory that builds an ONNX Runtime backed ModelBackend, execution-provider discovery, and process-wide provider-library registration.",
       "publicSymbols": [
         "onnx_world_model::detail::CreateOrtBackend",
-        "onnx_world_model::detail::GetAvailableOrtProviders"
+        "onnx_world_model::detail::GetAvailableOrtProviders",
+        "onnx_world_model::detail::RegisterOrtExecutionProviderLibrary"
       ]
     },
     {
@@ -446,7 +449,7 @@
     {
       "path": "tests/cpp/model_test.cpp",
       "kind": "test",
-      "purpose": "Standalone test executable for Model and its metadata contract, using an in-process AddOneBackend stub instead of a real ONNX Runtime session.",
+      "purpose": "Standalone test executable for Model, runtime option defaults, provider helpers, and the named-tensor metadata contract, using an in-process AddOneBackend stub.",
       "publicSymbols": [
         "main"
       ]

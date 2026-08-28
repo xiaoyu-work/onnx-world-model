@@ -23,7 +23,7 @@ and the fixed latent-dynamics compatibility types.
 | `error.hpp` | `ErrorCode` categories and the `Error` exception thrown by every entry point. |
 | `tensor.hpp` | `DataType`, canonical `TensorDevice` identities, the ORT-independent `TensorBuffer` contract, and the device-aware copy-on-write `Tensor`. |
 | `backend.hpp` | `TensorSpec`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
-| `model.hpp` | `RuntimeOptions`, `GraphOptimizationLevel`, provider-name helpers, `NamedTensors`, `ModelBackend`, `Model`. |
+| `model.hpp` | `RuntimeOptions`, device-output policy, provider discovery and library registration, `NamedTensors`, `ModelBackend`, and `Model`. |
 | `pipeline.hpp` | Manifest value types, `PipelineManifest`, `PipelinePackage`, `Pipeline`, `PipelineSession`, `PipelineRunOptions`. |
 | `world_model.hpp` | `WorldModel` and `Rollout`, the fixed three-input/four-output latent-dynamics API. |
 | `onnx_world_model.hpp` | Umbrella header that includes all of the above. |

@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Standalone test executable for Model and its metadata contract, using an in-process AddOneBackend stub instead of a real ONNX Runtime session.
+ * @agent-purpose: Standalone test executable for Model, runtime option defaults, provider helpers, and the named-tensor metadata contract, using an in-process AddOneBackend stub.
  * @agent-public-api: main
- * @agent-invariants: Registered with CTest as model_test; it counts failures through local Check and CheckThrows helpers and returns a non-zero exit code when any check fails. It covers input and output name validation, dtype and shape mismatches, and provider-name normalization through a stub ModelBackend, so it never loads an ONNX Runtime library or a model file.
+ * @agent-invariants: Registered with CTest as model_test; it counts failures through local Check and CheckThrows helpers and returns a non-zero exit code when any check fails. It covers input and output validation, runtime defaults, provider-name normalization, and registration argument rejection through public APIs; invalid provider-library paths fail before ONNX Runtime is loaded.
  * @agent-side-effects: Writes failure descriptions to stderr and returns a process exit code.
  */
 
@@ -78,6 +78,7 @@ class AddOneBackend final : public onnx_world_model::ModelBackend {
 int main() {
   using onnx_world_model::Model;
   using onnx_world_model::NamedTensors;
+  using onnx_world_model::RuntimeOptions;
   using onnx_world_model::Tensor;
 
   Check(
@@ -88,6 +89,14 @@ int main() {
       onnx_world_model::NormalizeExecutionProviderName(
           "CUDAExecutionProvider") == "cuda",
       "ORT provider suffix normalization");
+  Check(!RuntimeOptions{}.device_outputs, "device outputs are opt-in");
+  CheckThrows(
+      [] {
+        onnx_world_model::RegisterExecutionProviderLibrary(
+            "missing-test-provider",
+            "missing-provider-library");
+      },
+      "missing provider library must fail before loading ORT");
 
   Model model(std::make_shared<AddOneBackend>());
   const std::array<float, 2> values{2.0F, 4.0F};

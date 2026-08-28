@@ -51,6 +51,9 @@ C++ API ───────────────┤                  │
 ```
 
 - `Model` runs any ONNX graph using named tensors.
+- `Model` uses ONNX Runtime I/O binding and can opt into device-resident C++
+  outputs after registering the corresponding EP library; Python results are
+  materialized as independent NumPy arrays.
 - `Pipeline` owns immutable component sessions and can be shared by callers.
 - `PipelineSession` owns one request/trajectory's KV cache, diffusion latent,
   action state, outputs, and stage cursors.

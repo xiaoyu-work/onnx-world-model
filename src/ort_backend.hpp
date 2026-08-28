@@ -1,7 +1,7 @@
 /**
  * @agent-file
- * @agent-purpose: Declares the factory that builds an ONNX Runtime backed ModelBackend and the query for execution providers a given ORT library offers.
- * @agent-public-api: onnx_world_model::detail::CreateOrtBackend, onnx_world_model::detail::GetAvailableOrtProviders
+ * @agent-purpose: Declares the factory that builds an ONNX Runtime backed ModelBackend, execution-provider discovery, and process-wide provider-library registration.
+ * @agent-public-api: onnx_world_model::detail::CreateOrtBackend, onnx_world_model::detail::GetAvailableOrtProviders, onnx_world_model::detail::RegisterOrtExecutionProviderLibrary
  * @agent-invariants: Internal header that is not installed; it is the only seam through which the rest of src/ reaches ONNX Runtime, so no other file includes ORT headers except dynamic_library.cpp.
  * @agent-side-effects: none in this header; the declared functions load the ORT library and read model files.
  */
@@ -20,5 +20,9 @@ namespace onnx_world_model::detail {
     const RuntimeOptions& options);
 [[nodiscard]] std::vector<std::string> GetAvailableOrtProviders(
     const std::filesystem::path& library_path);
+void RegisterOrtExecutionProviderLibrary(
+    std::string_view registration_name,
+    const std::filesystem::path& provider_library_path,
+    const std::filesystem::path& ort_library_path);
 
 }  // namespace onnx_world_model::detail

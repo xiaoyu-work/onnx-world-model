@@ -2,10 +2,10 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares runtime session configuration (RuntimeOptions, provider naming helpers) and Model, the generic named-tensor ONNX graph session used by every higher-level API.
- * @agent-public-api: GraphOptimizationLevel, RuntimeOptions, NormalizeExecutionProviderName, AvailableExecutionProviders, NamedTensors, ModelBackend, ModelBackendPtr, Model
- * @agent-invariants: Model rejects a null backend; Model::Run validates every input and output tensor against metadata, so unknown or missing names throw instead of reaching ONNX Runtime; provider names are compared only after NormalizeExecutionProviderName folds case, separators, and the ExecutionProvider suffix.
- * @agent-side-effects: none in this header; the declared Model::Load and AvailableExecutionProviders load the ONNX Runtime shared library and read model files.
+ * @agent-purpose: Declares runtime session and device-output configuration, execution-provider helpers and registration, and Model, the generic named-tensor ONNX graph session used by every higher-level API.
+ * @agent-public-api: GraphOptimizationLevel, RuntimeOptions, NormalizeExecutionProviderName, AvailableExecutionProviders, RegisterExecutionProviderLibrary, NamedTensors, ModelBackend, ModelBackendPtr, Model
+ * @agent-invariants: Model rejects a null backend; Model::Run validates every input and output tensor against metadata, so unknown or missing names throw instead of reaching ONNX Runtime. Device outputs are opt-in and require the corresponding provider library to be registered with the process-wide ORT environment before materialization. Provider names are compared only after NormalizeExecutionProviderName folds case, separators, and the ExecutionProvider suffix.
+ * @agent-side-effects: none in this header; the declared load, provider-query, and provider-registration functions load shared libraries or model files.
  */
 
 #include <filesystem>
@@ -32,6 +32,7 @@ struct RuntimeOptions {
   int inter_op_threads{0};
   int log_severity{3};
   GraphOptimizationLevel graph_optimization{GraphOptimizationLevel::all};
+  bool device_outputs{false};
   std::vector<std::string> providers;
   std::unordered_map<
       std::string,
@@ -42,6 +43,10 @@ struct RuntimeOptions {
 [[nodiscard]] std::string NormalizeExecutionProviderName(
     std::string_view name);
 [[nodiscard]] std::vector<std::string> AvailableExecutionProviders(
+    const std::filesystem::path& ort_library_path = {});
+void RegisterExecutionProviderLibrary(
+    std::string_view registration_name,
+    const std::filesystem::path& provider_library_path,
     const std::filesystem::path& ort_library_path = {});
 
 using NamedTensors = std::unordered_map<std::string, Tensor>;

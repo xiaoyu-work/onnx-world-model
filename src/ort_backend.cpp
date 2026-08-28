@@ -1,9 +1,9 @@
 /**
  * @agent-file
- * @agent-purpose: Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.
+ * @agent-purpose: Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, and uses I/O binding to retain ORT-owned output tensors on their assigned devices.
  * @agent-public-api: CreateOrtBackend, GetAvailableOrtProviders
- * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options, including log severity and execution providers. Until device I/O binding is enabled, every device-buffer input is synchronously materialized and retained on CPU for the complete ORT Run call. Requested execution providers are matched by NormalizeExecutionProviderName, and a provider the loaded ORT build does not offer is an error rather than a silent CPU fallback. DataType and ONNXTensorElementDataType map one-to-one; an unmapped ONNX element type throws ErrorCode::model_contract.
- * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions, may transfer device inputs to CPU, and runs inference.
+ * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options. Opt-in I/O binding places each output in the device memory assigned by ORT graph partitioning; the resulting TensorBuffer owns the Ort::Value and a flattened set of session, binding, and aliased-input lifetime roots. ORT-backed inputs bind without copying only when their original dtype and shape match the enclosing Tensor view and their device matches the destination input plan; incompatible, foreign, or reshaped device buffers are synchronously materialized and retained on CPU for the complete Run call. Requested provider lists fail when no available provider can satisfy them instead of silently selecting CPU.
+ * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions and output buffers, may transfer foreign device inputs to CPU, and runs inference.
  */
 
 #include "ort_backend.hpp"
@@ -175,26 +175,6 @@ namespace {
       shape.data(),
       shape.size(),
       ToOrtDataType(tensor.data_type()));
-}
-
-[[nodiscard]] Tensor CopyOrtTensor(const Ort::Value& value) {
-  if (!value.IsTensor()) {
-    throw Error(ErrorCode::runtime_execution, "ONNX Runtime returned a non-tensor value");
-  }
-  const auto info = value.GetTensorTypeAndShapeInfo();
-  Tensor tensor(
-      FromOrtDataType(info.GetElementType()),
-      info.GetShape());
-  if (tensor.size_bytes() != info.GetElementCount() * DataTypeSize(tensor.data_type())) {
-    throw Error(
-        ErrorCode::runtime_execution,
-        "ONNX Runtime returned an inconsistent tensor byte size");
-  }
-  std::memcpy(
-      tensor.mutable_bytes().data(),
-      value.GetTensorRawData(),
-      tensor.size_bytes());
-  return tensor;
 }
 
 using ProviderOptions =
@@ -418,10 +398,250 @@ Ort::Env& SharedOrtEnvironment() {
   return environment;
 }
 
+[[nodiscard]] std::string DeviceTypeForMemory(
+    const Ort::ConstMemoryInfo& memory_info) {
+  if (memory_info.GetDeviceType() == OrtMemoryInfoDeviceType_CPU) {
+    return "cpu";
+  }
+  const std::string allocator =
+      NormalizeExecutionProviderName(memory_info.GetAllocatorName());
+  if (!allocator.empty() && allocator != "cpu") {
+    return allocator;
+  }
+  switch (memory_info.GetDeviceType()) {
+    case OrtMemoryInfoDeviceType_GPU:
+      return "gpu";
+    case OrtMemoryInfoDeviceType_FPGA:
+      return "fpga";
+    case OrtMemoryInfoDeviceType_NPU:
+      return "npu";
+    case OrtMemoryInfoDeviceType_CPU:
+      return "cpu";
+  }
+  throw Error(
+      ErrorCode::runtime_execution,
+      "ONNX Runtime returned an unknown tensor device type");
+}
+
+[[nodiscard]] TensorDevice TensorDeviceForMemory(
+    const Ort::ConstMemoryInfo& memory_info) {
+  return TensorDevice(
+      DeviceTypeForMemory(memory_info),
+      memory_info.GetDeviceId());
+}
+
+class OrtTensorBuffer final : public TensorBuffer {
+ public:
+  OrtTensorBuffer(
+      Ort::Value value,
+      std::shared_ptr<Ort::Session> session_keep_alive,
+      std::shared_ptr<Ort::IoBinding> run_keep_alive,
+      const std::vector<std::shared_ptr<TensorBuffer>>& input_buffers)
+      : value_(std::move(value)) {
+    if (!value_.IsTensor()) {
+      throw Error(
+          ErrorCode::runtime_execution,
+          "ONNX Runtime returned a non-tensor value");
+    }
+    if (session_keep_alive == nullptr) {
+      throw Error(
+          ErrorCode::runtime_execution,
+          "ONNX Runtime tensor storage has no owning session");
+    }
+    if (run_keep_alive == nullptr) {
+      throw Error(
+          ErrorCode::runtime_execution,
+          "ONNX Runtime tensor storage has no owning I/O binding");
+    }
+    AddLifetimeOwner(std::move(session_keep_alive));
+    const auto type_info = value_.GetTensorTypeAndShapeInfo();
+    data_type_ = FromOrtDataType(type_info.GetElementType());
+    shape_ = type_info.GetShape();
+    size_bytes_ = value_.GetTensorSizeInBytes();
+    data_ = value_.GetTensorRawData();
+    const auto memory_info = value_.GetTensorMemoryInfo();
+    device_ = TensorDeviceForMemory(memory_info);
+    host_accessible_ =
+        memory_info.GetDeviceType() == OrtMemoryInfoDeviceType_CPU ||
+        memory_info.GetDeviceMemoryType() ==
+            OrtDeviceMemoryType_HOST_ACCESSIBLE;
+    if (!RetainAliasedInputs(input_buffers)) {
+      AddLifetimeOwner(std::move(run_keep_alive));
+    }
+  }
+
+  [[nodiscard]] DataType data_type() const noexcept {
+    return data_type_;
+  }
+
+  [[nodiscard]] const std::vector<std::int64_t>& shape() const noexcept {
+    return shape_;
+  }
+
+  [[nodiscard]] const Ort::Value& value() const noexcept {
+    return value_;
+  }
+
+  [[nodiscard]] const TensorDevice& device() const noexcept override {
+    return device_;
+  }
+
+  [[nodiscard]] std::size_t size_bytes() const noexcept override {
+    return size_bytes_;
+  }
+
+  [[nodiscard]] bool is_host_accessible() const noexcept override {
+    return host_accessible_;
+  }
+
+  [[nodiscard]] const void* data() const noexcept override {
+    return data_;
+  }
+
+  [[nodiscard]] std::span<const std::byte> bytes() const override {
+    if (!host_accessible_) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "ONNX Runtime device tensor is not host-accessible");
+    }
+    return {
+        static_cast<const std::byte*>(data_),
+        size_bytes_,
+    };
+  }
+
+  void CopyToCpu(std::span<std::byte> destination) const override {
+    if (destination.size() != size_bytes_) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "ONNX Runtime tensor copy destination has the wrong byte size");
+    }
+    try {
+      if (host_accessible_) {
+        std::memcpy(destination.data(), data_, size_bytes_);
+        return;
+      }
+      Ort::MemoryInfo cpu_memory = Ort::MemoryInfo::CreateCpu(
+          OrtDeviceAllocator,
+          OrtMemTypeDefault);
+      Ort::Value cpu_value = Ort::Value::CreateTensor(
+          cpu_memory,
+          destination.data(),
+          destination.size(),
+          shape_.data(),
+          shape_.size(),
+          ToOrtDataType(data_type_));
+      const Ort::Status status = SharedOrtEnvironment().CopyTensor(
+          value_,
+          cpu_value,
+          nullptr);
+      if (!status.IsOK()) {
+        throw Error(
+            ErrorCode::runtime_execution,
+            "ONNX Runtime device-to-CPU copy failed: " +
+                status.GetErrorMessage());
+      }
+    } catch (const Error&) {
+      throw;
+    } catch (const Ort::Exception& exception) {
+      throw Error(
+          ErrorCode::runtime_execution,
+          "ONNX Runtime device-to-CPU copy failed: " +
+              std::string(exception.what()));
+    }
+  }
+
+ private:
+  template <typename Owner>
+  void AddLifetimeOwner(std::shared_ptr<Owner> owner) {
+    if (owner == nullptr) {
+      return;
+    }
+    std::shared_ptr<const void> erased = std::move(owner);
+    const auto found = std::ranges::find(
+        lifetime_owners_,
+        erased.get(),
+        [](const std::shared_ptr<const void>& value) {
+          return value.get();
+        });
+    if (found == lifetime_owners_.end()) {
+      lifetime_owners_.push_back(std::move(erased));
+    }
+  }
+
+  [[nodiscard]] bool RetainAliasedInputs(
+      const std::vector<std::shared_ptr<TensorBuffer>>& input_buffers) {
+    bool retained = false;
+    const auto output_begin = reinterpret_cast<std::uintptr_t>(data_);
+    const auto output_end =
+        size_bytes_ > std::numeric_limits<std::uintptr_t>::max() - output_begin
+            ? std::numeric_limits<std::uintptr_t>::max()
+            : output_begin + size_bytes_;
+    for (const auto& input : input_buffers) {
+      if (input == nullptr || input->data() == nullptr) {
+        continue;
+      }
+      bool aliases = input->data() == data_;
+      if (!aliases && host_accessible_ && input->is_host_accessible()) {
+        const auto input_begin =
+            reinterpret_cast<std::uintptr_t>(input->data());
+        const auto input_end =
+            input->size_bytes() >
+                    std::numeric_limits<std::uintptr_t>::max() - input_begin
+                ? std::numeric_limits<std::uintptr_t>::max()
+                : input_begin + input->size_bytes();
+        aliases =
+            output_begin < input_end && input_begin < output_end;
+      }
+      if (aliases) {
+        retained = true;
+        const auto ort_input =
+            std::dynamic_pointer_cast<OrtTensorBuffer>(input);
+        if (ort_input != nullptr) {
+          for (const auto& owner : ort_input->lifetime_owners_) {
+            AddLifetimeOwner(owner);
+          }
+        } else {
+          AddLifetimeOwner(input);
+        }
+      }
+    }
+    return retained;
+  }
+
+  std::vector<std::shared_ptr<const void>> lifetime_owners_;
+  Ort::Value value_;
+  DataType data_type_{DataType::float32};
+  std::vector<std::int64_t> shape_;
+  std::size_t size_bytes_{0};
+  const void* data_{nullptr};
+  TensorDevice device_;
+  bool host_accessible_{false};
+};
+
+[[nodiscard]] Tensor WrapOrtTensor(
+    Ort::Value value,
+    const std::shared_ptr<Ort::Session>& session_keep_alive,
+    const std::shared_ptr<Ort::IoBinding>& run_keep_alive,
+    const std::vector<std::shared_ptr<TensorBuffer>>& input_buffers) {
+  auto buffer = std::make_shared<OrtTensorBuffer>(
+      std::move(value),
+      session_keep_alive,
+      run_keep_alive,
+      input_buffers);
+  const DataType data_type = buffer->data_type();
+  std::vector<std::int64_t> shape = buffer->shape();
+  return Tensor::FromBuffer(
+      data_type,
+      std::move(shape),
+      std::move(buffer));
+}
+
 class OrtBackend final : public ModelBackend {
  public:
   OrtBackend(const std::filesystem::path& model_path, const RuntimeOptions& options)
-      : memory_info_(Ort::MemoryInfo::CreateCpu(
+      : device_outputs_(options.device_outputs),
+        memory_info_(Ort::MemoryInfo::CreateCpu(
             OrtArenaAllocator,
             OrtMemTypeDefault)) {
     if (options.intra_op_threads < 0 || options.inter_op_threads < 0) {
@@ -449,19 +669,21 @@ class OrtBackend final : public ModelBackend {
       session_options_.AddConfigEntry(
           "session.disable_cpu_ep_fallback", "1");
     }
-    session_ = Ort::Session(
+    session_ = std::make_shared<Ort::Session>(
         SharedOrtEnvironment(),
         model_path.c_str(),
         session_options_);
 
     Ort::AllocatorWithDefaultOptions allocator;
-    metadata_.inputs.reserve(session_.GetInputCount());
-    for (std::size_t index = 0; index < session_.GetInputCount(); ++index) {
-      metadata_.inputs.push_back(ReadTensorSpec(session_, index, true, allocator));
+    metadata_.inputs.reserve(session_->GetInputCount());
+    for (std::size_t index = 0; index < session_->GetInputCount(); ++index) {
+      metadata_.inputs.push_back(
+          ReadTensorSpec(*session_, index, true, allocator));
     }
-    metadata_.outputs.reserve(session_.GetOutputCount());
-    for (std::size_t index = 0; index < session_.GetOutputCount(); ++index) {
-      metadata_.outputs.push_back(ReadTensorSpec(session_, index, false, allocator));
+    metadata_.outputs.reserve(session_->GetOutputCount());
+    for (std::size_t index = 0; index < session_->GetOutputCount(); ++index) {
+      metadata_.outputs.push_back(
+          ReadTensorSpec(*session_, index, false, allocator));
     }
   }
 
@@ -471,32 +693,65 @@ class OrtBackend final : public ModelBackend {
 
   [[nodiscard]] NamedTensors Run(const NamedTensors& inputs) const override {
     try {
+      auto binding = std::make_shared<Ort::IoBinding>(*session_);
+      const auto input_memory = session_->GetMemoryInfoForInputs();
+      if (input_memory.size() != metadata_.inputs.size()) {
+        throw Error(
+            ErrorCode::runtime_execution,
+            "ONNX Runtime returned an unexpected input memory plan");
+      }
       std::vector<Tensor> cpu_inputs;
       cpu_inputs.reserve(metadata_.inputs.size());
       std::vector<Ort::Value> input_values;
       input_values.reserve(metadata_.inputs.size());
-      std::vector<const char*> input_names;
-      input_names.reserve(metadata_.inputs.size());
-      for (const auto& spec : metadata_.inputs) {
-        input_names.push_back(spec.name.c_str());
-        cpu_inputs.push_back(inputs.at(spec.name).CopyToCpu());
-        input_values.push_back(
-            MakeOrtTensor(cpu_inputs.back(), memory_info_));
+      std::vector<std::shared_ptr<TensorBuffer>> input_buffers;
+      input_buffers.reserve(metadata_.inputs.size());
+      for (std::size_t index = 0; index < metadata_.inputs.size(); ++index) {
+        const TensorSpec& spec = metadata_.inputs[index];
+        const Tensor& input = inputs.at(spec.name);
+        const auto ort_buffer =
+            std::dynamic_pointer_cast<OrtTensorBuffer>(input.buffer());
+        const OrtMemoryInfo* expected_memory = input_memory[index];
+        const bool device_compatible =
+            expected_memory != nullptr &&
+            ort_buffer != nullptr &&
+            ort_buffer->device() ==
+                TensorDeviceForMemory(input_memory[index]);
+        if (ort_buffer != nullptr &&
+            ort_buffer->data_type() == input.data_type() &&
+            ort_buffer->shape() == input.shape() &&
+            device_compatible) {
+          binding->BindInput(spec.name.c_str(), ort_buffer->value());
+          input_buffers.push_back(input.buffer());
+        } else {
+          cpu_inputs.push_back(input.CopyToCpu());
+          input_values.push_back(
+              MakeOrtTensor(cpu_inputs.back(), memory_info_));
+          binding->BindInput(spec.name.c_str(), input_values.back());
+          input_buffers.push_back(cpu_inputs.back().buffer());
+        }
       }
 
-      std::vector<const char*> output_names;
-      output_names.reserve(metadata_.outputs.size());
-      for (const auto& spec : metadata_.outputs) {
-        output_names.push_back(spec.name.c_str());
+      binding->SynchronizeInputs();
+      const auto output_memory = session_->GetMemoryInfoForOutputs();
+      if (output_memory.size() != metadata_.outputs.size()) {
+        throw Error(
+            ErrorCode::runtime_execution,
+            "ONNX Runtime returned an unexpected output memory plan");
       }
-      auto outputs = session_.Run(
-          Ort::RunOptions{nullptr},
-          input_names.data(),
-          input_values.data(),
-          input_values.size(),
-          output_names.data(),
-          output_names.size());
-      if (outputs.size() != output_names.size()) {
+      for (std::size_t index = 0; index < metadata_.outputs.size(); ++index) {
+        const OrtMemoryInfo* location = output_memory[index];
+        binding->BindOutput(
+            metadata_.outputs[index].name.c_str(),
+            !device_outputs_ || location == nullptr
+                ? static_cast<const OrtMemoryInfo*>(memory_info_)
+                : location);
+      }
+
+      session_->Run(Ort::RunOptions{nullptr}, *binding);
+      binding->SynchronizeOutputs();
+      auto outputs = binding->GetOutputValues();
+      if (outputs.size() != metadata_.outputs.size()) {
         throw Error(
             ErrorCode::runtime_execution,
             "ONNX Runtime returned an unexpected number of outputs");
@@ -506,7 +761,11 @@ class OrtBackend final : public ModelBackend {
       for (std::size_t index = 0; index < outputs.size(); ++index) {
         result.emplace(
             metadata_.outputs[index].name,
-            CopyOrtTensor(outputs[index]));
+            WrapOrtTensor(
+                std::move(outputs[index]),
+                session_,
+                binding,
+                input_buffers));
       }
       return result;
     } catch (const Ort::Exception& exception) {
@@ -519,7 +778,8 @@ class OrtBackend final : public ModelBackend {
 
  private:
   Ort::SessionOptions session_options_;
-  mutable Ort::Session session_{nullptr};
+  std::shared_ptr<Ort::Session> session_;
+  bool device_outputs_{false};
   Ort::MemoryInfo memory_info_;
   ModelMetadata metadata_;
 };
@@ -567,6 +827,34 @@ std::vector<std::string> GetAvailableOrtProviders(
         ErrorCode::runtime_load,
         "Failed to query ONNX Runtime execution providers: " +
             std::string(exception.what()));
+  }
+}
+
+void RegisterOrtExecutionProviderLibrary(
+    std::string_view registration_name,
+    const std::filesystem::path& provider_library_path,
+    const std::filesystem::path& ort_library_path) {
+  if (registration_name.empty()) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Execution provider registration name cannot be empty");
+  }
+  if (!std::filesystem::is_regular_file(provider_library_path)) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Execution provider library does not exist: " +
+            provider_library_path.string());
+  }
+  InitializeOrtApi(ort_library_path);
+  try {
+    SharedOrtEnvironment().RegisterExecutionProviderLibrary(
+        std::string(registration_name).c_str(),
+        std::filesystem::canonical(provider_library_path).native());
+  } catch (const Ort::Exception& exception) {
+    throw Error(
+        ErrorCode::runtime_load,
+        "Failed to register ONNX Runtime execution provider library '" +
+            std::string(registration_name) + "': " + exception.what());
   }
 }
 

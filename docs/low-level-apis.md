@@ -29,9 +29,20 @@ device-only storage raises; call `Tensor::CopyToCpu()` at an explicit host
 boundary.
 
 Owned tensor constructors still allocate CPU storage and preserve copy-on-write
-mutation. The generic ORT and pipeline paths currently stage device buffers
-through CPU; native device-to-device component handoff is enabled separately by
-the I/O-binding executor.
+mutation. `Model::Run` uses ORT I/O binding and binds outputs to CPU by default.
+C++ callers may register an EP library with
+`RegisterExecutionProviderLibrary`, set `RuntimeOptions.device_outputs = true`,
+and receive outputs in the memory location assigned by graph partitioning. An
+ORT-backed output can bind directly as a later model input; foreign device
+buffers stage through CPU. EP registration is required because device-to-CPU
+materialization uses the process-wide ORT data-transfer registry.
+
+Python `OnnxModel.run()` always returns independent NumPy arrays and therefore
+materializes device outputs.
+
+Pipeline execution currently materializes component outputs before applying its
+CPU transforms. Device-to-device pipeline connections are enabled separately by
+the connection planner.
 
 ## Latent dynamics
 

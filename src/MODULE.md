@@ -25,7 +25,7 @@ execution, and the fixed latent-dynamics compatibility layer.
 | File | Responsibility |
 |---|---|
 | `dynamic_library.hpp/.cpp` | RAII shared-library handle; binds the `OrtApi` table once per process. |
-| `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, and marshals tensors. |
+| `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, and retains I/O-bound outputs in ORT-owned device buffers. |
 | `tensor.cpp` | Canonical tensor devices, owned CPU buffers, checked shape arithmetic, explicit CPU materialization, and copy-on-write mutation. |
 | `model.cpp` | `Model` facade, provider-name normalization, tensor-versus-signature validation. |
 | `world_model.cpp` | `WorldModel` contract enforcement and `Rollout` recurrent state. |

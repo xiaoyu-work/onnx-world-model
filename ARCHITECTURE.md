@@ -61,8 +61,8 @@ Within `src/` the runtime is layered:
 - `dynamic_library` loads the ORT shared library and binds `OrtApi` once per
   process.
 - `ort_backend` is the only other translation unit that touches ORT; it owns
-  the process-wide ORT environment, builds component sessions, and marshals
-  tensors.
+  the process-wide ORT environment, builds component sessions, and uses I/O
+  binding to wrap ORT-owned outputs in device-aware tensors.
 - `model` validates named tensors against graph signatures.
 - `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
@@ -129,11 +129,13 @@ language boundary as independent NumPy arrays, so the binding materializes
 device storage to CPU before copying it; `float16` and `bfloat16` cross as raw
 two-byte views.
 
-Until device I/O binding is selected by the pipeline executor, the generic ORT
-backend and pipeline execution boundary materialize device buffers to CPU. This
-keeps custom device-buffer inputs correct without labeling accelerator pointers
-as CPU memory; the I/O-binding layer replaces that staging path for compatible
-component connections.
+The generic ORT backend uses I/O binding. By default it binds outputs to CPU;
+when `RuntimeOptions.device_outputs` is enabled after registering the
+corresponding EP library, it leaves each output on the device selected by graph
+partitioning. An ORT-backed tensor can bind directly into a later model
+invocation; foreign device buffers use explicit CPU staging. The pipeline
+execution boundary still materializes component outputs before its CPU
+transforms until device-aware connection planning is enabled.
 
 ## Entry Points
 
@@ -189,6 +191,11 @@ and the `onnx-world-model` wheel built by scikit-build-core.
 - **Shared ORT environment.** Every component session uses one process-wide
   `Ort::Env`. Thread counts, logging severity, graph optimization, and
   execution providers remain session-specific.
+- **ORT-owned device outputs.** Opt-in generic model execution binds outputs to
+  the memory locations selected by ORT. Returned buffers retain their
+  `Ort::Value` plus a flattened set of required session, binding, and aliased
+  input lifetime roots, and use an environment-registered EP data transfer for
+  explicit CPU materialization.
 - **Compatibility aliases.** `WorldModelPipeline` and `LegacyWorldModel` must
   keep pointing at `Pipeline` and `LatentDynamicsModel`.
 
