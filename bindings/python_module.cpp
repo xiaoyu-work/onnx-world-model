@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
  * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime or provider-library call and around the session snapshot, restore, and fork operations that take the session lock, and C++ Error is translated into the Python WorldModelError. PipelineSessionSnapshot is exposed as an opaque handle with no Python constructor, so it can only come from PipelineSession.snapshot().
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime or provider-library call and around the session snapshot, restore, fork, and named-checkpoint operations that take the session lock, and C++ Error is translated into the Python WorldModelError. PipelineSessionSnapshot is exposed as an opaque handle with no Python constructor, so it can only come from PipelineSession.snapshot(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle.
  * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
@@ -610,7 +610,35 @@ PYBIND11_MODULE(_native, module) {
           [](const PipelineSession& session) {
             py::gil_scoped_release release;
             return std::make_unique<PipelineSession>(session.Fork());
-          });
+          })
+      .def(
+          "checkpoint",
+          [](PipelineSession& session, const std::string& name) {
+            py::gil_scoped_release release;
+            session.Checkpoint(name);
+          },
+          py::arg("name"))
+      .def(
+          "restore_checkpoint",
+          [](PipelineSession& session, const std::string& name) {
+            py::gil_scoped_release release;
+            session.RestoreCheckpoint(name);
+          },
+          py::arg("name"))
+      .def(
+          "drop_checkpoint",
+          [](PipelineSession& session, const std::string& name) {
+            py::gil_scoped_release release;
+            session.DropCheckpoint(name);
+          },
+          py::arg("name"))
+      .def(
+          "has_checkpoint",
+          [](const PipelineSession& session, const std::string& name) {
+            py::gil_scoped_release release;
+            return session.HasCheckpoint(name);
+          },
+          py::arg("name"));
 
   py::class_<Rollout>(module, "Rollout")
       .def("reset", py::overload_cast<>(&Rollout::Reset))

@@ -301,7 +301,7 @@ selects the official behavior; any other field under `chat` is rejected.
 releases each stage after execution. Explicit `run_stage()` calls are clearer
 when stages need different prepared inputs.
 
-## Session snapshots
+## Session snapshots and named checkpoints
 
 A session can capture everything it has accumulated and rewind or branch from
 that capture:
@@ -337,6 +337,47 @@ paged out, and cannot be sent to another process. A snapshot stays bound to
 the `Pipeline` it was taken from: restoring it into a session from a
 separately loaded `Pipeline` raises `WorldModelError` even when both packages
 are byte-for-byte identical.
+
+### Named checkpoints
+
+When a caller would otherwise track snapshot handles itself, the session can
+hold them by name instead:
+
+```python
+session.checkpoint("before_branch")
+
+session.run_stage("world_generation", options={"num_inference_steps": 20})
+session.restore_checkpoint("before_branch")   # rewind and try again
+
+assert session.has_checkpoint("before_branch")
+session.drop_checkpoint("before_branch")
+```
+
+- `checkpoint(name)` captures exactly what `snapshot()` captures and stores it
+  under `name`, replacing any checkpoint already stored there. The capture and
+  the store happen together, so the checkpoint is the state the session held at
+  one instant.
+- `restore_checkpoint(name)` rewinds the session to that checkpoint with the
+  same all-or-nothing behaviour as `restore()`, and leaves the checkpoint
+  available for reuse.
+- `drop_checkpoint(name)` discards it. Dropping a name the session does not
+  hold raises `WorldModelError` rather than silently succeeding.
+- `has_checkpoint(name)` reports whether the name is currently held.
+- An empty name raises `WorldModelError` from every one of the four methods.
+
+Named checkpoints are control metadata that lives beside the execution state,
+not inside it:
+
+- they survive stage execution, `release_stage()`, and `restore()`;
+- `restore()` replaces the execution state only, so the session receiving a
+  snapshot keeps its own checkpoint names and gains none from the source;
+- a snapshot never carries checkpoints, so `fork()` inherits the parent's
+  execution state but starts with an empty checkpoint namespace;
+- `reset()` clears every named checkpoint along with the session state.
+
+This is in-memory transaction support. It is not paged KV attention, and it is
+not disk serialization: no checkpoint is written to disk, paged out, or shared
+across processes.
 
 ## Conditioned, guided stages
 
@@ -428,12 +469,27 @@ NamedTensors outputs = session.RunStage(
 PipelineSessionSnapshot checkpoint = session.Snapshot();
 PipelineSession branch = session.Fork();
 session.Restore(checkpoint);
+
+session.Checkpoint("before_branch");
+if (session.HasCheckpoint("before_branch")) {
+  session.RestoreCheckpoint("before_branch");
+  session.DropCheckpoint("before_branch");
+}
 ```
 
 `PipelineSessionSnapshot` has no public constructor, so it can only come from
 `PipelineSession::Snapshot()`. `Restore` and `Fork` take the session lock, and
 `Restore` throws `Error` with `ErrorCode::state` when the snapshot came from a
 session on a different `PipelinePackage` instance.
+
+`Checkpoint`, `RestoreCheckpoint`, `DropCheckpoint`, and `HasCheckpoint` take
+that same lock. `Checkpoint` captures and publishes under one lock hold, so its
+linearization point is that single acquisition; `RestoreCheckpoint` linearizes
+twice — once where it copies the named checkpoint handle, once where `Restore`
+commits — and never holds the lock across the delegation, so it cannot
+deadlock. An empty name throws `ErrorCode::invalid_argument`; restoring or
+dropping a name the session does not hold throws `ErrorCode::state` and changes
+nothing.
 
 ## Runtime scope
 
@@ -444,8 +500,9 @@ session on a different `PipelinePackage` instance.
   driven by the stage's `guidance` and `conditioning` options rather than by
   model names.
 - KV-cache, request, sequence, iteration, and session state lifecycles.
-- In-memory session snapshot, restore, and fork. Snapshots are not serialized
-  to disk and do not cross a process boundary.
+- In-memory session snapshot, restore, fork, and named checkpoints. This is
+  in-memory transaction support, not paged KV attention: nothing is serialized
+  to disk and nothing crosses a process boundary.
 - FlowMatch Euler and flow-prediction UniPC order-1/order-2 schedulers.
 - Greedy and temperature/top-k/top-p autoregressive sampling.
 - Packed layout, attention masks, multimodal positions, scheduler timesteps,

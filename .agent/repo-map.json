@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T10:27:39.050Z",
+  "generatedAt": "2026-08-28T10:57:58.621Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "3d1eb0a66b42838798ad90574814afe7813a147a700ccc06b3c5539c6afe806e",
+  "sourceFingerprint": "b61adeaa0267a4fe3916cad9d2ff24da73232e8d9863d84beb91f11aa8982766",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -97,7 +97,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, and its in-memory PipelineSessionSnapshot.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, and the session's named in-memory checkpoints.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -402,7 +402,7 @@
     {
       "path": "src/pipeline_session.cpp",
       "kind": "source",
-      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, and fork operations.",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations.",
       "publicSymbols": [
         "Pipeline::manifest",
         "Pipeline::execution_providers",
@@ -417,6 +417,10 @@
         "PipelineSession::Snapshot",
         "PipelineSession::Restore",
         "PipelineSession::Fork",
+        "PipelineSession::Checkpoint",
+        "PipelineSession::RestoreCheckpoint",
+        "PipelineSession::DropCheckpoint",
+        "PipelineSession::HasCheckpoint",
         "PipelineSessionSnapshot::valid"
       ]
     },
@@ -476,7 +480,7 @@
     {
       "path": "tests/cpp/pipeline_snapshot_test.cpp",
       "kind": "test",
-      "purpose": "Standalone test executable for the in-memory PipelineSession snapshot, restore, and fork contract: recurrent-state round trips, parent/child independence, package identity, device-buffer sharing, and random-engine determinism.",
+      "purpose": "Standalone test executable for the in-memory PipelineSession snapshot, restore, fork, and named-checkpoint contract: recurrent-state round trips, parent/child independence, package identity, device-buffer sharing, random-engine determinism, and checkpoint create/replace/restore/drop semantics.",
       "publicSymbols": [
         "main"
       ]
@@ -535,7 +539,7 @@
     {
       "path": "tests/python/test_pipeline_snapshot.py",
       "kind": "test",
-      "purpose": "Tests the PipelineSessionSnapshot wrapper and the PipelineSession snapshot, restore, and fork methods against a small counter package built with onnx_ir.",
+      "purpose": "Tests the PipelineSessionSnapshot wrapper, the PipelineSession snapshot, restore, and fork methods, and the named in-memory checkpoint methods against a small counter package built with onnx_ir.",
       "publicSymbols": []
     },
     {

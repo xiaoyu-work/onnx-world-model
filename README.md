@@ -60,8 +60,11 @@ C++ API ───────────────┤                  │
   across component connections, recurrent state, and public outputs.
 - `PipelineSession.snapshot()` captures all of that mutable state in memory,
   and `restore()` and `fork()` rewind or branch a trajectory from it without
-  copying tensor data or leaving the process. Snapshots are not written to
-  disk and do not cross a process boundary.
+  copying tensor data or leaving the process. `checkpoint(name)`,
+  `restore_checkpoint(name)`, `drop_checkpoint(name)`, and
+  `has_checkpoint(name)` add named in-memory transaction markers over the same
+  capture. This is in-memory transaction support only: it is not paged KV and
+  nothing is serialized to disk or crosses a process boundary.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in

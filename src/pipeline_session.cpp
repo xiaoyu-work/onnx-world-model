@@ -1,9 +1,9 @@
 /**
  * @agent-file
- * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, and fork operations.
- * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSessionSnapshot::valid
- * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, and public outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot.
- * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, and Fork touch memory only; they perform no device transfer, no disk access, and no inference.
+ * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations.
+ * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid
+ * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, and public outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back.  ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint copies the checkpoint handle under the lock and only then delegates to Restore so the mutex is never re-entered, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint.
+  * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, Fork, and the checkpoint operations touch memory only; they perform no device transfer, no disk access, and no inference.
  */
 
 #include "onnx_world_model/pipeline.hpp"
@@ -34,6 +34,18 @@ using Json = nlohmann::json;
 
 [[noreturn]] void ExecutionError(std::string message) {
   throw Error(ErrorCode::runtime_execution, std::move(message));
+}
+
+// Every checkpoint entry point names a checkpoint, and an empty name is a
+// caller mistake rather than a session-state problem, so all four share this
+// check and the std::string key it produces.
+[[nodiscard]] std::string CheckpointKey(std::string_view name) {
+  if (name.empty()) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Pipeline session checkpoint name must not be empty");
+  }
+  return std::string(name);
 }
 
 const PipelineStage& FindStage(
@@ -707,6 +719,21 @@ struct PipelineSession::Impl : SessionState {
 
   std::shared_ptr<const PipelinePackage> package;
   mutable std::mutex mutex;
+  // Named checkpoints are control metadata, deliberately declared here rather
+  // than in SessionState so that capturing, restoring, or forking execution
+  // state never carries a checkpoint namespace along with it.
+  std::unordered_map<std::string, PipelineSessionSnapshot> checkpoints;
+
+  // Captures the execution bundle without touching the lock, so a caller that
+  // already holds `mutex` can capture without re-entering a public method.
+  // Copying the bundle copies Tensor values, which share their storage
+  // copy-on-write, so a device-backed tensor is never materialized here.
+  [[nodiscard]] PipelineSessionSnapshot CaptureLocked() const {
+    auto captured = std::make_shared<PipelineSessionSnapshot::Impl>();
+    captured->package = package;
+    captured->state = static_cast<const SessionState&>(*this);
+    return PipelineSessionSnapshot(std::move(captured));
+  }
 
   [[nodiscard]] const PipelineManifest& manifest() const noexcept {
     return package->manifest();
@@ -3398,6 +3425,9 @@ void PipelineSession::Reset() {
   impl_->stage_iterations.clear();
   impl_->scheduler_histories.clear();
   impl_->position_cursors.clear();
+  // Named checkpoints are session-scoped control metadata, so a reset session
+  // starts with an empty checkpoint namespace as well as empty state.
+  impl_->checkpoints.clear();
 }
 
 PipelineSessionSnapshot::PipelineSessionSnapshot(
@@ -3409,15 +3439,8 @@ bool PipelineSessionSnapshot::valid() const noexcept {
 }
 
 PipelineSessionSnapshot PipelineSession::Snapshot() const {
-  auto captured = std::make_shared<PipelineSessionSnapshot::Impl>();
-  {
-    std::scoped_lock lock(impl_->mutex);
-    captured->package = impl_->package;
-    // Copying the bundle copies Tensor values, which share their storage
-    // copy-on-write, so a device-backed tensor is never materialized here.
-    captured->state = static_cast<const SessionState&>(*impl_);
-  }
-  return PipelineSessionSnapshot(std::move(captured));
+  std::scoped_lock lock(impl_->mutex);
+  return impl_->CaptureLocked();
 }
 
 void PipelineSession::Restore(const PipelineSessionSnapshot& snapshot) {
@@ -3445,7 +3468,53 @@ PipelineSession PipelineSession::Fork() const {
   const PipelineSessionSnapshot snapshot = Snapshot();
   PipelineSession forked(snapshot.impl_->package);
   forked.Restore(snapshot);
+  // The fork deliberately keeps its freshly constructed, empty checkpoint
+  // map: a snapshot carries execution state, and checkpoint names are the
+  // property of the session that declared them.
   return forked;
+}
+
+void PipelineSession::Checkpoint(std::string_view name) {
+  std::string key = CheckpointKey(name);
+  // Capture and publish happen under one lock hold, so the stored checkpoint
+  // is exactly the state observable at the instant the lock was acquired, and
+  // no concurrent RunStage can slip between the two. Snapshot() is never
+  // called here, so the session lock is taken exactly once.
+  std::scoped_lock lock(impl_->mutex);
+  impl_->checkpoints.insert_or_assign(std::move(key), impl_->CaptureLocked());
+}
+
+void PipelineSession::RestoreCheckpoint(std::string_view name) {
+  const std::string key = CheckpointKey(name);
+  std::scoped_lock lock(impl_->mutex);
+  const auto found = impl_->checkpoints.find(key);
+  if (found == impl_->checkpoints.end()) {
+    throw Error(
+        ErrorCode::state,
+        "Pipeline session has no checkpoint named '" + key + "'");
+  }
+  // Copy before swapping so allocation failure leaves the session untouched.
+  // Lookup, copy, and commit share one lock acquisition, making restore
+  // linearizable with checkpoint replacement, dropping, reset, and stage runs.
+  SessionState restored = found->second.impl_->state;
+  impl_->Swap(restored);
+}
+
+void PipelineSession::DropCheckpoint(std::string_view name) {
+  const std::string key = CheckpointKey(name);
+  std::scoped_lock lock(impl_->mutex);
+  // Dropping an unknown checkpoint is a caller error, not a silent no-op.
+  if (impl_->checkpoints.erase(key) == 0) {
+    throw Error(
+        ErrorCode::state,
+        "Pipeline session has no checkpoint named '" + key + "'");
+  }
+}
+
+bool PipelineSession::HasCheckpoint(std::string_view name) const {
+  const std::string key = CheckpointKey(name);
+  std::scoped_lock lock(impl_->mutex);
+  return impl_->checkpoints.contains(key);
 }
 
 }  // namespace onnx_world_model

@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Standalone test executable for the in-memory PipelineSession snapshot, restore, and fork contract: recurrent-state round trips, parent/child independence, package identity, device-buffer sharing, and random-engine determinism.
+ * @agent-purpose: Standalone test executable for the in-memory PipelineSession snapshot, restore, fork, and named-checkpoint contract: recurrent-state round trips, parent/child independence, package identity, device-buffer sharing, random-engine determinism, and checkpoint create/replace/restore/drop semantics.
  * @agent-public-api: main
- * @agent-invariants: Registered with CTest as pipeline_snapshot_test; it counts failures through local Check, CheckThrows, and CheckThrowsState helpers and returns a non-zero exit code when any check fails. Every component is a stub ModelBackend, so the run needs no ONNX Runtime library, no real ONNX model, and no filesystem access: each PipelinePackage is built in memory from an embedded manifest string. CountingDeviceBuffer is a non-host-accessible TensorBuffer whose shared copy counter asserts that snapshot, fork, and restore never materialize a device tensor.
+ * @agent-invariants: Registered with CTest as pipeline_snapshot_test; it counts failures through local Check, CheckThrowsCode, CheckThrowsState, and CheckThrowsInvalidArgument helpers and returns a non-zero exit code when any check fails. Every component is a stub ModelBackend, so the run needs no ONNX Runtime library, no real ONNX model, and no filesystem access: each PipelinePackage is built in memory from an embedded manifest string. CountingDeviceBuffer is a non-host-accessible TensorBuffer whose shared copy counter asserts that snapshot, fork, restore, and checkpoint save and restore never materialize a device tensor.
  * @agent-side-effects: Writes failure descriptions to stderr.
  */
 
@@ -36,16 +36,35 @@ void Check(bool condition, const char* message) {
 }
 
 template <typename Function>
-void CheckThrowsState(Function&& function, const char* message) {
+void CheckThrowsCode(
+    Function&& function,
+    onnx_world_model::ErrorCode expected,
+    const char* message) {
   try {
     function();
     Check(false, message);
   } catch (const onnx_world_model::Error& error) {
-    if (error.code() != onnx_world_model::ErrorCode::state) {
+    if (error.code() != expected) {
       std::cerr << "FAILED: " << message << " (got: " << error.what() << ")\n";
       ++failures;
     }
   }
+}
+
+template <typename Function>
+void CheckThrowsState(Function&& function, const char* message) {
+  CheckThrowsCode(
+      std::forward<Function>(function),
+      onnx_world_model::ErrorCode::state,
+      message);
+}
+
+template <typename Function>
+void CheckThrowsInvalidArgument(Function&& function, const char* message) {
+  CheckThrowsCode(
+      std::forward<Function>(function),
+      onnx_world_model::ErrorCode::invalid_argument,
+      message);
 }
 
 // Adds one to its single float state, mutating the tensor it was handed. The
@@ -675,6 +694,177 @@ int main() {
             sampled,
             [&sampled](std::int64_t token) { return token != sampled.front(); }),
         "uniform logits actually sample more than one token value");
+  }
+
+  // Named checkpoints are in-memory transaction markers over the same capture
+  // the snapshot API performs: create, query, replace, rewind, and drop.
+  {
+    const Pipeline pipeline = MakeCounterPipeline();
+    PipelineSession session = pipeline.CreateSession();
+    (void)session.RunStage("transition");
+    (void)session.RunStage("transition");
+
+    Check(
+        !session.HasCheckpoint("before"),
+        "a fresh session holds no named checkpoint");
+    session.Checkpoint("before");
+    Check(session.HasCheckpoint("before"), "a created checkpoint is visible");
+    Check(
+        !session.HasCheckpoint("other"),
+        "an unrelated name is still absent");
+
+    // Named checkpoints survive stage execution.
+    (void)session.RunStage("transition");
+    (void)session.RunStage("transition");
+    Check(CounterValue(session) == 4.0F, "the session advances past the checkpoint");
+    Check(
+        session.HasCheckpoint("before"),
+        "stage execution preserves named checkpoints");
+
+    session.RestoreCheckpoint("before");
+    Check(CounterValue(session) == 2.0F, "restoring a checkpoint rewinds the state");
+    Check(
+        session.outputs().at("value").values<float>()[0] == 2.0F,
+        "restoring a checkpoint reproduces the public outputs");
+    Check(
+        session.HasCheckpoint("before"),
+        "restoring a checkpoint does not consume it");
+    Check(
+        session.RunStage("transition").at("value").values<float>()[0] == 3.0F,
+        "a checkpoint-restored session resumes from the captured cursor");
+
+    // Replacing a name is atomic: the old capture is simply gone.
+    session.Checkpoint("before");
+    Check(
+        session.HasCheckpoint("before"),
+        "replacing a checkpoint keeps the name");
+    (void)session.RunStage("transition");
+    session.RestoreCheckpoint("before");
+    Check(
+        CounterValue(session) == 3.0F,
+        "a replaced checkpoint restores the newer capture");
+
+    session.DropCheckpoint("before");
+    Check(!session.HasCheckpoint("before"), "a dropped checkpoint is gone");
+    CheckThrowsState(
+        [&session] { session.RestoreCheckpoint("before"); },
+        "restoring a dropped checkpoint must fail");
+    Check(
+        CounterValue(session) == 3.0F,
+        "a failed checkpoint restore leaves the session untouched");
+  }
+
+  // Unknown and empty names fail loudly instead of silently doing nothing.
+  {
+    const Pipeline pipeline = MakeCounterPipeline();
+    PipelineSession session = pipeline.CreateSession();
+    (void)session.RunStage("transition");
+
+    CheckThrowsState(
+        [&session] { session.RestoreCheckpoint("missing"); },
+        "restoring an unknown checkpoint must throw ErrorCode::state");
+    CheckThrowsState(
+        [&session] { session.DropCheckpoint("missing"); },
+        "dropping an unknown checkpoint is not a no-op");
+    Check(
+        CounterValue(session) == 1.0F,
+        "a failed checkpoint operation changes nothing");
+
+    CheckThrowsInvalidArgument(
+        [&session] { session.Checkpoint(""); },
+        "an empty checkpoint name must throw ErrorCode::invalid_argument");
+    CheckThrowsInvalidArgument(
+        [&session] { session.RestoreCheckpoint(""); },
+        "an empty restore name must throw ErrorCode::invalid_argument");
+    CheckThrowsInvalidArgument(
+        [&session] { session.DropCheckpoint(""); },
+        "an empty drop name must throw ErrorCode::invalid_argument");
+    CheckThrowsInvalidArgument(
+        [&session] { (void)session.HasCheckpoint(""); },
+        "an empty query name must throw ErrorCode::invalid_argument");
+  }
+
+  // Checkpoints are control metadata, not execution state: Reset drops them,
+  // a fork inherits none of them, and an ordinary Restore leaves the target
+  // session's own checkpoint namespace alone.
+  {
+    const Pipeline pipeline = MakeCounterPipeline();
+    PipelineSession session = pipeline.CreateSession();
+    (void)session.RunStage("transition");
+    session.Checkpoint("first");
+    session.Checkpoint("second");
+
+    PipelineSession child = session.Fork();
+    Check(CounterValue(child) == 1.0F, "a fork begins at the parent's state");
+    Check(
+        !child.HasCheckpoint("first") && !child.HasCheckpoint("second"),
+        "a fork starts with an empty named-checkpoint namespace");
+    Check(
+        session.HasCheckpoint("first") && session.HasCheckpoint("second"),
+        "forking leaves the parent's checkpoints in place");
+    CheckThrowsState(
+        [&child] { child.RestoreCheckpoint("first"); },
+        "a fork cannot restore a name it never declared");
+
+    // A snapshot carries execution state only, so restoring one neither adds
+    // nor removes names on the session that receives it.
+    child.Checkpoint("child_only");
+    const PipelineSessionSnapshot snapshot = session.Snapshot();
+    child.Restore(snapshot);
+    Check(
+        CounterValue(child) == 1.0F,
+        "an ordinary restore still replaces the execution state");
+    Check(
+        child.HasCheckpoint("child_only"),
+        "an ordinary restore preserves the target session's checkpoints");
+    Check(
+        !child.HasCheckpoint("first"),
+        "an ordinary restore does not import the source session's checkpoints");
+
+    session.Reset();
+    Check(
+        !session.HasCheckpoint("first") && !session.HasCheckpoint("second"),
+        "Reset clears every named checkpoint");
+    CheckThrowsState(
+        [&session] { session.RestoreCheckpoint("first"); },
+        "a checkpoint cleared by Reset cannot be restored");
+  }
+
+  // Checkpointing and rewinding device-backed state shares buffers exactly
+  // like Snapshot and Restore do, and never materializes one to the host.
+  {
+    auto counter = std::make_shared<DeviceCopyCounter>();
+    std::unordered_map<std::string, Model> models;
+    models.emplace("producer", Model(std::make_shared<PassthroughBackend>()));
+    const Pipeline pipeline(PipelinePackage(
+        {}, PipelineManifest::Parse(kPassthroughManifest), std::move(models)));
+    PipelineSession session = pipeline.CreateSession();
+
+    const std::array<float, 4> first{1.0F, 2.0F, 3.0F, 4.0F};
+    Tensor device_input = MakeDeviceTensor({1, 4}, std::span(first), counter);
+    const onnx_world_model::TensorBuffer* first_buffer =
+        device_input.buffer().get();
+    (void)session.RunStage("run", {{"producer.x", device_input}});
+
+    session.Checkpoint("captured");
+    Check(counter->copies == 0, "checkpointing never materializes a device tensor");
+
+    const std::array<float, 4> second{9.0F, 9.0F, 9.0F, 9.0F};
+    Tensor replacement = MakeDeviceTensor({1, 4}, std::span(second), counter);
+    const onnx_world_model::TensorBuffer* second_buffer =
+        replacement.buffer().get();
+    (void)session.RunStage("run", {{"producer.x", replacement}});
+    Check(
+        session.outputs().at("produced").buffer().get() == second_buffer,
+        "the session picks up the replacement buffer");
+
+    session.RestoreCheckpoint("captured");
+    Check(
+        session.outputs().at("produced").buffer().get() == first_buffer,
+        "restoring a checkpoint restores the captured device buffer");
+    Check(
+        counter->copies == 0,
+        "checkpoint save and restore never materialize a device tensor");
   }
 
   if (failures == 0) {

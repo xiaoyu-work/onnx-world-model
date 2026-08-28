@@ -28,7 +28,7 @@ expects.
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline`, `PipelineSession` and its `PipelineSessionSnapshot`, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, device-output options, `Pipeline`, `PipelineSession` with its `PipelineSessionSnapshot` and named-checkpoint methods, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
 | `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
@@ -65,7 +65,8 @@ uvx ruff check python
 ```
 
 `tests/python/test_api.py` covers `_api.py`,
-`tests/python/test_pipeline_snapshot.py` covers the session snapshot wrappers,
+`tests/python/test_pipeline_snapshot.py` covers the session snapshot and
+named-checkpoint wrappers,
 `tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
 and `tests/python/test_guided_generation.py` and
 `tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that

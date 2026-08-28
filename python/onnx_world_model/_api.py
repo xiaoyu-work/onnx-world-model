@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, and latent-dynamics APIs.
 # @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility.
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -509,8 +509,41 @@ class PipelineSession:
         self._core.restore(snapshot._core)
 
     def fork(self) -> PipelineSession:
-        """Return an independent session started from a snapshot of this one."""
+        """Return an independent session started from a snapshot of this one.
+
+        The fork inherits execution state but starts with an empty
+        named-checkpoint namespace.
+        """
         return PipelineSession(self._pipeline, self._core.fork())
+
+    def checkpoint(self, name: str) -> None:
+        """Store the current execution state under ``name``, replacing any prior one.
+
+        Checkpoints are in-memory transaction markers held beside the session's
+        execution state, so they survive stage execution and :meth:`restore`,
+        never appear inside a snapshot, and are dropped by :meth:`reset`.
+        """
+        self._core.checkpoint(name)
+
+    def restore_checkpoint(self, name: str) -> None:
+        """Rewind the session to the checkpoint stored under ``name``.
+
+        Raises :class:`WorldModelError` for an empty or unknown name, and the
+        session is left unchanged. The checkpoint itself stays available.
+        """
+        self._core.restore_checkpoint(name)
+
+    def drop_checkpoint(self, name: str) -> None:
+        """Discard the checkpoint stored under ``name``.
+
+        Dropping a name this session does not hold raises
+        :class:`WorldModelError` rather than silently doing nothing.
+        """
+        self._core.drop_checkpoint(name)
+
+    def has_checkpoint(self, name: str) -> bool:
+        """Report whether this session currently holds a checkpoint ``name``."""
+        return bool(self._core.has_checkpoint(name))
 
 
 def _array_mapping(

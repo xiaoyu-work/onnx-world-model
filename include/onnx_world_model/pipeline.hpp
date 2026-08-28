@@ -2,9 +2,9 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, and its in-memory PipelineSessionSnapshot.
+ * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, and the session's named in-memory checkpoints.
  * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSessionSnapshot, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state.
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -211,7 +211,8 @@ class Pipeline {
 //: captured tensors share their storage copy-on-write, and a device-backed
 //: tensor is never materialized to CPU by capturing or restoring it. This is
 //: an in-process value only: it is not serialized to disk and cannot cross a
-//: process boundary.
+//: process boundary. A session's named checkpoints are control metadata, not
+//: execution state, so they never appear inside a snapshot.
 class PipelineSessionSnapshot {
  public:
   //: False only for a moved-from snapshot, which no session accepts.
@@ -259,8 +260,33 @@ class PipelineSession {
   void Restore(const PipelineSessionSnapshot& snapshot);
   //: Returns an independent session on the same immutable PipelinePackage,
   //: initialized from a snapshot of this one. Neither session observes the
-  //: other's later runs, releases, or resets.
+  //: other's later runs, releases, or resets. The fork starts with an empty
+  //: named-checkpoint namespace: execution state is inherited, checkpoint
+  //: names are not.
   [[nodiscard]] PipelineSession Fork() const;
+
+  //: Captures the same execution state Snapshot() captures and stores it in
+  //: this session under `name`, replacing any checkpoint already stored under
+  //: that name. Capture and store happen under one lock, so the checkpoint is
+  //: exactly the state some other thread could have observed at that instant.
+  //: An empty name throws ErrorCode::invalid_argument. Checkpoints are
+  //: control metadata that lives beside the execution state rather than
+  //: inside it, so a snapshot never carries them, they survive stage
+  //: execution and Restore, and Reset() drops all of them.
+  void Checkpoint(std::string_view name);
+  //: Restores the checkpoint stored under `name` exactly as Restore() would
+  //: restore the equivalent snapshot, leaving this session's checkpoints in
+  //: place. An empty name throws ErrorCode::invalid_argument; an unknown one
+  //: throws ErrorCode::state. Either way the session is left unchanged.
+  void RestoreCheckpoint(std::string_view name);
+  //: Drops the checkpoint stored under `name`. This is not a no-op for an
+  //: unknown name: an empty name throws ErrorCode::invalid_argument and an
+  //: unknown one throws ErrorCode::state.
+  void DropCheckpoint(std::string_view name);
+  //: Reports whether this session currently holds a checkpoint under `name`.
+  //: An empty name throws ErrorCode::invalid_argument, so this is not
+  //: noexcept.
+  [[nodiscard]] bool HasCheckpoint(std::string_view name) const;
 
  private:
   struct Impl;

@@ -13,7 +13,8 @@ package, including the compiled `_native` extension, through its public API.
 - Verify pipeline loading and staged execution through `Pipeline` and
   `PipelineSession`.
 - Verify the in-memory `PipelineSessionSnapshot` wrapper: snapshot, restore,
-  fork, and the pipeline-identity check that mirrors the native one.
+  fork, the named-checkpoint methods, and the pipeline-identity check that
+  mirrors the native one.
 - Verify the preprocessing and media layers against explicit reference
   implementations of the runtime tensor layouts.
 - Verify classifier-free guidance and the image-to-video entry point.
@@ -25,7 +26,7 @@ package, including the compiled `_native` extension, through its public API.
 | `conftest.py` | Shared fixtures that build throwaway packages, tokenizers, and chat templates. |
 | `test_api.py` | `_api.py` wrappers, providers, `LatentDynamicsModel`, `Rollout`. |
 | `test_pipeline.py` | `Pipeline` and `PipelineSession` contract and stage execution. |
-| `test_pipeline_snapshot.py` | `PipelineSessionSnapshot` plus `PipelineSession.snapshot`, `restore`, and `fork` on a counter package built with `onnx_ir`. |
+| `test_pipeline_snapshot.py` | `PipelineSessionSnapshot` plus `PipelineSession.snapshot`, `restore`, `fork`, `checkpoint`, `restore_checkpoint`, `drop_checkpoint`, and `has_checkpoint` on a counter package built with `onnx_ir`. |
 | `test_preprocessing.py` | `preprocessing.py` and `media.py`, including latent-token round trips. |
 | `test_guided_generation.py` | Classifier-free guidance on graphs synthesized with `onnx_ir`. |
 | `test_image_to_video_smoke.py` | The `tools/image_to_video_smoke.py` dry run and generation path. |

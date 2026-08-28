@@ -127,11 +127,21 @@ A session can capture all of that mutable execution state — external,
 endpoint, recurrent-state and guidance tensors, stage cursors, scheduler
 histories, position cursors, and the random engine — as an immutable
 `PipelineSessionSnapshot`, restore itself from one, or fork an independent
-session initialized from one. This is an in-process capability: a snapshot
-shares tensor storage copy-on-write, never materializes a device buffer, and
-is not serialized to disk or portable across processes. A snapshot records the
-`PipelinePackage` instance it came from, so restoring it into a session built
-on any other package instance fails with `ErrorCode::state`.
+session initialized from one. The same capture is also reachable by name
+through `Checkpoint`, `RestoreCheckpoint`, `DropCheckpoint`, and
+`HasCheckpoint`. This is an in-process, in-memory transaction capability: a
+snapshot shares tensor storage copy-on-write, never materializes a device
+buffer, is not paged KV attention, and is not serialized to disk or portable
+across processes. A snapshot records the `PipelinePackage` instance it came
+from, so restoring it into a session built on any other package instance fails
+with `ErrorCode::state`.
+
+Named checkpoints are control metadata held on the session beside that
+execution state rather than inside it. A snapshot therefore never carries a
+checkpoint namespace: checkpoints survive stage execution and ordinary
+`Restore`, a fork inherits execution state but starts with no checkpoint
+names, and `Reset` clears them all. An empty name is `ErrorCode::invalid_argument`
+and an unknown name is `ErrorCode::state` — `DropCheckpoint` is not a no-op.
 
 `Tensor` can retain an ORT-independent `TensorBuffer` on a named device. Owned
 tensor constructors allocate copy-on-write CPU storage; device-only buffers
@@ -159,8 +169,9 @@ Python:
   generation API, exposing `.text`, `.image`, `.video`, and `.action`, each with
   a `generate()` method.
 - `onnx_world_model.Pipeline` and `PipelineSession` — direct stage execution,
-  plus `snapshot()`, `restore()`, and `fork()` for in-memory session
-  branching.
+  plus `snapshot()`, `restore()`, `fork()`, and the named `checkpoint()`,
+  `restore_checkpoint()`, `drop_checkpoint()`, and `has_checkpoint()` methods
+  for in-memory session branching.
 - `onnx_world_model.OnnxModel` — one ONNX graph with named tensors.
 - `onnx_world_model.LatentDynamicsModel` and `Rollout` — the fixed
   latent-dynamics API.
@@ -175,7 +186,8 @@ C++:
 - `onnx_world_model::Pipeline::Load` then `Pipeline::CreateSession` and
   `PipelineSession::RunStage` or `StepStage`.
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
-  in-memory session branching.
+  in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
+  `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
 - `onnx_world_model::Model::Load` and `Model::Run`.
 - `onnx_world_model::WorldModel::Load`, `WorldModel::Step`, and `Rollout`.
 
@@ -200,9 +212,11 @@ and the `onnx-world-model` wheel built by scikit-build-core.
 - **Ownership split.** `Pipeline` is immutable and shareable; `PipelineSession`
   is move-only and owns exactly one request or trajectory. Session state is
   guarded by `impl_->mutex`, and `Rollout` guards its state by its own mutex.
-  `PipelineSession::Snapshot`, `Restore`, and `Fork` take that same lock;
-  `Restore` copies every container before taking it and commits by swapping,
-  so a failure leaves the target session unchanged.
+  `PipelineSession::Snapshot`, `Restore`, `Fork`, and the named-checkpoint
+  operations take that same lock; no public method calls `Snapshot` or
+  `Restore` while already holding it, so they cannot deadlock. `Restore`
+  copies every container before taking it and commits by swapping, so a
+  failure leaves the target session unchanged.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
   CPU buffer is cloned before mutation. Device buffers expose immutable
   storage and an explicit synchronous CPU-copy operation.

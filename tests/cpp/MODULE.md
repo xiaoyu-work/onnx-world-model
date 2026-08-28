@@ -19,7 +19,10 @@ Runtime library and no real ONNX model.
 - Cover the in-memory `PipelineSessionSnapshot` contract: recurrent-state
   round trips, parent and child independence after a fork, package identity,
   device-buffer sharing without materialization, and random-engine
-  determinism. This is also a separate executable.
+  determinism. The same executable covers the named-checkpoint contract:
+  create, query, replace, rewind, drop, empty and unknown names, `Reset`
+  clearing, and a fork's empty checkpoint namespace. This is also a separate
+  executable.
 
 ## Key Files
 
@@ -29,10 +32,12 @@ Runtime library and no real ONNX model.
 | `model_test.cpp` | `model_test` | `Model` input and output validation through the `AddOneBackend` stub. |
 | `pipeline_test.cpp` | `pipeline_test` | Manifest parsing and rejection, stage execution, guidance, schedulers, state lifecycle. |
 | `pipeline_device_test.cpp` | `pipeline_device_test` | Device-tensor preservation across `PipelineSession`: rank adaptation, transform-free connections, reshape, public outputs, and CPU-transform materialization. |
-| `pipeline_snapshot_test.cpp` | `pipeline_snapshot_test` | `PipelineSession::Snapshot`, `Restore`, and `Fork`: state round trips, fork independence, package identity rejection, zero-copy device sharing, and random-engine determinism. |
+| `pipeline_snapshot_test.cpp` | `pipeline_snapshot_test` | `PipelineSession::Snapshot`, `Restore`, `Fork`, and the named `Checkpoint`, `RestoreCheckpoint`, `DropCheckpoint`, and `HasCheckpoint`: state round trips, fork independence, package identity rejection, zero-copy device sharing, random-engine determinism, and checkpoint create/replace/rewind/drop plus empty and unknown name failures. |
 
 Each file is a self-contained `main()` with local `Check` and `CheckThrows`
-helpers (and `CheckThrowsMessage` where a message is asserted), a file-local
+helpers (and `CheckThrowsMessage` where a message is asserted, or
+`CheckThrowsCode`, `CheckThrowsState`, and `CheckThrowsInvalidArgument` where a
+specific `ErrorCode` is asserted), a file-local
 `failures` counter, and a non-zero exit code on failure. There is no
 third-party test framework; a new test is a new check inside an existing
 `main()`, or a new executable added to the
