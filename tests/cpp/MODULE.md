@@ -14,7 +14,10 @@ Runtime library and no real ONNX model.
   schedulers, classifier-free guidance, and recurrent state.
 - Cover device-tensor preservation across `PipelineSession`: which paths keep
   the producer's `TensorBuffer` and which materialize it, using a
-  non-host-accessible stub buffer with a shared CPU-copy counter.
+  non-host-accessible stub buffer with a shared CPU-copy counter. The same
+  executable covers the conservative `PipelineTransferPlan` a
+  `PipelinePackage` computes, using stub backends that report whichever
+  `TensorSpec::device` — or no device at all — each classification needs.
   This is a separate executable from the manifest and stage-execution tests.
 - Cover the in-memory `PipelineSessionSnapshot` contract: recurrent-state
   round trips, parent and child independence after a fork, package identity,
@@ -58,7 +61,7 @@ Runtime library and no real ONNX model.
 | `model_test.cpp` | `model_test` | `Model` input and output validation through the `AddOneBackend` stub. |
 | `cancellation_test.cpp` | `cancellation_test` | `CancellationToken` and `CancellationSource`: default inertness, explicit cancel, first-reason-wins, zero, negative, future, and saturating out-of-range deadlines, `ErrorCode::cancelled` versus `ErrorCode::deadline_exceeded`, moved-from sources, concurrent cancels, cross-thread observation, and the blocking `WaitForCancellation` — released by the shared watchdog at its deadline, by an explicit cancel, rejected with `invalid_argument` for an uncancellable state, and never released before its own deadline. |
 | `pipeline_test.cpp` | `pipeline_test` | Manifest parsing and rejection, stage execution, guidance, schedulers, state lifecycle. |
-| `pipeline_device_test.cpp` | `pipeline_device_test` | Device-tensor preservation across `PipelineSession`: rank adaptation, transform-free connections, reshape, public outputs, and CPU-transform materialization. |
+| `pipeline_device_test.cpp` | `pipeline_device_test` | Device-tensor preservation across `PipelineSession`: rank adaptation, transform-free connections, reshape, public outputs, and CPU-transform materialization. It also covers `PipelinePackage::transfer_plan`: one entry per manifest connection in manifest order with the recurrent edge flagged, `direct` and its `direct_bind_eligible` for identical known devices, `upload`, `download`, `host_staged` for two device ordinals and for two device types, `host_transform` for a cast and for a shape-changing reshape while an identical-shape reshape stays `direct`, `unknown` for a backend that reports no placement — which outranks a host transform — and the constructor's `device_outputs_enabled` flag reaching the plan without rewriting a kind. Two `static_assert`s in `main` are what assert that `PipelinePlacementOptions` cannot be handed to the already-built-package `Pipeline` constructor. |
 | `pipeline_snapshot_test.cpp` | `pipeline_snapshot_test` | `PipelineSession::Snapshot`, `Restore`, `Fork`, and the named `Checkpoint`, `RestoreCheckpoint`, `DropCheckpoint`, and `HasCheckpoint`: state round trips, fork independence, package identity rejection, zero-copy device sharing, random-engine determinism, and checkpoint create/replace/rewind/drop plus empty and unknown name failures. |
 | `pipeline_stream_test.cpp` | `pipeline_stream_test` | `PipelineSession::BeginStage` and `StageRun`: greedy, sampled, and per-lane early-stopping autoregressive parity with `RunStage`, the once-only token budget, iterative and single-pass parity, one terminal `StageEvent`, `Finish` after partial stepping, the active-run exclusions, cancellation and destruction, failure without rollback, moved handles, session move and destruction safety, and device-preserving event outputs. |
 | `pipeline_cancellation_test.cpp` | `pipeline_cancellation_test` | `StageRun::RequestCancellation` interrupting a `Finish` that holds the session lock, an external `CancellationSource`, no extra component pass after a cancellation between steps, partial state surviving, `deadline_exceeded` versus `cancelled`, an expired deadline never claiming the run slot, a stale handle not releasing a newer run, session reuse with a fresh token, a reused cancelled token failing immediately, direct `StepStage` honoring its token, a `~20 ms` deadline unblocking a `RunStage` and a `Step` whose backend is parked on `WaitForCancellation` with no polling at all, exception-safe restoration of the classifier-free guidance scratch state when the unconditional pass is cancelled, `Model::Run`'s cancellable overload, and no device materialization from cancelling. |
@@ -81,7 +84,10 @@ third-party test framework; a new test is a new check inside an existing
   `onnx_world_model::ModelBackend` defined inside each test file, plus
   `FakeDeviceBuffer`, a stub `onnx_world_model::TensorBuffer` in
   `pipeline_device_test.cpp` that reports a non-CPU device, refuses host
-  access, and counts each `CopyToCpu`; `pipeline_snapshot_test.cpp`,
+  access, and counts each `CopyToCpu`, and `PlacedBackend` in the same file,
+  whose ports report whichever `TensorSpec::device` a transfer-plan check
+  needs — including none, which is how "unknown" is exercised;
+  `pipeline_snapshot_test.cpp`,
   `pipeline_stream_test.cpp`, and `pipeline_cancellation_test.cpp` have their
   own `CountingDeviceBuffer` with the same shape.
 - Concurrency is expressed with condition variables, never with sleeps:

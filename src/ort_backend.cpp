@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, and uses I/O binding to retain ORT-owned output tensors on their assigned devices.
  * @agent-public-api: CreateOrtBackend, GetAvailableOrtProviders
- * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options. Opt-in I/O binding places each output in the device memory assigned by ORT graph partitioning; the resulting TensorBuffer owns the Ort::Value and a flattened set of session, binding, and aliased-input lifetime roots. ORT-backed inputs bind without copying only when their original dtype and shape match the enclosing Tensor view and their device matches the destination input plan; incompatible, foreign, or reshaped device buffers are synchronously materialized and retained on CPU for the complete Run call. Requested provider lists fail when no available provider can satisfy them instead of silently selecting CPU. The cancellable Run override owns one fresh Ort::RunOptions per call and never reuses or un-terminates it, registers its SetTerminate callback after that object so the registration is destroyed first, and decides that an Ort::Exception was a cancellation from the token rather than from ONNX Runtime's message text. That callback is what the shared deadline watchdog reaches, so a deadline interrupts an in-flight Run at the next graph node without any boundary being polled; a single long-running kernel still finishes first, because ORT checks its terminate flag between nodes and not inside one.
+ * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options. The per-port memory plan is read once in the constructor with GetMemoryInfoForInputs and GetMemoryInfoForOutputs, checked against the input and output counts, cached as non-owning Ort::ConstMemoryInfo views that stay valid for the session's lifetime, and published on each metadata TensorSpec::device, so Run reuses that plan instead of querying it again and a caller can see where ONNX Runtime actually placed every port. Opt-in I/O binding places each output in the device memory assigned by ORT graph partitioning; the resulting TensorBuffer owns the Ort::Value and a flattened set of session, binding, and aliased-input lifetime roots. ORT-backed inputs bind without copying only when their original dtype and shape match the enclosing Tensor view and their device matches the destination input plan; incompatible, foreign, or reshaped device buffers are synchronously materialized and retained on CPU for the complete Run call. Requested provider lists fail when no available provider can satisfy them instead of silently selecting CPU. The cancellable Run override owns one fresh Ort::RunOptions per call and never reuses or un-terminates it, registers its SetTerminate callback after that object so the registration is destroyed first, and decides that an Ort::Exception was a cancellation from the token rather than from ONNX Runtime's message text. That callback is what the shared deadline watchdog reaches, so a deadline interrupts an in-flight Run at the next graph node without any boundary being polled; a single long-running kernel still finishes first, because ORT checks its terminate flag between nodes and not inside one.
  * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions and output buffers, may transfer foreign device inputs to CPU, and runs inference.
  */
 
@@ -426,6 +426,13 @@ Ort::Env& SharedOrtEnvironment() {
 
 [[nodiscard]] TensorDevice TensorDeviceForMemory(
     const Ort::ConstMemoryInfo& memory_info) {
+  // Pinned CPU-input/output allocators owned by an accelerator may report
+  // that accelerator's ordinal even though the memory itself is host memory.
+  // TensorDevice reserves nonzero ids for actual devices, so every CPU-typed
+  // allocation is canonically cpu:0.
+  if (memory_info.GetDeviceType() == OrtMemoryInfoDeviceType_CPU) {
+    return TensorDevice{};
+  }
   return TensorDevice(
       DeviceTypeForMemory(memory_info),
       memory_info.GetDeviceId());
@@ -686,6 +693,34 @@ class OrtBackend final : public ModelBackend {
       metadata_.outputs.push_back(
           ReadTensorSpec(*session_, index, false, allocator));
     }
+
+    // Graph partitioning has already decided where each port lives, and that
+    // decision cannot change for the life of the session, so it is read once
+    // here rather than on every Run. Ort::ConstMemoryInfo is a non-owning view
+    // of memory ONNX Runtime owns inside the session; session_ is held by this
+    // backend and released after these vectors, so every view stays valid for
+    // as long as the backend does.
+    input_memory_ = session_->GetMemoryInfoForInputs();
+    output_memory_ = session_->GetMemoryInfoForOutputs();
+    if (input_memory_.size() != metadata_.inputs.size() ||
+        output_memory_.size() != metadata_.outputs.size()) {
+      throw Error(
+          ErrorCode::runtime_load,
+          "ONNX Runtime reported a memory plan that does not cover every "
+          "model input and output");
+    }
+    for (std::size_t index = 0; index < metadata_.inputs.size(); ++index) {
+      if (static_cast<const OrtMemoryInfo*>(input_memory_[index]) != nullptr) {
+        metadata_.inputs[index].device =
+            TensorDeviceForMemory(input_memory_[index]);
+      }
+    }
+    for (std::size_t index = 0; index < metadata_.outputs.size(); ++index) {
+      if (static_cast<const OrtMemoryInfo*>(output_memory_[index]) != nullptr) {
+        metadata_.outputs[index].device =
+            TensorDeviceForMemory(output_memory_[index]);
+      }
+    }
   }
 
   [[nodiscard]] const ModelMetadata& metadata() const noexcept override {
@@ -702,12 +737,6 @@ class OrtBackend final : public ModelBackend {
     cancellation.ThrowIfCancellationRequested();
     try {
       auto binding = std::make_shared<Ort::IoBinding>(*session_);
-      const auto input_memory = session_->GetMemoryInfoForInputs();
-      if (input_memory.size() != metadata_.inputs.size()) {
-        throw Error(
-            ErrorCode::runtime_execution,
-            "ONNX Runtime returned an unexpected input memory plan");
-      }
       std::vector<Tensor> cpu_inputs;
       cpu_inputs.reserve(metadata_.inputs.size());
       std::vector<Ort::Value> input_values;
@@ -719,12 +748,9 @@ class OrtBackend final : public ModelBackend {
         const Tensor& input = inputs.at(spec.name);
         const auto ort_buffer =
             std::dynamic_pointer_cast<OrtTensorBuffer>(input.buffer());
-        const OrtMemoryInfo* expected_memory = input_memory[index];
         const bool device_compatible =
-            expected_memory != nullptr &&
-            ort_buffer != nullptr &&
-            ort_buffer->device() ==
-                TensorDeviceForMemory(input_memory[index]);
+            ort_buffer != nullptr && spec.device.has_value() &&
+            ort_buffer->device() == *spec.device;
         if (ort_buffer != nullptr &&
             ort_buffer->data_type() == input.data_type() &&
             ort_buffer->shape() == input.shape() &&
@@ -741,14 +767,8 @@ class OrtBackend final : public ModelBackend {
       }
 
       binding->SynchronizeInputs();
-      const auto output_memory = session_->GetMemoryInfoForOutputs();
-      if (output_memory.size() != metadata_.outputs.size()) {
-        throw Error(
-            ErrorCode::runtime_execution,
-            "ONNX Runtime returned an unexpected output memory plan");
-      }
       for (std::size_t index = 0; index < metadata_.outputs.size(); ++index) {
-        const OrtMemoryInfo* location = output_memory[index];
+        const OrtMemoryInfo* location = output_memory_[index];
         binding->BindOutput(
             metadata_.outputs[index].name.c_str(),
             !device_outputs_ || location == nullptr
@@ -807,6 +827,11 @@ class OrtBackend final : public ModelBackend {
   std::shared_ptr<Ort::Session> session_;
   bool device_outputs_{false};
   Ort::MemoryInfo memory_info_;
+  //: Non-owning views of the per-port memory plan ONNX Runtime owns inside
+  //: session_. They are read once in the constructor and are valid for as
+  //: long as session_ is, which is the lifetime of this backend.
+  std::vector<Ort::ConstMemoryInfo> input_memory_;
+  std::vector<Ort::ConstMemoryInfo> output_memory_;
   ModelMetadata metadata_;
 };
 

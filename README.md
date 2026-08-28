@@ -91,6 +91,18 @@ C++ API ───────────────┤                  │
   `cancellation` token and `timeout`, so it can be stopped before it ever
   starts. `Pipeline.scheduling_stats` reads how many executions are admitted
   and how many are queued right now, per stage kind as well as in total.
+- Component placement is per component and load-time. Pass
+  `component_placement` to `Pipeline` or `WorldModel` to give one component its
+  own execution providers, provider options (including `device_id`), graph
+  optimization level, and thread counts, layered over the pipeline-wide
+  options; `allow_unpreferred_providers` lets a component that names its own
+  providers run somewhere its manifest does not prefer. Every port then reports
+  where ONNX Runtime actually placed it, and `Pipeline.transfer_plan`
+  classifies each manifest connection from those placements — `direct`,
+  `upload`, `download`, `host_staged`, `host_transform`, or `unknown` — with a
+  reason for every non-direct one. The plan is inspection only: nothing
+  executes from it, and warm-up, lazy loading, offload and eviction, and
+  peer-to-peer transfers are not included.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in
@@ -235,7 +247,14 @@ Low-level tensor and stage execution is documented in the
 ## Current scope
 
 - Text, image, video, and action generation from Mobius packages.
-- Configurable execution providers, subject to the loaded ONNX Runtime build.
+- Configurable execution providers, subject to the loaded ONNX Runtime build,
+  pipeline-wide and per component.
+- Per-component load-time placement — execution providers, provider options,
+  graph optimization level, and thread counts — plus an inspection-only
+  `transfer_plan` over the ports ONNX Runtime actually assigned. Session
+  warm-up, lazy or deferred component loading, offload and eviction,
+  peer-to-peer device-to-device transfers, and executing from the plan are
+  **not** included.
 - One image or video per text-generation request.
 - Image-to-video conditioning and classifier-free guidance for packages that
   declare them; output media encoding is not yet included.

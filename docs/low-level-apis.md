@@ -74,6 +74,21 @@ materializes device outputs. Python callers configure the same behavior with
 `register_execution_provider_library(...)` and `device_outputs=True` on
 `OnnxModel`, `Pipeline`, `LatentDynamicsModel`, or `WorldModel`.
 
+Each model port also reports where ONNX Runtime placed it. In C++ that is
+`TensorSpec::device`, a `std::optional<TensorDevice>` read once per session
+from the graph partitioner's memory plan; in Python it is `TensorSpec.device`,
+a `DeviceSpec(type, id)` or `None`:
+
+```python
+model = OnnxModel("component/model.onnx")
+print(model.metadata.outputs[0].device)   # DeviceSpec(type='cpu', id=0)
+```
+
+`None` means the backend does not report placement, which is what a custom
+`ModelBackend` written before this member existed reports. The device is
+runtime placement rather than part of the graph signature, so it never takes
+part in tensor validation.
+
 `PipelineSession::RunStage` and `StepStage` preserve device storage. Caller
 inputs, overrides, component outputs, recurrent state, and public outputs keep
 whatever buffer the producer supplied, and a transform-free connection hands
@@ -110,13 +125,15 @@ rollout.reset(batch_size=1)
 
 This fixed API does not accept a cancellation token in this milestone; use
 `Pipeline` and `PipelineSession` when a call must be interruptible. It also
-takes no concurrency limits: `max_concurrent_executions` and
-`max_concurrent_by_stage_kind` are pipeline-only options, so `OnnxModel` and
+takes no concurrency limits and no placement: `max_concurrent_executions`,
+`max_concurrent_by_stage_kind`, `component_placement`, and
+`allow_unpreferred_providers` are pipeline-only options, so `OnnxModel` and
 `LatentDynamicsModel` do not accept them.
 
 ## Pipeline
 
 For package-level tensor and stage execution — including the admission
-scheduling that caps concurrent executions and the `scheduling_stats` reading
-of it — see the
+scheduling that caps concurrent executions, the `scheduling_stats` reading of
+it, the per-component `component_placement` overrides, and the `transfer_plan`
+they produce — see the
 [Pipeline API](pipeline-api.md).

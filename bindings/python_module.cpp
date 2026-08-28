@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
  * @agent-public-api: _native module, WorldModelError, CancelledError, DeadlineExceededError, CancellationToken, CancellationSource, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, StageRun, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call, every session or run method that takes the session lock -- run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, request_cancellation, done, and iteration -- and CancellationToken.wait and CancellationSource.wait, which block until another thread or the shared deadline watchdog claims a reason and would otherwise deadlock the interpreter. A C++ Error is translated by one custom translator that maps ErrorCode::cancelled to CancelledError and ErrorCode::deadline_exceeded to DeadlineExceededError, and every other code to their common base WorldModelError, so the code rather than the message decides the Python type and existing WorldModelError handlers still catch everything. A cancellation token crosses as its own argument rather than through the scalar options dictionary, because a token is not a bool, int, float, or str. Pipeline's two admission-scheduling arguments are converted while the GIL is held and are checked here only for shape -- a count must be a non-bool int that is not negative and a per-kind key must be a string -- while the stage-kind names themselves are validated in C++, so there is one list of legal kinds rather than two that can drift. PipelineSessionSnapshot, StageRun, and CancellationToken are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot(), PipelineSession.begin_stage(), and CancellationSource.token(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync, and one reading of the admission scheduler crosses the same way, so the frozen PipelineSchedulingStats also lives in Python; that read releases the GIL because it takes the scheduler mutex, and it returns a detached copy rather than a live view.
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call, every session or run method that takes the session lock -- run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, request_cancellation, done, and iteration -- and CancellationToken.wait and CancellationSource.wait, which block until another thread or the shared deadline watchdog claims a reason and would otherwise deadlock the interpreter. A C++ Error is translated by one custom translator that maps ErrorCode::cancelled to CancelledError and ErrorCode::deadline_exceeded to DeadlineExceededError, and every other code to their common base WorldModelError, so the code rather than the message decides the Python type and existing WorldModelError handlers still catch everything. A cancellation token crosses as its own argument rather than through the scalar options dictionary, because a token is not a bool, int, float, or str. Pipeline's two admission-scheduling arguments are converted while the GIL is held and are checked here only for shape -- a count must be a non-bool int that is not negative and a per-kind key must be a string -- while the stage-kind names themselves are validated in C++, so there is one list of legal kinds rather than two that can drift. Its component_placement argument is split the same way: this file checks that component and provider keys are strings, that a provider list is a sequence that is not itself a string, that option values are the same str, bool, int, or float the pipeline-wide provider_options accepts, and that a thread count is a non-bool, non-negative int, while C++ owns every semantic question -- whether the component exists, whether a provider repeats, and whether a component runs where its options claim. A tensor spec's device crosses as None or a {type, id} dictionary, and one transfer plan crosses as a plain dictionary of plain dictionaries, so the frozen DeviceSpec, PipelineTransfer, and PipelineTransferPlan values live in Python; reading the plan takes no lock because it was computed while the package loaded. PipelineSessionSnapshot, StageRun, and CancellationToken are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot(), PipelineSession.begin_stage(), and CancellationSource.token(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync, and one reading of the admission scheduler crosses the same way, so the frozen PipelineSchedulingStats also lives in Python; that read releases the GIL because it takes the scheduler mutex, and it returns a detached copy rather than a live view.
  * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
@@ -167,11 +167,23 @@ using onnx_world_model::WorldModel;
   return array;
 }
 
+[[nodiscard]] py::object TensorDeviceToObject(
+    const std::optional<onnx_world_model::TensorDevice>& device) {
+  if (!device.has_value()) {
+    return py::none();
+  }
+  py::dict result;
+  result["type"] = std::string(device->type());
+  result["id"] = device->id();
+  return result;
+}
+
 [[nodiscard]] py::dict TensorSpecToDictionary(const TensorSpec& spec) {
   py::dict result;
   result["name"] = spec.name;
   result["dtype"] = std::string(onnx_world_model::ToString(spec.data_type));
   result["shape"] = spec.shape;
+  result["device"] = TensorDeviceToObject(spec.device);
   return result;
 }
 
@@ -509,6 +521,198 @@ PipelineSchedulingFromPython(
   return options;
 }
 
+// A thread count is a count, so `True` is rejected for the same reason a
+// concurrency limit rejects it: bool is a Python int subclass, and quietly
+// meaning "one thread" would be worse than failing.
+[[nodiscard]] int ThreadCountFromPython(
+    const py::handle& value,
+    const std::string& label) {
+  if (py::isinstance<py::bool_>(value)) {
+    throw py::type_error(label + " must be an int, not a bool");
+  }
+  if (!py::isinstance<py::int_>(value)) {
+    throw py::type_error(label + " must be an int");
+  }
+  const auto count = py::cast<std::int64_t>(value);
+  if (count < 0) {
+    throw py::value_error(label + " must not be negative");
+  }
+  return static_cast<int>(count);
+}
+
+// Provider option values cross exactly as they do for the pipeline-wide
+// provider_options dictionary, so one component override and one global option
+// cannot mean different things.
+[[nodiscard]] std::unordered_map<std::string, std::string>
+ProviderOptionsFromPython(
+    const py::handle& value,
+    const std::string& label) {
+  if (!py::isinstance<py::dict>(value)) {
+    throw py::type_error(label + " must be a mapping of option names to values");
+  }
+  std::unordered_map<std::string, std::string> options;
+  for (const auto& option : py::reinterpret_borrow<py::dict>(value)) {
+    if (!py::isinstance<py::str>(option.first) ||
+        !(py::isinstance<py::str>(option.second) ||
+          py::isinstance<py::bool_>(option.second) ||
+          py::isinstance<py::int_>(option.second) ||
+          py::isinstance<py::float_>(option.second))) {
+      throw py::type_error(
+          label +
+          " names must be strings and values must be str, bool, int, or "
+          "float");
+    }
+    std::string text;
+    if (py::isinstance<py::bool_>(option.second)) {
+      text = py::cast<bool>(option.second) ? "1" : "0";
+    } else {
+      text = py::str(option.second).cast<std::string>();
+    }
+    options.emplace(
+        py::str(option.first).cast<std::string>(), std::move(text));
+  }
+  return options;
+}
+
+// Shape only: this checks that the caller handed over strings, sequences, and
+// counts, and leaves every semantic question -- does this component exist, is
+// this provider repeated, does it run where its options claim -- to C++, so
+// there is one authority for placement rules rather than two.
+[[nodiscard]] onnx_world_model::PipelinePlacementOptions
+PipelinePlacementFromPython(
+    const py::dict& component_placement,
+    bool allow_unpreferred_providers) {
+  onnx_world_model::PipelinePlacementOptions placement;
+  placement.allow_unpreferred_providers = allow_unpreferred_providers;
+  for (const auto& item : component_placement) {
+    if (!py::isinstance<py::str>(item.first)) {
+      throw py::type_error("component_placement keys must be component names");
+    }
+    const std::string component = py::str(item.first).cast<std::string>();
+    const std::string label = "component_placement['" + component + "']";
+    if (!py::isinstance<py::dict>(item.second)) {
+      throw py::type_error(label + " must be a mapping");
+    }
+    onnx_world_model::ComponentPlacement resolved;
+    for (const auto& field : py::reinterpret_borrow<py::dict>(item.second)) {
+      if (!py::isinstance<py::str>(field.first)) {
+        throw py::type_error(label + " keys must be strings");
+      }
+      const std::string name = py::str(field.first).cast<std::string>();
+      const std::string field_label = label + "['" + name + "']";
+      if (name == "providers") {
+        // A bare string is a sequence of characters, so accepting one would
+        // silently request a provider per letter.
+        if (py::isinstance<py::str>(field.second) ||
+            !py::isinstance<py::sequence>(field.second)) {
+          throw py::type_error(
+              field_label + " must be a sequence of provider names");
+        }
+        for (const auto& provider :
+             py::reinterpret_borrow<py::sequence>(field.second)) {
+          if (!py::isinstance<py::str>(provider)) {
+            throw py::type_error(
+                field_label + " must contain provider name strings");
+          }
+          resolved.providers.push_back(py::str(provider).cast<std::string>());
+        }
+      } else if (name == "provider_options") {
+        if (!py::isinstance<py::dict>(field.second)) {
+          throw py::type_error(
+              field_label +
+              " must map provider names to option dictionaries");
+        }
+        for (const auto& provider :
+             py::reinterpret_borrow<py::dict>(field.second)) {
+          if (!py::isinstance<py::str>(provider.first)) {
+            throw py::type_error(
+                field_label + " keys must be provider name strings");
+          }
+          const std::string provider_name =
+              py::str(provider.first).cast<std::string>();
+          resolved.provider_options.emplace(
+              provider_name,
+              ProviderOptionsFromPython(
+                  provider.second,
+                  field_label + "['" + provider_name + "']"));
+        }
+      } else if (name == "graph_optimization") {
+        if (field.second.is_none()) {
+          continue;
+        }
+        if (!py::isinstance<py::str>(field.second)) {
+          throw py::type_error(field_label + " must be a string");
+        }
+        resolved.graph_optimization = ParseGraphOptimization(
+            py::str(field.second).cast<std::string>());
+      } else if (name == "intra_op_threads" || name == "inter_op_threads") {
+        if (field.second.is_none()) {
+          continue;
+        }
+        const int count = ThreadCountFromPython(field.second, field_label);
+        if (name == "intra_op_threads") {
+          resolved.intra_op_threads = count;
+        } else {
+          resolved.inter_op_threads = count;
+        }
+      } else {
+        throw py::value_error(
+            label + " has unknown key '" + name +
+            "'; expected providers, provider_options, graph_optimization, "
+            "intra_op_threads, or inter_op_threads");
+      }
+    }
+    placement.components.emplace(component, std::move(resolved));
+  }
+  return placement;
+}
+
+[[nodiscard]] const char* TransferKindName(
+    onnx_world_model::PipelineTransferKind kind) {
+  switch (kind) {
+    case onnx_world_model::PipelineTransferKind::direct:
+      return "direct";
+    case onnx_world_model::PipelineTransferKind::upload:
+      return "upload";
+    case onnx_world_model::PipelineTransferKind::download:
+      return "download";
+    case onnx_world_model::PipelineTransferKind::host_staged:
+      return "host_staged";
+    case onnx_world_model::PipelineTransferKind::host_transform:
+      return "host_transform";
+    case onnx_world_model::PipelineTransferKind::unknown:
+      return "unknown";
+  }
+  throw py::value_error("Unsupported pipeline transfer kind");
+}
+
+// Crosses as a plain dictionary for the same reason a stage event does: the
+// typed, frozen value lives in Python and the binding keeps no second value
+// type in sync.
+[[nodiscard]] py::dict TransferPlanToDictionary(
+    const onnx_world_model::PipelineTransferPlan& plan) {
+  py::list transfers;
+  for (const auto& transfer : plan.transfers) {
+    py::dict entry;
+    entry["source"] = transfer.source.qualified();
+    entry["target"] = transfer.target.qualified();
+    entry["recurrent"] = transfer.recurrent;
+    entry["transform"] = transfer.transform.has_value()
+                             ? py::object(py::str(*transfer.transform))
+                             : py::object(py::none());
+    entry["source_device"] = TensorDeviceToObject(transfer.source_device);
+    entry["target_device"] = TensorDeviceToObject(transfer.target_device);
+    entry["kind"] = TransferKindName(transfer.kind);
+    entry["direct_bind_eligible"] = transfer.direct_bind_eligible;
+    entry["reason"] = transfer.reason;
+    transfers.append(std::move(entry));
+  }
+  py::dict result;
+  result["transfers"] = std::move(transfers);
+  result["device_outputs_enabled"] = plan.device_outputs_enabled;
+  return result;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_native, module) {
@@ -737,7 +941,9 @@ PYBIND11_MODULE(_native, module) {
                        const std::vector<std::string>& providers,
                        const py::dict& provider_options,
                        const py::object& max_concurrent_executions,
-                       const py::dict& max_concurrent_by_stage_kind) {
+                       const py::dict& max_concurrent_by_stage_kind,
+                       const py::dict& component_placement,
+                       bool allow_unpreferred_providers) {
             RuntimeOptions options = RuntimeOptionsFromPython(
                 ort_library_path,
                 intra_op_threads,
@@ -752,8 +958,14 @@ PYBIND11_MODULE(_native, module) {
             onnx_world_model::PipelineSchedulingOptions scheduling =
                 PipelineSchedulingFromPython(
                     max_concurrent_executions, max_concurrent_by_stage_kind);
+            // Same split for placement: shape here, component and provider
+            // semantics in C++.
+            onnx_world_model::PipelinePlacementOptions placement =
+                PipelinePlacementFromPython(
+                    component_placement, allow_unpreferred_providers);
             py::gil_scoped_release release;
-            return Pipeline::Load(package_path, options, scheduling);
+            return Pipeline::Load(
+                package_path, options, scheduling, placement);
           }),
           py::arg("package_path"),
           py::arg("ort_library_path"),
@@ -765,10 +977,19 @@ PYBIND11_MODULE(_native, module) {
           py::arg("providers") = std::vector<std::string>{},
           py::arg("provider_options") = py::dict(),
           py::arg("max_concurrent_executions") = 0,
-          py::arg("max_concurrent_by_stage_kind") = py::dict())
+          py::arg("max_concurrent_by_stage_kind") = py::dict(),
+          py::arg("component_placement") = py::dict(),
+          py::arg("allow_unpreferred_providers") = false)
       .def_property_readonly(
           "execution_providers",
           &Pipeline::execution_providers)
+      // Inspection only: the plan is computed while the package loads and
+      // nothing executes from it, so reading it takes no lock at all.
+      .def_property_readonly(
+          "transfer_plan",
+          [](const Pipeline& pipeline) {
+            return TransferPlanToDictionary(pipeline.transfer_plan());
+          })
       // Crosses as a plain dictionary for the same reason a stage event does:
       // the typed, frozen value lives in Python and the binding keeps no
       // second value type in sync. The GIL is released because reading takes

@@ -218,6 +218,170 @@ retain their device buffers. Host-authored programs and numeric transforms
 materialize each device source once at the transform boundary. Python return
 values are always independent NumPy arrays.
 
+## Component placement
+
+Every option above is pipeline-wide. `component_placement` overrides them for
+one component at a time, at load time, while that component's ONNX Runtime
+session is still being built.
+
+```python
+from onnx_world_model import ComponentPlacementSpec, Pipeline
+
+pipeline = Pipeline(
+    "output/cosmos3-edge",
+    providers=["cuda", "cpu"],
+    provider_options={"cuda": {"gpu_mem_limit": 24 * 1024**3}},
+    component_placement={
+        "world_model": ComponentPlacementSpec(
+            providers=["cuda", "cpu"],
+            # device_id is a native ONNX Runtime provider option, not an
+            # argument this runtime invents a second spelling for.
+            provider_options={"cuda": {"device_id": 1}},
+        ),
+        "vae_decoder": {
+            "providers": ["cpu"],
+            "graph_optimization": "basic",
+            "intra_op_threads": 4,
+        },
+    },
+)
+```
+
+A `ComponentPlacementSpec` and an equivalent plain mapping are interchangeable.
+A field left out — or set to `None` — inherits the pipeline-wide value rather
+than overriding it.
+
+| Field | Effect |
+|---|---|
+| `providers` | This component's provider order, most preferred first |
+| `provider_options` | Merged over the global options per provider and per key, component wins |
+| `graph_optimization` | Replaces the global level for this component |
+| `intra_op_threads` | Replaces the global count for this component |
+| `inter_op_threads` | Replaces the global count for this component |
+
+The ONNX Runtime library path, log severity, and `device_outputs` stay
+pipeline-wide: they are process- or package-level policy rather than
+per-component placement.
+
+**How providers are chosen.** For each component, in order:
+
+1. the component's own `providers`, if it supplied any;
+2. otherwise the pipeline-wide `providers`, if any were given;
+3. otherwise that component's `preferred_execution_providers` from the
+   manifest.
+
+Whichever list is chosen is then filtered by the component's manifest
+preferences — which is exactly what every earlier release did — unless
+`allow_unpreferred_providers=True` **and** that component supplied its own
+list. The flag never widens a component that inherited the global order or its
+own preferences, so turning it on cannot quietly move a component nobody named.
+An explicitly named CPU provider is always kept, because ONNX Runtime refuses
+to build a session with no fallback for a node the preferred provider does not
+implement.
+
+**How provider options are chosen.** Global options are a pipeline-wide
+default, so options for a provider a component does not run on are simply not
+that component's business and are dropped. A component's own options are a
+statement about that component, so the same mismatch is an error:
+
+```python
+Pipeline(
+    "output/cosmos3-edge",
+    component_placement={
+        "vae_decoder": {"providers": ["cpu"], "provider_options": {"cuda": {}}}
+    },
+)  # WorldModelError: 'cuda' is not one of the providers it runs on
+```
+
+Everything decidable from the manifest is rejected before a single component
+model file is opened: an empty or unknown component name, a provider repeated
+in one list, and a negative thread count all raise `WorldModelError`. Argument
+shape is checked earlier still — a provider list that is a bare string, a
+non-integer or `bool` thread count, and an unknown placement key raise
+`TypeError` or `ValueError`. Whether a provider exists and whether this ONNX
+Runtime build supports it stays a single decision made by the backend.
+
+`WorldModel` takes the same two keyword arguments and forwards them.
+`OnnxModel` and `LatentDynamicsModel` do not: they are single graphs, not
+pipelines.
+
+The C++ equivalent is `PipelinePlacementOptions`, the final defaulted argument
+of `Pipeline::Load` and `PipelinePackage::Load`. It is deliberately **not** a
+parameter of `Pipeline(PipelinePackage, scheduling)`: that package's sessions
+already exist, so accepting placement there could only be a silent no-op.
+
+**Not included.** Placement decides how a session is built and nothing else.
+There is no warm-up, no lazy or deferred component loading, no offload or
+eviction, and no peer-to-peer device-to-device transfer.
+
+## Transfer plan
+
+`Pipeline.transfer_plan` reports what every manifest connection would have to
+do to move its tensor, given where ONNX Runtime actually placed the two ports.
+
+```python
+plan = pipeline.transfer_plan
+
+print(plan.device_outputs_enabled)
+for transfer in plan.transfers:
+    print(transfer.source, "->", transfer.target, transfer.kind, transfer.reason)
+```
+
+`PipelineTransferPlan` and `PipelineTransfer` are frozen dataclasses. There is
+exactly one transfer per connection, in manifest order, recurrent edges
+included.
+
+| Kind | Meaning |
+|---|---|
+| `direct` | Same known device, nothing in between: the producer's buffer can be handed over |
+| `upload` | Host to a non-CPU device |
+| `download` | A non-CPU device to the host |
+| `host_staged` | Two different non-CPU devices, staged through the host because there is no peer-to-peer path |
+| `host_transform` | A transform this runtime evaluates on the host sits between the ports |
+| `unknown` | At least one endpoint's device is unreported, so nothing may be assumed |
+
+- **Classification is conservative.** `direct` — and the
+  `direct_bind_eligible` flag that goes with it — is claimed only when both
+  devices are known, identical, and nothing sits between them. Every other
+  kind carries a one-sentence `reason`; `direct` carries an empty one.
+- **`unknown` outranks everything.** A backend that reports no placement for a
+  port makes that connection `unknown` even if it also has a host transform.
+- **`reshape` is conservative too.** A reshape only relabels axes, but binding
+  a device buffer requires the original shape to equal the shape of the view
+  wrapped around it, so a reshape counts as `direct` only when the declared
+  source, target, and any explicit transform shape are identical and static.
+  Every other reshape is reported as `host_transform`.
+- **This is the configured plan, not the effective one.**
+  `device_outputs_enabled` mirrors the `device_outputs` option. When it is
+  false, every component output is bound to the host regardless of what the
+  plan says, so the effective behavior is CPU-bound even where the plan reports
+  `upload`, `download`, or `host_staged`. The plan is deliberately not
+  rewritten in that case, because it answers "how is this package placed",
+  which is what a caller needs before turning device outputs on.
+- **Nothing executes from it.** The plan is inspection only in this milestone.
+  Reading it takes no lock, changes nothing, and is computed once while the
+  package loads.
+
+Each port's placement is also visible on its own, through the model metadata
+of any graph loaded with `OnnxModel`:
+
+```python
+from onnx_world_model import OnnxModel
+
+model = OnnxModel("output/cosmos3-edge/world_model/model.onnx")
+for spec in model.metadata.outputs:
+    print(spec.name, spec.device)   # DeviceSpec(type='cuda', id=0) or None
+```
+
+`TensorSpec.device` is `None` when the backend reports no placement. It is
+runtime placement rather than part of the graph signature, so it never takes
+part in tensor validation.
+
+The C++ equivalents are `Pipeline::transfer_plan()` and
+`PipelinePackage::transfer_plan()`, which return the same
+`PipelineTransferPlan` value, and `TensorSpec::device`, a
+`std::optional<TensorDevice>`.
+
 ## Input contract
 
 Callers provide tokenized, normalized, and packed tensors using semantic or
@@ -777,7 +941,24 @@ Pipeline pipeline = Pipeline::Load(
     PipelineSchedulingOptions{
         .max_concurrent_executions = 4,
         .max_concurrent_by_stage_kind = {{"iterative", 2}},
+    },
+    PipelinePlacementOptions{
+        .components =
+            {
+                {"world_model",
+                 ComponentPlacement{
+                     .providers = {"cuda", "cpu"},
+                     .provider_options = {{"cuda", {{"device_id", "1"}}}},
+                 }},
+            },
     });
+
+for (const PipelineTransfer& transfer : pipeline.transfer_plan().transfers) {
+  if (transfer.kind != PipelineTransferKind::direct) {
+    // transfer.reason says why in one sentence.
+  }
+}
+
 PipelineSession session = pipeline.CreateSession();
 
 NamedTensors outputs = session.RunStage(
@@ -861,6 +1042,16 @@ therefore keeps compiling and still stops at those boundaries; only a backend
 that can interrupt work already running needs to override it, as the ONNX
 Runtime backend does.
 
+`TensorSpec` gained a final `std::optional<TensorDevice> device` member in
+0.6.0. A custom `ModelBackend` written before that keeps compiling and reports
+`std::nullopt`, which the transfer plan reads as unknown; a custom backend that
+does report placement can populate it and get a real plan. The member is
+deliberately not part of the graph signature, so neither `ValidateTensor` nor
+the manifest-versus-model check looks at it. A custom backend can also build a
+`PipelinePackage` directly and pass `device_outputs_enabled` as the
+constructor's final defaulted argument, so an in-memory package still produces
+an accurate plan.
+
 ## Runtime scope
 
 - Dense FP16, BF16, FP32, integer, and boolean tensors.
@@ -870,6 +1061,12 @@ Runtime backend does.
   driven by the stage's `guidance` and `conditioning` options rather than by
   model names.
 - KV-cache, request, sequence, iteration, and session state lifecycles.
+- Per-component load-time placement: execution providers, provider options
+  (including `device_id`), graph optimization level, and thread counts, plus a
+  conservative, inspection-only `transfer_plan` over the ports ONNX Runtime
+  actually assigned. Session warm-up, lazy or deferred component loading,
+  offload and eviction, peer-to-peer device-to-device transfers, and executing
+  from the plan are **not** included.
 - In-memory session snapshot, restore, fork, and named checkpoints. This is
   in-memory transaction support, not paged KV attention: nothing is serialized
   to disk and nothing crosses a process boundary.

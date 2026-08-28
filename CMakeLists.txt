@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   onnx_world_model
-  VERSION 0.5.0
+  VERSION 0.6.0
   DESCRIPTION "Runtime engine for Mobius-exported ONNX world models"
   LANGUAGES CXX
 )
@@ -51,7 +51,7 @@ set_target_properties(
   PROPERTIES
     CXX_EXTENSIONS OFF
     POSITION_INDEPENDENT_CODE ON
-    SOVERSION 0.5
+    SOVERSION 0.6
     VERSION ${PROJECT_VERSION}
 )
 target_compile_definitions(

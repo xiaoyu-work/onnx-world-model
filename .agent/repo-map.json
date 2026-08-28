@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T21:43:44.032Z",
+  "generatedAt": "2026-08-28T23:14:27.329Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "2c09a4ab437a7ff83d6fa61f24227546d29b5c1d023307f7872c6a3841b29643",
+  "sourceFingerprint": "55a7ebb8fc0fe6723b619799670d86b3a7b166f184fc588b78de973cadbf2488",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -112,7 +112,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -124,6 +124,11 @@
         "PipelineState",
         "PipelineAsset",
         "PipelineManifest",
+        "ComponentPlacement",
+        "PipelinePlacementOptions",
+        "PipelineTransferKind",
+        "PipelineTransfer",
+        "PipelineTransferPlan",
         "PipelinePackage",
         "PipelineRunOptions",
         "PipelineSchedulingOptions",
@@ -169,8 +174,10 @@
         "CancellationSource",
         "CancellationToken",
         "CancelledError",
+        "ComponentPlacementSpec",
         "ConditioningFramePreprocessor",
         "DeadlineExceededError",
+        "DeviceSpec",
         "GeneratorPromptPacker",
         "ImageGenerator",
         "ImageOutput",
@@ -189,6 +196,8 @@
         "PipelineSession",
         "PipelineSessionSnapshot",
         "PipelineStageSpec",
+        "PipelineTransfer",
+        "PipelineTransferPlan",
         "PreparedConditioning",
         "PreparedReasonerInputs",
         "PreparedVideo",
@@ -219,9 +228,14 @@
     {
       "path": "python/onnx_world_model/_api.py",
       "kind": "source",
-      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, cancellation, and latent-dynamics APIs.",
+      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, incremental stage run, cancellation, and latent-dynamics APIs.",
       "publicSymbols": [
+        "DeviceSpec",
         "TensorSpec",
+        "ComponentPlacementSpec",
+        "TransferKind",
+        "PipelineTransfer",
+        "PipelineTransferPlan",
         "ModelMetadata",
         "PipelineInputSpec",
         "PipelineOutputSpec",
@@ -402,7 +416,7 @@
     {
       "path": "src/pipeline.cpp",
       "kind": "source",
-      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root and opens their ONNX sessions as a PipelinePackage.",
+      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, applies per-component placement overrides, opens their ONNX sessions as a PipelinePackage, and classifies every manifest connection into that package's transfer plan.",
       "publicSymbols": [
         "Endpoint::Parse",
         "Endpoint::qualified",
@@ -415,7 +429,8 @@
         "PipelineManifest::Output",
         "PipelinePackage::PipelinePackage",
         "PipelinePackage::Load",
-        "PipelinePackage accessors"
+        "PipelinePackage accessors",
+        "PipelinePackage::transfer_plan"
       ]
     },
     {
@@ -512,6 +527,7 @@
         "Pipeline::Load",
         "Pipeline::manifest",
         "Pipeline::execution_providers",
+        "Pipeline::transfer_plan",
         "Pipeline::CreateSession",
         "Pipeline::scheduling_stats",
         "PipelineSession move operations and destructor",
@@ -604,7 +620,7 @@
     {
       "path": "tests/cpp/pipeline_device_test.cpp",
       "kind": "test",
-      "purpose": "Standalone test executable for device-tensor preservation across PipelineSession: which paths keep a producer's TensorBuffer untouched and which materialize it on the host, driven by in-process stub backends.",
+      "purpose": "Standalone test executable for device-tensor preservation across PipelineSession and for the conservative connection transfer plan a PipelinePackage computes, both driven by in-process stub backends.",
       "publicSymbols": [
         "main"
       ]
@@ -700,6 +716,12 @@
       "path": "tests/python/test_pipeline_stream.py",
       "kind": "test",
       "purpose": "Tests the Python StageEvent dataclass, the StageRun iterator and lifetime protocol, and PipelineSession.begin_stage and iter_stage against a state-transition package and an autoregressive package built with onnx_ir.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_placement.py",
+      "kind": "test",
+      "purpose": "Tests the keyword-only component_placement and allow_unpreferred_providers arguments on Pipeline and WorldModel, the DeviceSpec a CPU port reports through ModelMetadata, and the frozen PipelineTransferPlan a loaded package exposes.",
       "publicSymbols": []
     },
     {

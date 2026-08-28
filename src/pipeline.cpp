@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root and opens their ONNX sessions as a PipelinePackage.
- * @agent-public-api: Endpoint::Parse, Endpoint::qualified, PipelineManifest::Parse, PipelineManifest::Load, PipelineManifest::SupportedCapabilities, PipelineManifest accessors, PipelineManifest::Component, PipelineManifest::Input, PipelineManifest::Output, PipelinePackage::PipelinePackage, PipelinePackage::Load, PipelinePackage accessors
- * @agent-invariants: Only Mobius pipeline schema major version 1 is accepted, and unknown JSON fields are rejected rather than ignored. Every declared path stays inside the package root, and each component ONNX signature must agree with the manifest. Parsing populates the manifest and then hands it to detail::ValidateManifest, so a PipelineManifest that exists has already passed semantic validation. Pipeline is defined in pipeline_session.cpp, not here; it owns component sessions through a shared_ptr so copies share one set of ONNX sessions and one admission scheduler.
+ * @agent-purpose: Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, applies per-component placement overrides, opens their ONNX sessions as a PipelinePackage, and classifies every manifest connection into that package's transfer plan.
+ * @agent-public-api: Endpoint::Parse, Endpoint::qualified, PipelineManifest::Parse, PipelineManifest::Load, PipelineManifest::SupportedCapabilities, PipelineManifest accessors, PipelineManifest::Component, PipelineManifest::Input, PipelineManifest::Output, PipelinePackage::PipelinePackage, PipelinePackage::Load, PipelinePackage accessors, PipelinePackage::transfer_plan
+ * @agent-invariants: Only Mobius pipeline schema major version 1 is accepted, and unknown JSON fields are rejected rather than ignored. Every declared path stays inside the package root, and each component ONNX signature must agree with the manifest; that signature check ignores TensorSpec::device, which is runtime placement rather than part of the graph contract. Parsing populates the manifest and then hands it to detail::ValidateManifest, so a PipelineManifest that exists has already passed semantic validation. ValidatePlacementOptions runs immediately after the manifest is parsed and before any component model file is opened, so an empty or unknown component name, a repeated provider, repeated provider options for one provider, and a negative thread count all throw ErrorCode::invalid_argument before a single session is built; whether a provider is available and supported stays OrtBackend's decision alone. ResolveComponentRuntimeOptions layers a component's placement over the global RuntimeOptions: scalar overrides replace the global value, the provider order is the component's own list, else the global order, else the manifest preferences, the manifest preferences filter that choice unless allow_unpreferred_providers is set and the component supplied its own list, an explicitly named CPU provider is kept as the fallback, global provider options are filtered to the selected providers while component options for an unselected provider throw, and component options merge over global ones per key. BuildTransferPlan runs once in the PipelinePackage constructor after every component signature is accepted and emits exactly one PipelineTransfer per manifest connection in manifest order, recurrent edges included; classification is conservative, so an unknown endpoint device wins over everything, any transform other than a reshape whose declared source and target shapes are identical is host_transform, and direct is claimed only for identical known devices with nothing in between. Pipeline is defined in pipeline_session.cpp, not here; it owns component sessions through a shared_ptr so copies share one set of ONNX sessions and one admission scheduler.
  * @agent-side-effects: Reads pipeline.json, component ONNX files, and declared assets from disk; loads the ONNX Runtime shared library and creates one ORT session per component.
  */
 
@@ -13,11 +13,13 @@
 #include <cmath>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -317,25 +319,57 @@ void ValidateModelMetadata(
   validate(component.metadata.outputs, actual.outputs, "output");
 }
 
-RuntimeOptions ComponentRuntimeOptions(
+std::string JoinNames(const std::vector<std::string>& names) {
+  std::ostringstream joined;
+  for (std::size_t index = 0; index < names.size(); ++index) {
+    if (index != 0) {
+      joined << ", ";
+    }
+    joined << names[index];
+  }
+  return joined.str();
+}
+
+RuntimeOptions ResolveComponentRuntimeOptions(
     const RuntimeOptions& requested,
-    const PipelineComponent& component) {
+    const PipelineComponent& component,
+    const ComponentPlacement* placement,
+    bool allow_unpreferred_providers) {
   RuntimeOptions resolved = requested;
+  if (placement != nullptr) {
+    if (placement->graph_optimization.has_value()) {
+      resolved.graph_optimization = *placement->graph_optimization;
+    }
+    if (placement->intra_op_threads.has_value()) {
+      resolved.intra_op_threads = *placement->intra_op_threads;
+    }
+    if (placement->inter_op_threads.has_value()) {
+      resolved.inter_op_threads = *placement->inter_op_threads;
+    }
+  }
   std::unordered_set<std::string> allowed;
   for (const auto& provider :
        component.preferred_execution_providers) {
     allowed.insert(NormalizeExecutionProviderName(provider));
   }
 
+  // A component's own list wins over the global order, which in turn wins over
+  // its manifest preferences. Only the first of those three is "explicit" for
+  // this component, which is what allow_unpreferred_providers unlocks.
+  const bool component_providers =
+      placement != nullptr && !placement->providers.empty();
   const std::vector<std::string>& candidates =
-      requested.providers.empty()
-          ? component.preferred_execution_providers
-          : requested.providers;
+      component_providers        ? placement->providers
+      : requested.providers.empty() ? component.preferred_execution_providers
+                                    : requested.providers;
+  const bool bypass_preferences =
+      allow_unpreferred_providers && component_providers;
   resolved.providers.clear();
   for (const auto& provider : candidates) {
     const std::string normalized =
         NormalizeExecutionProviderName(provider);
-    if (allowed.empty() || allowed.contains(normalized)) {
+    if (bypass_preferences || allowed.empty() ||
+        allowed.contains(normalized)) {
       resolved.providers.push_back(provider);
     }
   }
@@ -351,18 +385,22 @@ RuntimeOptions ComponentRuntimeOptions(
           return NormalizeExecutionProviderName(provider) == "cpu";
         });
   };
-  if (names_cpu(requested.providers) && !names_cpu(resolved.providers)) {
+  const std::vector<std::string>& explicit_providers =
+      component_providers ? placement->providers : requested.providers;
+  if (names_cpu(explicit_providers) && !names_cpu(resolved.providers)) {
     resolved.providers.emplace_back("cpu");
   }
   if (resolved.providers.empty()) {
-    if (requested.providers.empty() && allowed.empty()) {
+    if (explicit_providers.empty() && allowed.empty()) {
       resolved.providers.emplace_back("cpu");
     } else {
       std::ostringstream message;
       message << "Component '" << component.name
               << "' has no execution provider compatible with ";
-      if (requested.providers.empty()) {
+      if (explicit_providers.empty()) {
         message << "its manifest preferences";
+      } else if (component_providers) {
+        message << "its requested provider order";
       } else {
         message << "the requested provider order";
       }
@@ -374,13 +412,254 @@ RuntimeOptions ComponentRuntimeOptions(
   for (const auto& provider : resolved.providers) {
     selected.insert(NormalizeExecutionProviderName(provider));
   }
+  // The global options are a pipeline-wide default, so options for a provider
+  // this component does not run on are simply not its business and are
+  // dropped. A component's own options are a statement about this component,
+  // so the same mismatch is an error rather than a silent no-op.
   resolved.provider_options.clear();
   for (const auto& [provider, values] : requested.provider_options) {
     if (selected.contains(NormalizeExecutionProviderName(provider))) {
       resolved.provider_options.emplace(provider, values);
     }
   }
+  if (placement != nullptr) {
+    for (const auto& [provider, values] : placement->provider_options) {
+      const std::string normalized =
+          NormalizeExecutionProviderName(provider);
+      if (!selected.contains(normalized)) {
+        throw Error(
+            ErrorCode::invalid_argument,
+            "Component '" + component.name +
+                "' has provider options for '" + normalized +
+                "', which is not one of the execution providers it runs on (" +
+                JoinNames(resolved.providers) + ")");
+      }
+      // Merge per key so a component can override one global option without
+      // restating the rest of that provider's configuration.
+      auto merged = resolved.provider_options.end();
+      for (auto entry = resolved.provider_options.begin();
+           entry != resolved.provider_options.end();
+           ++entry) {
+        if (NormalizeExecutionProviderName(entry->first) == normalized) {
+          merged = entry;
+          break;
+        }
+      }
+      if (merged == resolved.provider_options.end()) {
+        resolved.provider_options.emplace(provider, values);
+        continue;
+      }
+      for (const auto& [key, value] : values) {
+        merged->second[key] = value;
+      }
+    }
+  }
   return resolved;
+}
+
+//: Rejects everything about a placement request that can be decided from the
+//: manifest alone. It runs before a single component model file is opened, so
+//: a misspelled component or a repeated provider fails immediately instead of
+//: after a full package load. Whether a provider exists and whether this ORT
+//: build supports it stays OrtBackend's decision, so there is one authority
+//: for availability rather than two that can drift.
+void ValidatePlacementOptions(
+    const PipelineManifest& manifest,
+    const PipelinePlacementOptions& placement) {
+  for (const auto& [name, component] : placement.components) {
+    if (name.empty()) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "Component placement has an empty component name");
+    }
+    if (FindComponent(manifest.components(), name) == nullptr) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "Component placement names unknown component '" + name + "'");
+    }
+    std::unordered_set<std::string> seen;
+    for (const auto& provider : component.providers) {
+      const std::string normalized =
+          NormalizeExecutionProviderName(provider);
+      if (!seen.insert(normalized).second) {
+        throw Error(
+            ErrorCode::invalid_argument,
+            "Component placement for '" + name +
+                "' lists execution provider '" + normalized +
+                "' more than once");
+      }
+    }
+    std::unordered_set<std::string> option_providers;
+    for (const auto& [provider, values] : component.provider_options) {
+      (void)values;
+      if (!option_providers.insert(NormalizeExecutionProviderName(provider))
+               .second) {
+        throw Error(
+            ErrorCode::invalid_argument,
+            "Component placement for '" + name +
+                "' supplies provider options more than once for '" +
+                NormalizeExecutionProviderName(provider) + "'");
+      }
+    }
+    if (component.intra_op_threads.value_or(0) < 0 ||
+        component.inter_op_threads.value_or(0) < 0) {
+      throw Error(
+          ErrorCode::invalid_argument,
+          "Component placement for '" + name +
+              "' has a negative thread count; use 0 for automatic");
+    }
+  }
+}
+
+const TensorSpec* FindPortSpec(
+    const std::vector<TensorSpec>& specs,
+    const std::string& port) {
+  const auto found = std::ranges::find(specs, port, &TensorSpec::name);
+  return found == specs.end() ? nullptr : &*found;
+}
+
+std::string DescribeDevice(const std::optional<TensorDevice>& device) {
+  if (!device.has_value()) {
+    return "unknown";
+  }
+  return std::string(device->type()) + ":" + std::to_string(device->id());
+}
+
+//: Classifies one connection. Everything here is deliberately conservative:
+//: a kind other than `direct` never claims more than "the runtime cannot
+//: prove this is a pointer handoff", and `direct` is claimed only when both
+//: ports are known to be on the same device with nothing in between.
+PipelineTransfer ClassifyTransfer(
+    const PipelineConnection& connection,
+    const std::optional<TensorDevice>& source_device,
+    const std::optional<TensorDevice>& target_device,
+    const std::vector<std::int64_t>& source_shape,
+    const std::vector<std::int64_t>& target_shape) {
+  PipelineTransfer transfer{
+      .source = connection.source,
+      .target = connection.target,
+      .recurrent = connection.recurrent,
+      .transform = connection.transform,
+      .source_device = source_device,
+      .target_device = target_device,
+  };
+  if (!source_device.has_value() || !target_device.has_value()) {
+    transfer.kind = PipelineTransferKind::unknown;
+    transfer.reason =
+        "The device of at least one endpoint is unknown (" +
+        connection.source.qualified() + " is " +
+        DescribeDevice(source_device) + ", " +
+        connection.target.qualified() + " is " +
+        DescribeDevice(target_device) +
+        "), so no transfer may be assumed";
+    return transfer;
+  }
+  if (connection.transform.has_value()) {
+    // A reshape only relabels axes, so it can still be a pointer handoff --
+    // but only when nothing about the shape actually changes, because the
+    // device buffer binding requires the original shape to equal the shape of
+    // the view wrapped around it. Every other transform is evaluated on the
+    // host, and any reshape this runtime cannot prove is a no-op is treated
+    // the same way rather than optimistically.
+    bool explicit_shape_is_noop = true;
+    if (*connection.transform == "reshape") {
+      const Json parameters = Json::parse(connection.parameters_json);
+      if (parameters.contains("shape")) {
+        const Json& shape = parameters.at("shape");
+        explicit_shape_is_noop =
+            shape.size() == source_shape.size() &&
+            std::ranges::all_of(
+                source_shape,
+                [](std::int64_t dimension) { return dimension >= 0; }) &&
+            std::equal(
+                shape.begin(),
+                shape.end(),
+                source_shape.begin(),
+                [](const Json& declared, std::int64_t source) {
+                  return declared.is_number_integer() &&
+                         declared.get<std::int64_t>() == source;
+                });
+      }
+    }
+    const bool provable_noop =
+        *connection.transform == "reshape" &&
+        source_shape == target_shape &&
+        explicit_shape_is_noop;
+    if (!provable_noop) {
+      transfer.kind = PipelineTransferKind::host_transform;
+      transfer.reason =
+          "Transform '" + *connection.transform +
+          "' is evaluated on the host, so the source is materialized there";
+      if (*connection.transform == "reshape") {
+        transfer.reason +=
+            "; a reshape binds directly only when the declared source, "
+            "target, and explicit transform shapes are identical and static";
+      }
+      return transfer;
+    }
+  }
+  if (*source_device == *target_device) {
+    transfer.kind = PipelineTransferKind::direct;
+    transfer.direct_bind_eligible = true;
+    return transfer;
+  }
+  const bool source_is_cpu = source_device->type() == "cpu";
+  const bool target_is_cpu = target_device->type() == "cpu";
+  if (source_is_cpu) {
+    transfer.kind = PipelineTransferKind::upload;
+    transfer.reason =
+        "The source is on the host and the target is on " +
+        DescribeDevice(target_device);
+    return transfer;
+  }
+  if (target_is_cpu) {
+    transfer.kind = PipelineTransferKind::download;
+    transfer.reason =
+        "The source is on " + DescribeDevice(source_device) +
+        " and the target is on the host";
+    return transfer;
+  }
+  transfer.kind = PipelineTransferKind::host_staged;
+  transfer.reason =
+      "The endpoints are on two different non-CPU devices (" +
+      DescribeDevice(source_device) + " and " +
+      DescribeDevice(target_device) +
+      "), and this runtime has no peer-to-peer path, so the tensor stages "
+      "through the host";
+  return transfer;
+}
+
+PipelineTransferPlan BuildTransferPlan(
+    const PipelineManifest& manifest,
+    const std::unordered_map<std::string, Model>& components,
+    bool device_outputs_enabled) {
+  PipelineTransferPlan plan;
+  plan.device_outputs_enabled = device_outputs_enabled;
+  plan.transfers.reserve(manifest.connections().size());
+  for (const auto& connection : manifest.connections()) {
+    const auto source_component = components.find(connection.source.component);
+    const auto target_component = components.find(connection.target.component);
+    const TensorSpec* source_spec =
+        source_component == components.end()
+            ? nullptr
+            : FindPortSpec(
+                  source_component->second.metadata().outputs,
+                  connection.source.port);
+    const TensorSpec* target_spec =
+        target_component == components.end()
+            ? nullptr
+            : FindPortSpec(
+                  target_component->second.metadata().inputs,
+                  connection.target.port);
+    static const std::vector<std::int64_t> kNoShape;
+    plan.transfers.push_back(ClassifyTransfer(
+        connection,
+        source_spec == nullptr ? std::nullopt : source_spec->device,
+        target_spec == nullptr ? std::nullopt : target_spec->device,
+        source_spec == nullptr ? kNoShape : source_spec->shape,
+        target_spec == nullptr ? kNoShape : target_spec->shape));
+  }
+  return plan;
 }
 
 }  // namespace
@@ -960,7 +1239,8 @@ const TensorSpec& PipelineManifest::Output(const Endpoint& endpoint) const {
 PipelinePackage::PipelinePackage(
     std::filesystem::path root,
     PipelineManifest manifest,
-    std::unordered_map<std::string, Model> components)
+    std::unordered_map<std::string, Model> components,
+    bool device_outputs_enabled)
     : root_(std::move(root)),
       manifest_(std::move(manifest)),
       components_(std::move(components)) {
@@ -978,11 +1258,16 @@ PipelinePackage::PipelinePackage(
     }
     ValidateModelMetadata(component, found->second.metadata());
   }
+  // Computed once, after every component signature has been accepted, so the
+  // plan describes a package that is already known to be coherent.
+  transfer_plan_ =
+      BuildTransferPlan(manifest_, components_, device_outputs_enabled);
 }
 
 PipelinePackage PipelinePackage::Load(
     const std::filesystem::path& directory,
-    const RuntimeOptions& options) {
+    const RuntimeOptions& options,
+    const PipelinePlacementOptions& placement) {
   if (!std::filesystem::is_directory(directory)) {
     throw Error(
         ErrorCode::invalid_argument,
@@ -992,6 +1277,9 @@ PipelinePackage PipelinePackage::Load(
   const std::filesystem::path manifest_path =
       ResolveInside(root, "pipeline.json", "pipeline.json");
   PipelineManifest manifest = PipelineManifest::Load(manifest_path);
+  // Before any component model file is opened: a placement request that names
+  // nothing this package has is a caller mistake, not a load failure.
+  ValidatePlacementOptions(manifest, placement);
 
   std::unordered_map<std::string, Model> components;
   components.reserve(manifest.components().size());
@@ -1000,11 +1288,19 @@ PipelinePackage PipelinePackage::Load(
         root,
         manifest.component_files().at(component.name),
         "Component '" + component.name + "'");
+    const auto component_placement =
+        placement.components.find(component.name);
     components.emplace(
         component.name,
         Model::Load(
             model_path,
-            ComponentRuntimeOptions(options, component)));
+            ResolveComponentRuntimeOptions(
+                options,
+                component,
+                component_placement == placement.components.end()
+                    ? nullptr
+                    : &component_placement->second,
+                placement.allow_unpreferred_providers)));
   }
   for (const auto& asset : manifest.assets()) {
     const auto path = root / asset.path;
@@ -1016,7 +1312,11 @@ PipelinePackage PipelinePackage::Load(
           root, asset.path, "Optional asset '" + asset.path.generic_string() + "'");
     }
   }
-  return PipelinePackage(root, std::move(manifest), std::move(components));
+  return PipelinePackage(
+      root,
+      std::move(manifest),
+      std::move(components),
+      options.device_outputs);
 }
 
 const std::filesystem::path& PipelinePackage::root() const noexcept {
@@ -1045,6 +1345,10 @@ PipelinePackage::execution_providers() const {
     result.emplace(name, component.metadata().execution_providers);
   }
   return result;
+}
+
+const PipelineTransferPlan& PipelinePackage::transfer_plan() const noexcept {
+  return transfer_plan_;
 }
 
 }  // namespace onnx_world_model

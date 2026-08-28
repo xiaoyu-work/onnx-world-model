@@ -28,9 +28,9 @@ types.
 | `error.hpp` | `ErrorCode` categories and the `Error` exception thrown by every entry point. |
 | `cancellation.hpp` | `CancellationReason`, the copyable observer `CancellationToken` with its boundary `ThrowIfCancellationRequested` and blocking `WaitForCancellation`, and the move-only `CancellationSource` that owns the cancellable state and its optional deadline. |
 | `tensor.hpp` | `DataType`, canonical `TensorDevice` identities, the ORT-independent `TensorBuffer` contract, and the device-aware copy-on-write `Tensor`. |
-| `backend.hpp` | `TensorSpec`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
+| `backend.hpp` | `TensorSpec` with its optional runtime `device`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
 | `model.hpp` | `RuntimeOptions`, device-output policy, provider discovery and library registration, `NamedTensors`, `ModelBackend` with its default cancellable `Run` overload, and `Model`. |
-| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `PipelinePackage`, `Pipeline` with its shared `PipelineSchedulingOptions` admission limits and its `PipelineSchedulingStats` reading of them, `PipelineSession` with its incremental `BeginStage` and named-checkpoint methods, `PipelineSessionSnapshot`, `StageEventKind`, `StageEvent`, `StageRun`, `PipelineRunOptions`. |
+| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `ComponentPlacement` and `PipelinePlacementOptions`, the `PipelineTransferKind`, `PipelineTransfer`, and `PipelineTransferPlan` classification of every connection, `PipelinePackage`, `Pipeline` with its shared `PipelineSchedulingOptions` admission limits and its `PipelineSchedulingStats` reading of them, `PipelineSession` with its incremental `BeginStage` and named-checkpoint methods, `PipelineSessionSnapshot`, `StageEventKind`, `StageEvent`, `StageRun`, `PipelineRunOptions`. |
 | `world_model.hpp` | `WorldModel` and `Rollout`, the fixed three-input/four-output latent-dynamics API. |
 | `onnx_world_model.hpp` | Umbrella header that includes all of the above. |
 
@@ -62,8 +62,20 @@ with `Pipeline::scheduling_stats` that reports the shared controller's
 admitted and queued counts, and a `Pipeline` data member holding that
 controller, which changes the class layout; the library
 therefore carries `SOVERSION 0.5` and a C++ consumer built against 0.4 must be
-recompiled. Every one of those parameters is defaulted, so source that already
-compiled keeps compiling and keeps its unlimited behavior.
+recompiled. Version 0.6.0 adds a final `std::optional<TensorDevice> device`
+member to `TensorSpec`, the `ComponentPlacement` and `PipelinePlacementOptions`
+load-time placement types with a final defaulted parameter on
+`PipelinePackage::Load` and `Pipeline::Load`, the `PipelineTransferKind`,
+`PipelineTransfer`, and `PipelineTransferPlan` value types with
+`PipelinePackage::transfer_plan` and `Pipeline::transfer_plan`, a final
+defaulted `device_outputs_enabled` parameter on the `PipelinePackage`
+constructor, and a `PipelinePackage` data member holding the computed plan;
+`TensorSpec` and `PipelinePackage` therefore both change layout, so the library
+carries `SOVERSION 0.6` and a consumer built against 0.5 must be recompiled.
+Placement is deliberately absent from `Pipeline(PipelinePackage, scheduling)`,
+whose sessions are already built. Every one of those parameters is defaulted,
+so source that already compiled keeps compiling and keeps its unlimited,
+unplaced behavior.
 
 ## Tests
 
@@ -77,9 +89,13 @@ ctest --preset dev
 `tests/cpp/tensor_test.cpp` covers `tensor.hpp`, `tests/cpp/model_test.cpp`
 covers `model.hpp` and `backend.hpp`,
 `tests/cpp/cancellation_test.cpp` covers `cancellation.hpp`, and
-`tests/cpp/pipeline_test.cpp`, `tests/cpp/pipeline_snapshot_test.cpp`,
+`tests/cpp/pipeline_test.cpp`, `tests/cpp/pipeline_device_test.cpp`,
+`tests/cpp/pipeline_snapshot_test.cpp`,
 `tests/cpp/pipeline_stream_test.cpp`,
 `tests/cpp/pipeline_cancellation_test.cpp`, and
-`tests/cpp/pipeline_scheduler_test.cpp` cover `pipeline.hpp`.
+`tests/cpp/pipeline_scheduler_test.cpp` cover `pipeline.hpp`;
+`tests/cpp/pipeline_device_test.cpp` is the primary coverage for
+`PipelineTransferPlan` and for the API shape that keeps
+`PipelinePlacementOptions` off the already-built-package constructor.
 `tests/python/` reaches the same declarations through the `_native` extension
 module.

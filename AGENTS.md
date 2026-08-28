@@ -76,14 +76,15 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 9 of 9 passing; `pytest` reports 161 passed
+Expected baseline: `ctest` reports 9 of 9 passing; `pytest` reports 185 passed
 and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
 `tests/python/test_pipeline_snapshot.py`,
 `tests/python/test_pipeline_stream.py`,
-`tests/python/test_cancellation.py`, and
-`tests/python/test_scheduling.py`.
+`tests/python/test_cancellation.py`,
+`tests/python/test_scheduling.py`, and
+`tests/python/test_placement.py`.
 
 `pipeline_scheduler_test` is the one concurrent CTest executable. Run it
 repeatedly after changing `src/pipeline_scheduler.cpp`, `src/cancellation.cpp`,
@@ -91,6 +92,14 @@ or any call site that takes an admission lease:
 
 ```console
 ctest --preset dev -R pipeline_scheduler_test --repeat until-fail:20
+```
+
+Run the placement tests repeatedly after changing component placement, the
+per-port device metadata, or the transfer plan:
+
+```console
+ctest --preset dev -R pipeline_device_test
+.venv\Scripts\python.exe -m pytest tests/python/test_placement.py -q
 ```
 
 C++ changes require `cmake --build --preset dev` before `ctest`, and a

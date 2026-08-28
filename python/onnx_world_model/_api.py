@@ -1,7 +1,7 @@
 # @agent-file
-# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, cancellation, and latent-dynamics APIs.
-# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
+# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, incremental stage run, cancellation, and latent-dynamics APIs.
+# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -23,12 +23,103 @@ from numpy.typing import ArrayLike, NDArray
 
 from . import _native
 
+ProviderOptionValue = str | bool | int | float
+ProviderOptions = Mapping[str, Mapping[str, ProviderOptionValue]]
+
+
+@dataclass(frozen=True)
+class DeviceSpec:
+    """Where one model port lives, as ONNX Runtime actually placed it.
+
+    ``type`` is a canonical lowercase device name such as ``"cpu"`` or
+    ``"cuda"``, and ``id`` is that device's ordinal, which is always ``0`` for
+    the host.
+    """
+
+    type: str
+    id: int
+
 
 @dataclass(frozen=True)
 class TensorSpec:
     name: str
     dtype: str
     shape: tuple[int, ...]
+    #: Where this port is placed, or ``None`` when the backend does not report
+    #: placement. It is runtime placement rather than part of the graph
+    #: signature, so it never affects tensor validation.
+    device: DeviceSpec | None = None
+
+
+@dataclass(frozen=True)
+class ComponentPlacementSpec:
+    """Per-component execution-provider and session overrides for one load.
+
+    Leaving a field empty or ``None`` keeps the pipeline-wide value:
+    ``providers`` falls back to the global provider order and then to the
+    component's manifest preferences, ``provider_options`` merges over the
+    global options per provider and per key, and each scalar override replaces
+    the global one only for this component.
+
+    ``device_id`` and every other device selector belongs in
+    ``provider_options`` under its native ONNX Runtime name, so this runtime
+    never invents a second spelling for something ONNX Runtime already names.
+    """
+
+    providers: Sequence[str] | None = None
+    provider_options: ProviderOptions | None = None
+    graph_optimization: str | None = None
+    intra_op_threads: int | None = None
+    inter_op_threads: int | None = None
+
+
+TransferKind = Literal[
+    "direct",
+    "upload",
+    "download",
+    "host_staged",
+    "host_transform",
+    "unknown",
+]
+
+
+@dataclass(frozen=True)
+class PipelineTransfer:
+    """How one manifest connection would have to move its tensor.
+
+    ``kind`` is conservative: anything the runtime cannot prove is a pointer
+    handoff is reported as needing host involvement, and ``reason`` says why in
+    one sentence. It is empty only for ``"direct"``.
+    """
+
+    source: str
+    target: str
+    recurrent: bool
+    transform: str | None
+    source_device: DeviceSpec | None
+    target_device: DeviceSpec | None
+    kind: TransferKind
+    direct_bind_eligible: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class PipelineTransferPlan:
+    """One :class:`PipelineTransfer` per manifest connection, in manifest order.
+
+    This is the *configured* physical plan, not the effective one. It reports
+    where ONNX Runtime placed each port; it does not describe what the session
+    currently does, and nothing in this milestone executes from it. When
+    ``device_outputs_enabled`` is false every component output is bound to the
+    host regardless of what the plan says, so the effective behavior is
+    CPU-bound even where the plan reports ``upload``, ``download``, or
+    ``host_staged``. The plan is deliberately not rewritten in that case,
+    because it answers "how is this package placed", which is what a caller
+    needs before turning device outputs on.
+    """
+
+    transfers: tuple[PipelineTransfer, ...]
+    device_outputs_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -258,18 +349,47 @@ def _cancellation_token(
     return None, None
 
 
+def _device_spec(payload: Mapping[str, Any] | None) -> DeviceSpec | None:
+    """Freezes one native device dictionary, or keeps ``None`` for unknown."""
+    if payload is None:
+        return None
+    return DeviceSpec(type=str(payload["type"]), id=int(payload["id"]))
+
+
 def _metadata_from_native(value: dict[str, Any]) -> ModelMetadata:
     def convert(spec: dict[str, Any]) -> TensorSpec:
         return TensorSpec(
             name=spec["name"],
             dtype=spec["dtype"],
             shape=tuple(spec["shape"]),
+            device=_device_spec(spec.get("device")),
         )
 
     return ModelMetadata(
         inputs=tuple(convert(spec) for spec in value["inputs"]),
         outputs=tuple(convert(spec) for spec in value["outputs"]),
         execution_providers=tuple(value["execution_providers"]),
+    )
+
+
+def _transfer_plan(payload: Mapping[str, Any]) -> PipelineTransferPlan:
+    """Freezes one native transfer plan into its typed, immutable value."""
+    return PipelineTransferPlan(
+        transfers=tuple(
+            PipelineTransfer(
+                source=entry["source"],
+                target=entry["target"],
+                recurrent=bool(entry["recurrent"]),
+                transform=entry["transform"],
+                source_device=_device_spec(entry["source_device"]),
+                target_device=_device_spec(entry["target_device"]),
+                kind=entry["kind"],
+                direct_bind_eligible=bool(entry["direct_bind_eligible"]),
+                reason=entry["reason"],
+            )
+            for entry in payload["transfers"]
+        ),
+        device_outputs_enabled=bool(payload["device_outputs_enabled"]),
     )
 
 
@@ -358,10 +478,6 @@ def _find_ort_library() -> Path:
     )
 
 
-ProviderOptionValue = str | bool | int | float
-ProviderOptions = Mapping[str, Mapping[str, ProviderOptionValue]]
-
-
 def _provider_arguments(
     providers: Sequence[str] | None,
     provider_options: ProviderOptions | None,
@@ -373,6 +489,54 @@ def _provider_arguments(
             for provider, options in (provider_options or {}).items()
         },
     )
+
+
+def _placement_arguments(
+    component_placement: Mapping[str, ComponentPlacementSpec | Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Normalizes each component override into the plain mapping ``_native`` takes.
+
+    A :class:`ComponentPlacementSpec` and an equivalent plain mapping are
+    accepted interchangeably; a field left at ``None`` is dropped rather than
+    forwarded, so it inherits the pipeline-wide value instead of overriding it
+    with a null.
+    """
+    resolved: dict[str, dict[str, Any]] = {}
+    for component, placement in (component_placement or {}).items():
+        if isinstance(placement, ComponentPlacementSpec):
+            fields: dict[str, Any] = {
+                "providers": placement.providers,
+                "provider_options": placement.provider_options,
+                "graph_optimization": placement.graph_optimization,
+                "intra_op_threads": placement.intra_op_threads,
+                "inter_op_threads": placement.inter_op_threads,
+            }
+        elif isinstance(placement, Mapping):
+            fields = dict(placement)
+        else:
+            raise TypeError(
+                f"component_placement[{component!r}] must be a "
+                "ComponentPlacementSpec or a mapping"
+            )
+        entry: dict[str, Any] = {}
+        for name, value in fields.items():
+            if value is None:
+                continue
+            if name == "providers":
+                entry[name] = value if isinstance(value, str) else list(value)
+            elif name == "provider_options":
+                entry[name] = (
+                    value
+                    if not isinstance(value, Mapping)
+                    else {
+                        provider: dict(options) if isinstance(options, Mapping) else options
+                        for provider, options in value.items()
+                    }
+                )
+            else:
+                entry[name] = value
+        resolved[component] = entry
+    return resolved
 
 
 def available_execution_providers(
@@ -500,6 +664,20 @@ class Pipeline:
     runtime executes -- ``single_pass``, ``autoregressive``, ``iterative``,
     ``state_transition``, ``composite``, or ``on_demand`` -- and an unknown or
     empty key raises :class:`WorldModelError` here rather than being ignored.
+
+    ``component_placement`` maps a manifest component name to a
+    :class:`ComponentPlacementSpec` -- or an equivalent mapping -- that
+    overrides the pipeline-wide execution providers, provider options, graph
+    optimization level, and thread counts for that component alone. An empty or
+    unknown component name raises :class:`WorldModelError` before any component
+    model file is opened. A component's manifest preferences still filter its
+    provider order unless ``allow_unpreferred_providers`` is set *and* that
+    component supplied its own ``providers`` list.
+
+    Placement is load-time configuration, so it is accepted only here, where
+    the component sessions are still being built. It never warms a session up,
+    loads one lazily, offloads or evicts one, or arranges a peer-to-peer
+    transfer.
     """
 
     def __init__(
@@ -516,6 +694,10 @@ class Pipeline:
         provider_options: ProviderOptions | None = None,
         max_concurrent_executions: int = 0,
         max_concurrent_by_stage_kind: Mapping[str, int] | None = None,
+        component_placement: (
+            Mapping[str, ComponentPlacementSpec | Mapping[str, Any]] | None
+        ) = None,
+        allow_unpreferred_providers: bool = False,
     ) -> None:
         package = Path(package_path)
         with (package / "pipeline.json").open(encoding="utf-8") as file:
@@ -525,6 +707,7 @@ class Pipeline:
         )
         provider_names, options = _provider_arguments(providers, provider_options)
         stage_kind_limits = dict(max_concurrent_by_stage_kind or {})
+        placement = _placement_arguments(component_placement)
         self._core = _native.Pipeline(
             os.fspath(package),
             os.fspath(library_path),
@@ -537,6 +720,8 @@ class Pipeline:
             options,
             max_concurrent_executions,
             stage_kind_limits,
+            placement,
+            allow_unpreferred_providers,
         )
         # Recorded only after the native constructor accepted them, so these
         # report the limits actually in force rather than what was requested.
@@ -544,6 +729,7 @@ class Pipeline:
         self._max_concurrent_by_stage_kind: Mapping[str, int] = MappingProxyType(
             stage_kind_limits
         )
+        self._transfer_plan = _transfer_plan(self._core.transfer_plan)
         self._manifest: dict[str, Any] = self._document["manifest"]
         components = {
             component["name"]: component for component in self._manifest["components"]
@@ -630,6 +816,16 @@ class Pipeline:
     def max_concurrent_executions(self) -> int:
         """Executions admitted at once across every session, or 0 for no cap."""
         return self._max_concurrent_executions
+
+    @property
+    def transfer_plan(self) -> PipelineTransferPlan:
+        """How every manifest connection would have to move its tensor.
+
+        Inspection only: nothing in this milestone executes from the plan. It
+        is computed once while the package loads, so reading it costs nothing
+        and always returns the same immutable value.
+        """
+        return self._transfer_plan
 
     @property
     def max_concurrent_by_stage_kind(self) -> Mapping[str, int]:

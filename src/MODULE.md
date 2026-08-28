@@ -15,6 +15,14 @@ latent-dynamics compatibility layer.
   ORT build and links against no ORT binary.
 - Turn `pipeline.json` into a `PipelineManifest` and reject anything the
   runtime cannot execute at load time rather than at inference time.
+- Place each component's ONNX Runtime session where the caller asked: a
+  per-component execution-provider order, provider options, graph optimization
+  level, and thread counts layered over the pipeline-wide `RuntimeOptions`,
+  validated against the manifest before a single model file is opened. From
+  the ports ONNX Runtime actually assigned, classify every manifest connection
+  into a conservative `PipelineTransferPlan`. That plan is inspection only:
+  nothing executes from it, and warm-up, lazy loading, offload and eviction,
+  and peer-to-peer transfers are deliberately not implemented.
 - Execute pipeline stages, including generated inputs, transforms, diffusion
   schedulers, classifier-free guidance, autoregressive decoding, and recurrent
   state lifecycles, through one state machine that a caller can either drain
@@ -47,11 +55,11 @@ latent-dynamics compatibility layer.
 |---|---|
 | `cancellation.hpp/.cpp` | The cancellation state machine behind `CancellationToken` and `CancellationSource`: first-reason-wins claiming, deadline claiming from both a poll and the one process-wide `detail::DeadlineService` watchdog, the blocking `WaitForCancellation`, the race-free callback registry, the `detail::CancellationAccess` seam, and the RAII `detail::CancellationRegistration`. |
 | `dynamic_library.hpp/.cpp` | RAII shared-library handle; binds the `OrtApi` table once per process. |
-| `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, retains I/O-bound outputs in ORT-owned device buffers, and terminates an in-flight `Session::Run` through a per-call `Ort::RunOptions`. |
+| `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, reads each session's per-port memory plan once and publishes it as `TensorSpec::device`, retains I/O-bound outputs in ORT-owned device buffers, and terminates an in-flight `Session::Run` through a per-call `Ort::RunOptions`. |
 | `tensor.cpp` | Canonical tensor devices, owned CPU buffers, checked shape arithmetic, explicit CPU materialization, and copy-on-write mutation. |
 | `model.cpp` | `Model` facade, the default cancellable `ModelBackend::Run` overload, provider-name normalization, tensor-versus-signature validation. |
 | `world_model.cpp` | `WorldModel` contract enforcement and `Rollout` recurrent state. |
-| `pipeline.cpp` | `pipeline.json` parsing and `PipelinePackage` loading. |
+| `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, and the connection transfer plan. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
 | `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the supported stage-kind list and its validation, the per-kind permit buckets, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
@@ -113,7 +121,7 @@ ctest --preset dev
 validation, `tests/cpp/cancellation_test.cpp` is the primary coverage for
 `cancellation.cpp`, `tests/cpp/pipeline_device_test.cpp` is the primary
 coverage for the device-versus-host materialization boundaries in
-`pipeline_session.cpp`, `tests/cpp/pipeline_snapshot_test.cpp` is the primary
+`pipeline_session.cpp` and for the transfer plan `pipeline.cpp` computes, `tests/cpp/pipeline_snapshot_test.cpp` is the primary
 coverage for its snapshot, restore, fork, and named-checkpoint operations,
 `tests/cpp/pipeline_stream_test.cpp` is the primary coverage for its
 `StageRun` state machine and the `RunStage` parity that machine guarantees,
@@ -122,4 +130,5 @@ that machine's cancellation and deadline boundaries, and
 `tests/cpp/pipeline_scheduler_test.cpp` is the primary coverage for
 `pipeline_scheduler.cpp` and for which calls take an admission lease.
 `tests/python/` exercises the same code through the `_native` extension
-module.
+module; `tests/python/test_placement.py` is where the load-time placement
+overrides and their rejection cases are exercised end to end.

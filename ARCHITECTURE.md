@@ -47,8 +47,8 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
-| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, admission scheduling, staged execution. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
+| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, component placement and connection transfer planning, admission scheduling, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
 | C++ tests | `tests/cpp/` | Stub-backend tests registered with CTest. |
@@ -67,11 +67,16 @@ Within `src/` the runtime is layered:
 - `dynamic_library` loads the ORT shared library and binds `OrtApi` once per
   process.
 - `ort_backend` is the only other translation unit that touches ORT; it owns
-  the process-wide ORT environment, builds component sessions, uses I/O
-  binding to wrap ORT-owned outputs in device-aware tensors, and terminates an
+  the process-wide ORT environment, builds component sessions, reads each
+  session's per-port memory plan once and publishes it as
+  `TensorSpec::device`, uses I/O binding to wrap ORT-owned outputs in
+  device-aware tensors, and terminates an
   in-flight `Session::Run` through a per-call `Ort::RunOptions`.
 - `model` validates named tensors against graph signatures.
-- `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
+- `pipeline` parses `pipeline.json`, resolves and validates per-component
+  placement over the pipeline-wide `RuntimeOptions`, and classifies every
+  connection into the package's conservative `PipelineTransferPlan`;
+  `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
   share.
 - `pipeline_scheduler` is the shared admission controller: the supported
@@ -113,10 +118,16 @@ Loading:
 
 1. `Pipeline.__init__` reads `pipeline.json` and calls `_native.Pipeline`.
 2. `PipelinePackage::Load` resolves component paths inside the package root,
-   parses the manifest, and runs `detail::ValidateManifest`.
-3. Each component ONNX file is opened as a `Model`, and its signature is checked
-   against the manifest.
-4. `Pipeline` holds the resulting components immutably behind a `shared_ptr`.
+   parses the manifest, runs `detail::ValidateManifest`, and then validates the
+   requested `PipelinePlacementOptions` against that manifest, before any
+   component model file is opened.
+3. Each component ONNX file is opened as a `Model` with its placement layered
+   over the pipeline-wide `RuntimeOptions`, and its signature is checked
+   against the manifest. The ORT backend reads that session's per-port memory
+   plan once and publishes it as each `TensorSpec::device`.
+4. `PipelinePackage` classifies every manifest connection into its
+   `PipelineTransferPlan` from those port devices.
+5. `Pipeline` holds the resulting components immutably behind a `shared_ptr`.
 
 Generation, using video as the example:
 
@@ -300,9 +311,12 @@ Python:
   `snapshot()`, `restore()`, `fork()`, and the named `checkpoint()`,
   `restore_checkpoint()`, `drop_checkpoint()`, and `has_checkpoint()` methods
   for in-memory session branching, the keyword-only `cancellation` and
-  `timeout` arguments on every execution method, and the keyword-only
+  `timeout` arguments on every execution method, the keyword-only
   `max_concurrent_executions` and `max_concurrent_by_stage_kind` constructor
-  arguments that cap concurrent executions.
+  arguments that cap concurrent executions, the keyword-only
+  `component_placement` and `allow_unpreferred_providers` constructor
+  arguments that place each component's session, and the read-only
+  `transfer_plan` those produce.
 - `onnx_world_model.CancellationSource` and `CancellationToken` — explicit
   cancellation and deadlines, with `CancelledError` and
   `DeadlineExceededError` as the outcomes, both derived from
@@ -324,6 +338,10 @@ C++:
   constructor and `Load` take an optional `PipelineSchedulingOptions` that
   caps concurrent executions globally and per stage kind, and
   `Pipeline::scheduling_stats` reads how many are admitted and queued now.
+  `Pipeline::Load` and `PipelinePackage::Load` take an optional
+  `PipelinePlacementOptions` that places each component's session;
+  `Pipeline::transfer_plan` and `PipelinePackage::transfer_plan` read the
+  resulting connection classification.
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
   in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
@@ -397,6 +415,27 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   `Pipeline::scheduling_stats` observes that controller and nothing else: it
   reports admitted and queued counts, never timings or throughput, and reading
   it cannot admit, queue, or block anything.
+- **Placement is load-time, and the transfer plan only describes it.** Which
+  execution providers, provider options, graph optimization level, and thread
+  counts a component's session is built with is decided once, while that
+  session is being created; `PipelinePlacementOptions` therefore appears only
+  on `PipelinePackage::Load` and `Pipeline::Load` and never on the constructor
+  that takes an already-built package. A component's own provider list beats
+  the global order, which beats its manifest preferences, and those
+  preferences still filter the result unless `allow_unpreferred_providers` is
+  set *and* that component supplied its own list. Global provider options are
+  a pipeline-wide default and are filtered to the providers a component runs
+  on; a component's own options for a provider it does not run on are an error
+  rather than a silent drop. `PipelineTransferPlan` is a conservative
+  description of where ONNX Runtime placed each port — direct only for
+  identical known devices with nothing in between, `unknown` whenever an
+  endpoint device is unreported, and host-involving for every transform this
+  runtime evaluates on the host, including any `reshape` whose declared source
+  and target shapes are not identical. It is the configured physical plan, not
+  the effective one: when `device_outputs` is off every output is still bound
+  to the host, and the plan is deliberately not rewritten to say so. Nothing
+  executes from the plan. Warm-up, lazy loading, offload and eviction, and
+  peer-to-peer transfers are explicitly out of scope.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
   CPU buffer is cloned before mutation. Device buffers expose immutable
   storage and an explicit synchronous CPU-copy operation.
@@ -445,3 +484,16 @@ hidden:
 
 Output media encoding is not included, and fixed-step stochastic FlowMatch
 schedules are not yet supported.
+
+Component placement covers where each component's session is built and a
+conservative, inspectable description of what every connection would then have
+to move. The following are deliberately out of scope in this milestone and are
+not partially implemented anywhere:
+
+- session warm-up and lazy or deferred component loading;
+- offloading or evicting a component's session or weights;
+- peer-to-peer device-to-device transfers, so two different non-CPU devices
+  are always reported as staging through the host;
+- rewriting execution from the transfer plan. Nothing reads it, so turning
+  `device_outputs` on or off changes what the session does while the plan
+  keeps describing the same physical placement.

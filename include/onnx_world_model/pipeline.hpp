@@ -2,9 +2,9 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
- * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, PipelineSchedulingOptions, PipelineSchedulingStats, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back. PipelineSchedulingOptions is admission scheduling only and never batching: a Pipeline's limits are fixed at construction, shared by every copy of that Pipeline and by every session and StageRun it produces, and an unknown or empty per-kind key is rejected with ErrorCode::invalid_argument at construction. Exactly four calls are one execution and take exactly one permit for their whole duration -- RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain -- while BeginStage, a completed Finish, an idle StageRun between Step calls, Cancel, RequestCancellation, and every query and state method take none. PipelineSchedulingStats is a detached value, not a view: Pipeline::scheduling_stats() reads the shared controller under its own lock and returns counts that never change afterwards, both per-kind maps always carry all six executable stage kinds, and the counts are permits rather than executions, so an unlimited stage kind -- which is admitted without one -- is reported as zero.
+ * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
+ * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, ComponentPlacement, PipelinePlacementOptions, PipelineTransferKind, PipelineTransfer, PipelineTransferPlan, PipelinePackage, PipelineRunOptions, PipelineSchedulingOptions, PipelineSchedulingStats, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. PipelinePlacementOptions is load-time only: it appears on PipelinePackage::Load and Pipeline::Load and deliberately not on Pipeline(PipelinePackage, scheduling), whose sessions are already built, and an empty or unknown component key throws ErrorCode::invalid_argument right after the manifest is parsed and before any component model file is opened. A component's providers are its own list when it has one, otherwise the global order, otherwise its manifest preferences; the manifest preferences filter that choice unless allow_unpreferred_providers is set and that component supplied its own list. Provider options merge global-then-component per provider and per key, and component options for a provider that component does not run on throw ErrorCode::invalid_argument instead of being dropped. PipelineTransferPlan holds exactly one PipelineTransfer per manifest connection, recurrent edges included, in manifest order; it is the configured physical plan and is never rewritten when device_outputs_enabled is false, and nothing in this milestone executes from it. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back. PipelineSchedulingOptions is admission scheduling only and never batching: a Pipeline's limits are fixed at construction, shared by every copy of that Pipeline and by every session and StageRun it produces, and an unknown or empty per-kind key is rejected with ErrorCode::invalid_argument at construction. Exactly four calls are one execution and take exactly one permit for their whole duration -- RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain -- while BeginStage, a completed Finish, an idle StageRun between Step calls, Cancel, RequestCancellation, and every query and state method take none. PipelineSchedulingStats is a detached value, not a view: Pipeline::scheduling_stats() reads the shared controller under its own lock and returns counts that never change afterwards, both per-kind maps always carry all six executable stage kinds, and the counts are permits rather than executions, so an unlimited stage kind -- which is admitted without one -- is reported as zero.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -162,27 +162,155 @@ class PipelineManifest {
   std::unordered_map<std::string, std::filesystem::path> component_files_;
 };
 
+//: Where one component's ONNX Runtime session runs and how it is configured,
+//: layered on top of the pipeline-wide RuntimeOptions. Every member is
+//: optional in the sense that leaving it empty keeps the global value: an
+//: empty `providers` inherits the global provider order or the component's
+//: manifest preferences, an empty `provider_options` inherits only the global
+//: options, and a disengaged optional leaves the global scalar in force.
+//:
+//: This is placement configuration only. It never warms a session up, loads
+//: one lazily, offloads or evicts one, or arranges a peer-to-peer transfer;
+//: all of those are deliberately outside this milestone.
+struct ComponentPlacement {
+  //: The execution-provider order for this component, most preferred first.
+  //: `device_id` and every other device selector is a native provider option
+  //: rather than a field of its own, so this runtime never invents a second
+  //: spelling for something ONNX Runtime already names.
+  std::vector<std::string> providers;
+  //: Provider options for this component, merged over the global ones per
+  //: provider and per key with the component winning. Supplying options for a
+  //: provider this component does not end up running on throws
+  //: ErrorCode::invalid_argument rather than being dropped.
+  std::unordered_map<
+      std::string,
+      std::unordered_map<std::string, std::string>>
+      provider_options;
+  //: Overrides RuntimeOptions::graph_optimization for this component only.
+  std::optional<GraphOptimizationLevel> graph_optimization;
+  //: Overrides RuntimeOptions::intra_op_threads for this component only. 0 is
+  //: ONNX Runtime's automatic choice; a negative value is rejected.
+  std::optional<int> intra_op_threads;
+  //: Overrides RuntimeOptions::inter_op_threads for this component only.
+  std::optional<int> inter_op_threads;
+};
+
+//: Per-component placement for one package load. Keys are manifest component
+//: names; an empty or unknown name throws ErrorCode::invalid_argument
+//: immediately after the manifest is parsed and before any component model
+//: file is opened, so a typo fails fast instead of silently placing nothing.
+struct PipelinePlacementOptions {
+  std::unordered_map<std::string, ComponentPlacement> components;
+  //: Lets a component that explicitly names its own providers run on one its
+  //: manifest does not prefer. It applies only to such a component: a
+  //: component that inherits the global provider order or its own manifest
+  //: preferences is still filtered by those preferences, which is the
+  //: behavior every earlier release had.
+  bool allow_unpreferred_providers{false};
+};
+
+//: How one manifest connection would have to move its tensor, given where
+//: ONNX Runtime actually placed the two ports. Classification is conservative:
+//: anything this runtime cannot prove is a pointer handoff is reported as
+//: needing host involvement.
+enum class PipelineTransferKind {
+  //: Same device on both ends and no transform: the producer's buffer can be
+  //: handed straight to the consumer.
+  direct,
+  //: CPU to a non-CPU device.
+  upload,
+  //: A non-CPU device to CPU.
+  download,
+  //: Two different non-CPU devices, which this runtime stages through the
+  //: host because it has no peer-to-peer path.
+  host_staged,
+  //: A transform this runtime evaluates on the host sits between the ports,
+  //: so the source is materialized there whatever the two devices are.
+  host_transform,
+  //: At least one endpoint's device is unknown, so nothing may be assumed.
+  unknown,
+};
+
+//: One manifest connection classified for transfer. There is exactly one of
+//: these per connection, recurrent edges included, in manifest order.
+struct PipelineTransfer {
+  Endpoint source;
+  Endpoint target;
+  //: True for a loop-carried edge, which is classified exactly like a forward
+  //: one; it is reported so a caller can tell the two apart.
+  bool recurrent{false};
+  //: The connection's declared transform, if it has one.
+  std::optional<std::string> transform;
+  //: Where the producing output port lives, or nullopt when unknown.
+  std::optional<TensorDevice> source_device;
+  //: Where the consuming input port lives, or nullopt when unknown.
+  std::optional<TensorDevice> target_device;
+  PipelineTransferKind kind{PipelineTransferKind::unknown};
+  //: True only for `direct`. A `reshape` counts as direct only when the
+  //: declared source and target shapes are identical, because the current
+  //: device-buffer binding requires the original shape to equal the shape of
+  //: the view wrapped around it.
+  bool direct_bind_eligible{false};
+  //: Why this connection is not direct, in one sentence. Empty for `direct`.
+  std::string reason;
+};
+
+//: The conservative transfer classification of a whole package: one entry per
+//: manifest connection, in manifest order.
+//:
+//: This is the configured physical plan, not the effective one. It describes
+//: where ONNX Runtime placed each port; it does not describe what the session
+//: currently does, and nothing in this milestone rewrites execution from it.
+//: In particular, when `device_outputs_enabled` is false every component
+//: output is bound to CPU regardless of where the plan says the port lives,
+//: so the effective behavior is CPU-bound even where the plan reports
+//: `upload`, `download`, or `host_staged`. The plan is deliberately not
+//: rewritten in that case, because it answers "how is this package placed",
+//: which is what a caller needs before turning device outputs on.
+struct PipelineTransferPlan {
+  std::vector<PipelineTransfer> transfers;
+  //: Mirrors RuntimeOptions::device_outputs for the sessions this plan was
+  //: computed over.
+  bool device_outputs_enabled{false};
+};
+
 class PipelinePackage {
  public:
+  //: Builds a package over component sessions that already exist, which is
+  //: how a custom backend or a test assembles one without touching disk.
+  //: `device_outputs_enabled` records whether those sessions were configured
+  //: to hand back device-resident outputs; it only annotates the computed
+  //: transfer plan and changes no execution.
   PipelinePackage(
       std::filesystem::path root,
       PipelineManifest manifest,
-      std::unordered_map<std::string, Model> components);
+      std::unordered_map<std::string, Model> components,
+      bool device_outputs_enabled = false);
 
+  //: Loads and validates the package under `directory`. `options` is the
+  //: baseline every component starts from and `placement` layers per-component
+  //: overrides on top of it. Both are defaulted, so an existing call keeps its
+  //: behavior exactly.
   static PipelinePackage Load(
       const std::filesystem::path& directory,
-      const RuntimeOptions& options = {});
+      const RuntimeOptions& options = {},
+      const PipelinePlacementOptions& placement = {});
 
   [[nodiscard]] const std::filesystem::path& root() const noexcept;
   [[nodiscard]] const PipelineManifest& manifest() const noexcept;
   [[nodiscard]] const Model& Component(std::string_view name) const;
   [[nodiscard]] std::unordered_map<std::string, std::vector<std::string>>
   execution_providers() const;
+  //: The conservative transfer classification of every manifest connection,
+  //: computed once while this package was built. It is a description, never a
+  //: rewrite: execution reads none of it in this milestone.
+  [[nodiscard]] const PipelineTransferPlan& transfer_plan() const noexcept;
 
  private:
   std::filesystem::path root_;
   PipelineManifest manifest_;
   std::unordered_map<std::string, Model> components_;
+  PipelineTransferPlan transfer_plan_;
 };
 
 struct PipelineRunOptions {
@@ -276,6 +404,11 @@ class Pipeline {
   //: Copies of the returned Pipeline share that controller, so their sessions
   //: compete for the same permits; a separately constructed Pipeline over the
   //: same package gets an independent one.
+  //:
+  //: This overload takes no PipelinePlacementOptions on purpose. Placement
+  //: decides how a component's ONNX Runtime session is built, and by the time
+  //: a PipelinePackage exists every session in it has already been built, so
+  //: accepting placement here could only be a silent no-op.
   explicit Pipeline(
       PipelinePackage package,
       PipelineSchedulingOptions scheduling = {});
@@ -283,11 +416,15 @@ class Pipeline {
   static Pipeline Load(
       const std::filesystem::path& directory,
       const RuntimeOptions& options = {},
-      const PipelineSchedulingOptions& scheduling = {});
+      const PipelineSchedulingOptions& scheduling = {},
+      const PipelinePlacementOptions& placement = {});
 
   [[nodiscard]] const PipelineManifest& manifest() const noexcept;
   [[nodiscard]] std::unordered_map<std::string, std::vector<std::string>>
   execution_providers() const;
+  //: This package's conservative connection transfer plan. It is inspection
+  //: only: nothing in this milestone executes from it.
+  [[nodiscard]] const PipelineTransferPlan& transfer_plan() const noexcept;
   [[nodiscard]] PipelineSession CreateSession() const;
 
   //: Reads this pipeline's admission controller right now. Copies of one
