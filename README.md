@@ -58,13 +58,21 @@ C++ API ───────────────┤                  │
 - `PipelineSession` owns one request/trajectory's KV cache, diffusion latent,
   action state, outputs, and stage cursors, and preserves device-backed tensors
   across component connections, recurrent state, and public outputs.
+- `PipelineSession.begin_stage()` runs any stage one step at a time and reports
+  each step as a `StageEvent`, so a caller can stream decoded tokens or
+  diffusion steps. Stepping is synchronous — one call blocks for one model or
+  scheduler step — and `run_stage()` is that same run drained to the end, so
+  both paths produce identical results. Cancellation of a step already in
+  flight and step deadlines are a later milestone.
 - `PipelineSession.snapshot()` captures all of that mutable state in memory,
   and `restore()` and `fork()` rewind or branch a trajectory from it without
   copying tensor data or leaving the process. `checkpoint(name)`,
   `restore_checkpoint(name)`, `drop_checkpoint(name)`, and
   `has_checkpoint(name)` add named in-memory transaction markers over the same
   capture. This is in-memory transaction support only: it is not paged KV and
-  nothing is serialized to disk or crosses a process boundary.
+  nothing is serialized to disk or crosses a process boundary. An unfinished
+  stage run holds the session, so these calls and every other state-mutating
+  call fail while one is active.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in

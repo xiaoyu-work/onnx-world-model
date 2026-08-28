@@ -1,19 +1,20 @@
 # @agent-file
-# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, and latent-dynamics APIs.
-# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer.
+# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, and latent-dynamics APIs.
+# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, StageEventKind, StageEvent, StageRun, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
 import sysconfig
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, final
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -70,6 +71,33 @@ class StepResult:
     observation_prediction: NDArray[Any]
     reward: NDArray[Any]
     continuation: NDArray[Any]
+
+
+StageEventKind = Literal["token", "iteration", "transition", "completed"]
+
+
+@dataclass(frozen=True)
+class StageEvent:
+    """One step of an incremental stage run.
+
+    ``kind`` is ``"token"`` for autoregressive decoding, ``"iteration"`` for an
+    iterative scheduler step, ``"transition"`` for the single pass of every
+    other stage kind, and ``"completed"`` for the one terminal event that ends
+    a run. ``token_ids`` is present only on a ``"token"`` event, ``finished``
+    is true only on the ``"completed"`` event, and ``iteration`` counts step
+    events within this run rather than the stage's lifetime cursor.
+
+    ``outputs`` and ``token_ids`` are independent NumPy arrays, so a
+    device-resident output is materialized at this boundary exactly as it is
+    for :meth:`PipelineSession.run_stage`.
+    """
+
+    kind: StageEventKind
+    stage: str
+    iteration: int
+    token_ids: NDArray[Any] | None
+    outputs: dict[str, NDArray[Any]]
+    finished: bool
 
 
 def _metadata_from_native(value: dict[str, Any]) -> ModelMetadata:
@@ -408,6 +436,121 @@ class PipelineSessionSnapshot:
         return bool(self._core.valid)
 
 
+def _stage_event(payload: Mapping[str, Any]) -> StageEvent:
+    return StageEvent(
+        kind=payload["kind"],
+        stage=payload["stage"],
+        iteration=int(payload["iteration"]),
+        token_ids=payload["token_ids"],
+        outputs=dict(payload["outputs"]),
+        finished=bool(payload["finished"]),
+    )
+
+
+@final
+class StageRun:
+    """One incremental execution of a single stage.
+
+    Only :meth:`PipelineSession.begin_stage` produces one, and the handle is
+    not an extension point, so it is final. Each :meth:`step` advances the
+    session by exactly one model or scheduler step and returns that step's
+    :class:`StageEvent`; the run ends with exactly one event whose
+    ``finished`` is true, and :meth:`finish` returns the same outputs
+    :meth:`PipelineSession.run_stage` returns for the same arguments.
+
+    Stepping is synchronous: it blocks until that step finishes, and a step
+    already in flight cannot be cancelled. A session runs one stage at a time,
+    so while this run is unfinished the session raises
+    :class:`WorldModelError` from ``begin_stage``, ``run_stage``,
+    ``step_stage``, ``snapshot``, ``restore``, ``fork``, ``checkpoint``,
+    ``restore_checkpoint``, ``drop_checkpoint``, ``reset``, and
+    ``release_stage``. Reading ``outputs``, ``state``, and ``has_checkpoint``
+    stays legal.
+
+    Use the run as a context manager, or call :meth:`close`, to release the
+    session when a caller stops early:
+
+    ```python
+    with session.begin_stage("decode", inputs) as run:
+        for event in run:
+            if event.kind == "token" and stop_now(event.token_ids):
+                break
+    ```
+    """
+
+    def __init__(self, session: PipelineSession, core: _native.StageRun) -> None:
+        # The session reference is deliberately strong: a run keeps the
+        # session it drives alive for as long as a caller holds the run.
+        self._session = session
+        self._core = core
+        self._closed = False
+        self._exhausted = False
+
+    @property
+    def session(self) -> PipelineSession:
+        return self._session
+
+    @property
+    def stage(self) -> str:
+        return str(self._core.stage)
+
+    @property
+    def done(self) -> bool:
+        return self._closed or bool(self._core.done)
+
+    @property
+    def iteration(self) -> int:
+        return int(self._core.iteration)
+
+    def step(self) -> StageEvent:
+        """Advance the run by one step and return that step's event."""
+        if self._closed:
+            raise _native.WorldModelError(
+                f"Pipeline stage run for '{self.stage}' is closed"
+            )
+        return _stage_event(self._core.step())
+
+    def finish(self) -> dict[str, NDArray[Any]]:
+        """Drain the remaining steps and return the full ``run_stage`` result."""
+        if self._closed:
+            raise _native.WorldModelError(
+                f"Pipeline stage run for '{self.stage}' is closed"
+            )
+        outputs = self._core.finish()
+        self._exhausted = True
+        return outputs
+
+    def close(self) -> None:
+        """Abandon an unfinished run and release the session. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        self._core.cancel()
+
+    def __iter__(self) -> Iterator[StageEvent]:
+        return self
+
+    def __next__(self) -> StageEvent:
+        if self._exhausted:
+            raise StopIteration
+        event = self.step()
+        if event.finished:
+            self._exhausted = True
+        return event
+
+    def __enter__(self) -> StageRun:
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Best effort only: interpreter shutdown may already have torn down
+        # the native module, and a destructor must not raise.
+        with contextlib.suppress(Exception):
+            self.close()
+
+
 class PipelineSession:
     """Mutable per-request and per-trajectory state for a :class:`Pipeline`."""
 
@@ -455,6 +598,56 @@ class PipelineSession:
             _array_mapping(overrides),
             dict(options or {}),
         )
+
+    def begin_stage(
+        self,
+        stage: str,
+        inputs: Mapping[str, ArrayLike] | None = None,
+        *,
+        overrides: Mapping[str, ArrayLike] | None = None,
+        options: Mapping[str, bool | int | float | str] | None = None,
+    ) -> StageRun:
+        """Start an incremental execution of ``stage``.
+
+        The returned :class:`StageRun` owns this session's single run slot
+        until it completes or is closed, so hold it in a ``with`` block when a
+        caller may stop before the run finishes.
+        """
+        return StageRun(
+            self,
+            self._core.begin_stage(
+                stage,
+                _array_mapping(inputs),
+                _array_mapping(overrides),
+                dict(options or {}),
+            ),
+        )
+
+    def iter_stage(
+        self,
+        stage: str,
+        inputs: Mapping[str, ArrayLike] | None = None,
+        *,
+        overrides: Mapping[str, ArrayLike] | None = None,
+        options: Mapping[str, bool | int | float | str] | None = None,
+    ) -> Iterator[StageEvent]:
+        """Iterate the events of one incremental execution of ``stage``.
+
+        The run starts before the first event is requested, so an invalid
+        stage or option fails here rather than on the first ``next()``. The
+        iterator closes the run when it is exhausted or closed, but a bare
+        ``break`` only closes it once the generator is collected, which is not
+        a guarantee every interpreter makes promptly. Use
+        :meth:`begin_stage` with a ``with`` block, or call ``close()`` on this
+        iterator, whenever a caller may stop early.
+        """
+        run = self.begin_stage(
+            stage,
+            inputs,
+            overrides=overrides,
+            options=options,
+        )
+        return _drain_stage_run(run)
 
     def run(
         self,
@@ -544,6 +737,13 @@ class PipelineSession:
     def has_checkpoint(self, name: str) -> bool:
         """Report whether this session currently holds a checkpoint ``name``."""
         return bool(self._core.has_checkpoint(name))
+
+
+def _drain_stage_run(run: StageRun) -> Iterator[StageEvent]:
+    try:
+        yield from run
+    finally:
+        run.close()
 
 
 def _array_mapping(

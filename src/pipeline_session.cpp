@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations.
- * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid
- * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, and public outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back.  ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint copies the checkpoint handle under the lock and only then delegates to Restore so the mutex is never re-entered, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint.
+ * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations and the StageRun state machine that drives every stage one step at a time.
+ * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::BeginStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid, StageRun move operations and destructor, StageRun::stage, StageRun::done, StageRun::iteration, StageRun::Step, StageRun::Finish, StageRun::Cancel
+ * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind, inputs, overrides, options, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target exactly once under the session lock. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing.
   * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, Fork, and the checkpoint operations touch memory only; they perform no device transfer, no disk access, and no inference.
  */
 
@@ -11,10 +11,12 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <set>
@@ -723,6 +725,26 @@ struct PipelineSession::Impl : SessionState {
   // than in SessionState so that capturing, restoring, or forking execution
   // state never carries a checkpoint namespace along with it.
   std::unordered_map<std::string, PipelineSessionSnapshot> checkpoints;
+  // The identity of the session's one incremental stage run, also control
+  // metadata rather than execution state: a snapshot never carries a run, so
+  // restoring or forking can never resurrect one or adopt another session's.
+  // `next_run_id` only ever grows, so a stale handle can be told apart from
+  // the run that currently holds the slot.
+  std::uint64_t next_run_id{1};
+  std::optional<std::uint64_t> active_run_id;
+
+  // An active run owns the execution state until it completes or is
+  // cancelled, and its autoregressive loop state lives on the run rather than
+  // in SessionState. Rather than capture or mutate a session mid-run and
+  // silently drop that loop state, every conflicting operation fails here.
+  void EnsureNoActiveRunLocked(std::string_view operation) const {
+    if (active_run_id.has_value()) {
+      throw Error(
+          ErrorCode::state,
+          "Pipeline session cannot " + std::string(operation) +
+              " while a stage run is active");
+    }
+  }
 
   // Captures the execution bundle without touching the lock, so a caller that
   // already holds `mutex` can capture without re-entering a public method.
@@ -3181,124 +3203,417 @@ struct PipelineSession::Impl : SessionState {
     return *requested_count;
   }
 
-  [[nodiscard]] NamedTensors RunAutoregressive(
-      const PipelineStage& stage,
-      const NamedTensors& inputs,
-      const NamedTensors& overrides,
-      const PipelineRunOptions& options) {
-    StoreExternalInputs(inputs);
-    const Json stage_options = Json::parse(stage.options_json);
-    const Json sampling =
-        stage_options.value("sampling", Json::object());
-    const bool do_sample =
-        options.integers.contains("do_sample")
-            ? options.integers.at("do_sample") != 0
-            : sampling.value("do_sample", false);
-    if (options.integers.contains("seed")) {
-      random_engine.seed(
-          static_cast<std::uint64_t>(options.integers.at("seed")));
-    }
-    std::set<std::int64_t> eos_tokens;
-    if (stage_options.contains("stop") &&
-        stage_options.at("stop").is_object() &&
-        stage_options.at("stop").contains("eos_token_ids")) {
-      for (const auto& token :
-           stage_options.at("stop").at("eos_token_ids")) {
-        eos_tokens.insert(token.get<std::int64_t>());
-      }
-    }
+};
 
-    const std::size_t maximum = MaximumTokens(stage, options);
-    std::vector<std::vector<std::int64_t>> generated;
-    std::vector<bool> finished;
-    for (std::size_t index = 0; index < maximum; ++index) {
-      (void)StepStage(
-          stage.name,
-          index == 0 ? inputs : NamedTensors{},
-          overrides,
-          options);
-      Tensor tokens =
-          do_sample
-              ? SampleTokens(
-                    StageLogits(stage), sampling, options, generated)
-              : GreedyTokens(StageLogits(stage));
-      auto mutable_values = std::span(
-          reinterpret_cast<std::int64_t*>(
-              tokens.mutable_bytes().data()),
-          tokens.element_count());
-      if (finished.empty()) {
-        finished.assign(mutable_values.size(), false);
-      }
-      const std::int64_t eos =
-          eos_tokens.empty() ? 0 : *eos_tokens.begin();
-      for (std::size_t batch_index = 0;
-           batch_index < mutable_values.size();
-           ++batch_index) {
-        if (finished[batch_index]) {
-          mutable_values[batch_index] = eos;
-        } else if (eos_tokens.contains(mutable_values[batch_index])) {
-          finished[batch_index] = true;
-        }
-      }
-      const auto values = tokens.values<std::int64_t>();
-      generated.emplace_back(values.begin(), values.end());
-      SetStageTokenInput(stage, tokens);
-      if (!eos_tokens.empty() &&
-          std::ranges::all_of(finished, [](bool value) { return value; })) {
-        break;
-      }
-    }
+// The one state machine behind both execution paths. A StageRun holds one of
+// these; PipelineSession::RunStage begins a run, drains it, and drops it, so
+// full and incremental execution cannot diverge. Everything that used to be a
+// local of the autoregressive loop -- the generated history, the per-lane
+// end-of-sequence latch, the resolved sampling configuration, and the token
+// budget -- lives here, deliberately outside SessionState so that a snapshot
+// never captures half of an in-flight run.
+struct StageRun::Impl {
+  std::shared_ptr<PipelineSession::Impl> session;
+  std::uint64_t run_id{0};
+  std::string stage_name;
+  std::string stage_kind;
+  NamedTensors inputs;
+  NamedTensors overrides;
+  PipelineRunOptions options;
 
-    NamedTensors result = CollectOutputs();
-    if (!generated.empty()) {
-      const std::size_t batch = generated.front().size();
-      std::vector<std::int64_t> flattened(batch * generated.size());
-      for (std::size_t step = 0; step < generated.size(); ++step) {
-        for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
-          flattened[batch_index * generated.size() + step] =
-              generated[step][batch_index];
-        }
-      }
-      result.emplace(
-          "generated_token_ids",
-          Int64Tensor(
-              {
-                  static_cast<std::int64_t>(batch),
-                  static_cast<std::int64_t>(generated.size()),
-              },
-              flattened));
-    }
-    return result;
-  }
+  // The stage's own inputs are bound by the first step that actually runs, and
+  // never again, exactly as the old loops passed them only on their first
+  // iteration.
+  bool consumed_inputs{false};
+  std::size_t emitted_steps{0};
+  bool completed{false};
+  bool closed{false};
+  NamedTensors final_outputs;
+  std::optional<NamedTensors> last_step_outputs;
 
-  [[nodiscard]] NamedTensors RunStage(
+  // Autoregressive plan, resolved once by Begin.
+  Json sampling;
+  bool do_sample{false};
+  std::set<std::int64_t> eos_tokens;
+  std::size_t maximum_tokens{0};
+  std::vector<std::vector<std::int64_t>> generated;
+  std::vector<bool> finished_lanes;
+  bool stop_requested{false};
+
+  // Iterative plan: the absolute cursor this run drives the stage to, read
+  // once so a later option change cannot move the target mid-run.
+  std::size_t target_iterations{0};
+
+  // Resolves everything the run will need while the caller still holds the
+  // session lock, then claims the session's run slot. A failure here leaves
+  // the slot free; whatever it already applied to the session stays applied,
+  // which is what the previous RunStage did when it failed after storing its
+  // inputs.
+  [[nodiscard]] static std::unique_ptr<Impl> Begin(
+      const std::shared_ptr<PipelineSession::Impl>& owner,
       std::string_view stage_name,
       const NamedTensors& inputs,
       const NamedTensors& overrides,
       const PipelineRunOptions& options) {
-    const PipelineStage& stage = FindStage(manifest(), stage_name);
+    const PipelineStage& stage = FindStage(owner->manifest(), stage_name);
+    auto plan = std::make_unique<Impl>();
+    plan->session = owner;
+    plan->stage_name = stage.name;
+    plan->stage_kind = stage.kind;
+    plan->inputs = inputs;
+    plan->overrides = overrides;
+    plan->options = options;
+
     if (stage.kind == "autoregressive") {
-      return RunAutoregressive(stage, inputs, overrides, options);
+      owner->StoreExternalInputs(inputs);
+      const Json stage_options = Json::parse(stage.options_json);
+      plan->sampling = stage_options.value("sampling", Json::object());
+      plan->do_sample =
+          options.integers.contains("do_sample")
+              ? options.integers.at("do_sample") != 0
+              : plan->sampling.value("do_sample", false);
+      if (options.integers.contains("seed")) {
+        owner->random_engine.seed(
+            static_cast<std::uint64_t>(options.integers.at("seed")));
+      }
+      if (stage_options.contains("stop") &&
+          stage_options.at("stop").is_object() &&
+          stage_options.at("stop").contains("eos_token_ids")) {
+        for (const auto& token :
+             stage_options.at("stop").at("eos_token_ids")) {
+          plan->eos_tokens.insert(token.get<std::int64_t>());
+        }
+      }
+      // Measured before the first step replaces the prompt with a single
+      // token, so the budget reflects the prompt this run started from.
+      plan->maximum_tokens = owner->MaximumTokens(stage, options);
+    } else if (stage.kind == "iterative") {
+      plan->target_iterations = owner->InferenceSteps(stage.name, options);
     }
-    if (stage.kind == "iterative") {
-      const std::size_t steps = InferenceSteps(stage.name, options);
-      const std::size_t completed = stage_iterations[stage.name];
-      if (completed >= steps) {
-        return CollectOutputs();
+
+    plan->run_id = owner->next_run_id++;
+    owner->active_run_id = plan->run_id;
+    return plan;
+  }
+
+  void ReleaseSlotLocked() noexcept {
+    if (session->active_run_id.has_value() &&
+        *session->active_run_id == run_id) {
+      session->active_run_id.reset();
+    }
+  }
+
+  void EnsureActiveLocked() const {
+    if (completed) {
+      throw Error(
+          ErrorCode::state,
+          "Pipeline stage run for '" + stage_name +
+              "' already reported its completed event");
+    }
+    if (closed) {
+      throw Error(
+          ErrorCode::state,
+          "Pipeline stage run for '" + stage_name + "' is closed");
+    }
+    if (!session->active_run_id.has_value() ||
+        *session->active_run_id != run_id) {
+      throw Error(
+          ErrorCode::state,
+          "Pipeline stage run for '" + stage_name +
+              "' is no longer this session's active run");
+    }
+  }
+
+  [[nodiscard]] StageEvent Step() {
+    std::scoped_lock lock(session->mutex);
+    EnsureActiveLocked();
+    try {
+      return StepLocked();
+    } catch (...) {
+      // The session keeps everything the run already applied, exactly as a
+      // failing RunStage left it; only the run slot and this handle close.
+      ReleaseSlotLocked();
+      closed = true;
+      throw;
+    }
+  }
+
+  [[nodiscard]] NamedTensors Finish() {
+    std::scoped_lock lock(session->mutex);
+    return FinishLocked();
+  }
+
+  // Drains a run while the caller holds the session lock. Full RunStage uses
+  // this path so its historical whole-stage atomicity is preserved, while
+  // explicit Step() calls still release the lock between events.
+  [[nodiscard]] NamedTensors FinishLocked() {
+    if (completed) {
+      return final_outputs;
+    }
+    EnsureActiveLocked();
+    try {
+      while (!completed) {
+        (void)StepLocked();
       }
-      NamedTensors result;
-      for (std::size_t index = completed; index < steps; ++index) {
-        result = StepStage(
-            stage.name,
-            index == completed ? inputs : NamedTensors{},
-            overrides,
-            options);
+      return final_outputs;
+    } catch (...) {
+      ReleaseSlotLocked();
+      closed = true;
+      throw;
+    }
+  }
+
+  void Cancel() noexcept {
+    try {
+      std::scoped_lock lock(session->mutex);
+      ReleaseSlotLocked();
+      if (!completed) {
+        closed = true;
       }
+    } catch (...) {
+      // A run that cannot take the lock keeps the slot; there is nothing
+      // safe to do about it from a noexcept path.
+    }
+  }
+
+  [[nodiscard]] bool Done() const noexcept {
+    try {
+      std::scoped_lock lock(session->mutex);
+      return completed || closed;
+    } catch (...) {
+      return true;
+    }
+  }
+
+  [[nodiscard]] std::size_t Iteration() const noexcept {
+    try {
+      std::scoped_lock lock(session->mutex);
+      return emitted_steps;
+    } catch (...) {
+      return emitted_steps;
+    }
+  }
+
+  [[nodiscard]] StageEvent StepLocked() {
+    const PipelineStage& stage = FindStage(session->manifest(), stage_name);
+    if (stage_kind == "autoregressive") {
+      return AutoregressiveStepLocked(stage);
+    }
+    if (stage_kind == "iterative") {
+      return IterativeStepLocked(stage);
+    }
+    return SinglePassStepLocked(stage);
+  }
+
+  [[nodiscard]] NamedTensors RunInputsLocked() {
+    if (consumed_inputs) {
+      return {};
+    }
+    consumed_inputs = true;
+    return inputs;
+  }
+
+  [[nodiscard]] StageEvent AutoregressiveStepLocked(
+      const PipelineStage& stage) {
+    if (stop_requested || emitted_steps >= maximum_tokens) {
+      return CompleteLocked();
+    }
+    NamedTensors step_outputs = session->StepStage(
+        stage.name, RunInputsLocked(), overrides, options);
+    Tensor tokens =
+        do_sample
+            ? session->SampleTokens(
+                  session->StageLogits(stage), sampling, options, generated)
+            : session->GreedyTokens(session->StageLogits(stage));
+    auto mutable_values = std::span(
+        reinterpret_cast<std::int64_t*>(tokens.mutable_bytes().data()),
+        tokens.element_count());
+    if (finished_lanes.empty()) {
+      finished_lanes.assign(mutable_values.size(), false);
+    }
+    const std::int64_t eos = eos_tokens.empty() ? 0 : *eos_tokens.begin();
+    for (std::size_t batch_index = 0;
+         batch_index < mutable_values.size();
+         ++batch_index) {
+      if (finished_lanes[batch_index]) {
+        mutable_values[batch_index] = eos;
+      } else if (eos_tokens.contains(mutable_values[batch_index])) {
+        finished_lanes[batch_index] = true;
+      }
+    }
+    const auto values = tokens.values<std::int64_t>();
+    generated.emplace_back(values.begin(), values.end());
+    session->SetStageTokenInput(stage, tokens);
+    if (!eos_tokens.empty() &&
+        std::ranges::all_of(
+            finished_lanes, [](bool value) { return value; })) {
+      // The old loop broke here; the incremental run reports the stop on the
+      // next Step instead, so every run ends with one completed event.
+      stop_requested = true;
+    }
+
+    StageEvent event;
+    event.kind = StageEventKind::token;
+    event.stage = stage.name;
+    event.iteration = emitted_steps;
+    event.token_ids = std::move(tokens);
+    event.outputs = std::move(step_outputs);
+    ++emitted_steps;
+    return event;
+  }
+
+  [[nodiscard]] StageEvent IterativeStepLocked(const PipelineStage& stage) {
+    if (session->stage_iterations[stage.name] >= target_iterations) {
+      return CompleteLocked();
+    }
+    NamedTensors step_outputs = session->StepStage(
+        stage.name, RunInputsLocked(), overrides, options);
+    last_step_outputs = step_outputs;
+
+    StageEvent event;
+    event.kind = StageEventKind::iteration;
+    event.stage = stage.name;
+    event.iteration = emitted_steps;
+    event.outputs = std::move(step_outputs);
+    ++emitted_steps;
+    return event;
+  }
+
+  // single_pass, state_transition, composite, and on_demand all execute as
+  // exactly one pass, which is what RunStage did for them.
+  [[nodiscard]] StageEvent SinglePassStepLocked(const PipelineStage& stage) {
+    if (emitted_steps > 0) {
+      return CompleteLocked();
+    }
+    NamedTensors step_outputs = session->StepStage(
+        stage.name, RunInputsLocked(), overrides, options);
+    last_step_outputs = step_outputs;
+
+    StageEvent event;
+    event.kind = StageEventKind::transition;
+    event.stage = stage.name;
+    event.iteration = emitted_steps;
+    event.outputs = std::move(step_outputs);
+    ++emitted_steps;
+    return event;
+  }
+
+  [[nodiscard]] StageEvent CompleteLocked() {
+    if (stage_kind == "autoregressive") {
+      final_outputs = AutoregressiveResultLocked();
+    } else if (last_step_outputs.has_value()) {
+      // Exactly what the last executed step returned, which is what RunStage
+      // returned for this stage.
+      final_outputs = *last_step_outputs;
+    } else {
+      // A stage that had no work left executed nothing, so its result is the
+      // session's current public outputs.
+      final_outputs = session->CollectOutputs();
+    }
+    completed = true;
+    ReleaseSlotLocked();
+
+    StageEvent event;
+    event.kind = StageEventKind::completed;
+    event.stage = stage_name;
+    event.iteration = emitted_steps;
+    event.outputs = final_outputs;
+    event.finished = true;
+    return event;
+  }
+
+  // Packs the generated history batch-major, the layout the previous
+  // RunAutoregressive published, and adds it without displacing a manifest
+  // output of the same name.
+  [[nodiscard]] NamedTensors AutoregressiveResultLocked() const {
+    NamedTensors result = session->CollectOutputs();
+    if (generated.empty()) {
       return result;
     }
-    return StepStage(stage.name, inputs, overrides, options);
+    const std::size_t batch = generated.front().size();
+    std::vector<std::int64_t> flattened(batch * generated.size());
+    for (std::size_t step = 0; step < generated.size(); ++step) {
+      for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+        flattened[batch_index * generated.size() + step] =
+            generated[step][batch_index];
+      }
+    }
+    result.emplace(
+        "generated_token_ids",
+        Int64Tensor(
+            {
+                static_cast<std::int64_t>(batch),
+                static_cast<std::int64_t>(generated.size()),
+            },
+            flattened));
+    return result;
   }
 };
+
+StageRun::StageRun(std::unique_ptr<Impl> state) noexcept
+    : impl_(std::move(state)) {}
+
+StageRun::StageRun(StageRun&&) noexcept = default;
+
+StageRun& StageRun::operator=(StageRun&& other) noexcept {
+  if (this != &other) {
+    Cancel();
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
+
+StageRun::~StageRun() {
+  Cancel();
+}
+
+namespace {
+
+[[noreturn]] void ClosedRunError() {
+  throw Error(
+      ErrorCode::state,
+      "This pipeline stage run owns no run; it was moved from");
+}
+
+}  // namespace
+
+std::string_view StageRun::stage() const {
+  if (impl_ == nullptr) {
+    ClosedRunError();
+  }
+  return impl_->stage_name;
+}
+
+bool StageRun::done() const noexcept {
+  return impl_ == nullptr || impl_->Done();
+}
+
+std::size_t StageRun::iteration() const {
+  if (impl_ == nullptr) {
+    ClosedRunError();
+  }
+  return impl_->Iteration();
+}
+
+StageEvent StageRun::Step() {
+  if (impl_ == nullptr) {
+    ClosedRunError();
+  }
+  return impl_->Step();
+}
+
+NamedTensors StageRun::Finish() {
+  if (impl_ == nullptr) {
+    ClosedRunError();
+  }
+  return impl_->Finish();
+}
+
+void StageRun::Cancel() noexcept {
+  if (impl_ != nullptr) {
+    impl_->Cancel();
+  }
+}
 
 Pipeline::Pipeline(PipelinePackage package)
     : package_(
@@ -3325,7 +3640,7 @@ PipelineSession Pipeline::CreateSession() const {
 
 PipelineSession::PipelineSession(
     std::shared_ptr<const PipelinePackage> package)
-    : impl_(std::make_unique<Impl>(std::move(package))) {}
+    : impl_(std::make_shared<Impl>(std::move(package))) {}
 
 PipelineSession::PipelineSession(PipelineSession&&) noexcept = default;
 
@@ -3334,13 +3649,31 @@ PipelineSession& PipelineSession::operator=(PipelineSession&&) noexcept =
 
 PipelineSession::~PipelineSession() = default;
 
+// Full and incremental execution share the same StageRun state machine. A full
+// run keeps the session lock for the complete drain, preserving the historical
+// behavior that concurrent calls on one PipelineSession serialize and readers
+// observe only the pre-stage or final state.
 NamedTensors PipelineSession::RunStage(
     std::string_view stage,
     const NamedTensors& inputs,
     const NamedTensors& overrides,
     const PipelineRunOptions& options) {
   std::scoped_lock lock(impl_->mutex);
-  return impl_->RunStage(stage, inputs, overrides, options);
+  impl_->EnsureNoActiveRunLocked("run a stage");
+  auto run = StageRun::Impl::Begin(
+      impl_, stage, inputs, overrides, options);
+  return run->FinishLocked();
+}
+
+StageRun PipelineSession::BeginStage(
+    std::string_view stage,
+    const NamedTensors& inputs,
+    const NamedTensors& overrides,
+    const PipelineRunOptions& options) {
+  std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("begin a stage run");
+  return StageRun(
+      StageRun::Impl::Begin(impl_, stage, inputs, overrides, options));
 }
 
 NamedTensors PipelineSession::StepStage(
@@ -3349,6 +3682,7 @@ NamedTensors PipelineSession::StepStage(
     const NamedTensors& overrides,
     const PipelineRunOptions& options) {
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("step a stage directly");
   return impl_->StepStage(stage, inputs, overrides, options);
 }
 
@@ -3368,6 +3702,7 @@ std::optional<Tensor> PipelineSession::state(std::string_view name) const {
 
 void PipelineSession::ReleaseStage(std::string_view stage) {
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("release a stage");
   const PipelineStage& released = FindStage(impl_->manifest(), stage);
   const Json guidance = impl_->StageGuidance(released.name);
   if (!guidance.empty()) {
@@ -3418,6 +3753,7 @@ void PipelineSession::ReleaseStage(std::string_view stage) {
 
 void PipelineSession::Reset() {
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("reset");
   impl_->external_values.clear();
   impl_->endpoint_values.clear();
   impl_->state_values.clear();
@@ -3440,6 +3776,10 @@ bool PipelineSessionSnapshot::valid() const noexcept {
 
 PipelineSessionSnapshot PipelineSession::Snapshot() const {
   std::scoped_lock lock(impl_->mutex);
+  // An active run keeps its decode or scheduler loop state outside
+  // SessionState, so capturing here would hand back a snapshot that silently
+  // drops it. Refuse instead.
+  impl_->EnsureNoActiveRunLocked("capture a snapshot");
   return impl_->CaptureLocked();
 }
 
@@ -3461,10 +3801,15 @@ void PipelineSession::Restore(const PipelineSessionSnapshot& snapshot) {
   // below only swaps, so a failure here leaves the session exactly as it was.
   SessionState restored = captured.state;
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("restore a snapshot");
   impl_->Swap(restored);
 }
 
 PipelineSession PipelineSession::Fork() const {
+  {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->EnsureNoActiveRunLocked("fork");
+  }
   const PipelineSessionSnapshot snapshot = Snapshot();
   PipelineSession forked(snapshot.impl_->package);
   forked.Restore(snapshot);
@@ -3481,12 +3826,14 @@ void PipelineSession::Checkpoint(std::string_view name) {
   // no concurrent RunStage can slip between the two. Snapshot() is never
   // called here, so the session lock is taken exactly once.
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("store a checkpoint");
   impl_->checkpoints.insert_or_assign(std::move(key), impl_->CaptureLocked());
 }
 
 void PipelineSession::RestoreCheckpoint(std::string_view name) {
   const std::string key = CheckpointKey(name);
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("restore a checkpoint");
   const auto found = impl_->checkpoints.find(key);
   if (found == impl_->checkpoints.end()) {
     throw Error(
@@ -3503,6 +3850,7 @@ void PipelineSession::RestoreCheckpoint(std::string_view name) {
 void PipelineSession::DropCheckpoint(std::string_view name) {
   const std::string key = CheckpointKey(name);
   std::scoped_lock lock(impl_->mutex);
+  impl_->EnsureNoActiveRunLocked("drop a checkpoint");
   // Dropping an unknown checkpoint is a caller error, not a silent no-op.
   if (impl_->checkpoints.erase(key) == 0) {
     throw Error(

@@ -2,9 +2,9 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, and the session's named in-memory checkpoints.
- * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSessionSnapshot, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace.
+ * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
+ * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -227,6 +227,113 @@ class PipelineSessionSnapshot {
   friend class PipelineSession;
 };
 
+//: What one StageRun::Step() call observed. A stage's kind decides which step
+//: events it emits: `token` for autoregressive decoding, `iteration` for an
+//: iterative scheduler step, and `transition` for the single pass of every
+//: other stage kind. `completed` is the one terminal event that ends a run.
+enum class StageEventKind {
+  token,
+  iteration,
+  transition,
+  completed,
+};
+
+//: One step of an incremental stage run. Events are synchronous results, not
+//: notifications: StageRun::Step() returns exactly one of these after the
+//: model or scheduler step it describes has finished.
+struct StageEvent {
+  StageEventKind kind{StageEventKind::completed};
+  //: The stage this run drives. Every event of one run repeats it.
+  std::string stage;
+  //: Zero-based index of this step event within this StageRun. The terminal
+  //: `completed` event carries the number of step events that preceded it, so
+  //: it is a count of this run's steps rather than the stage's lifetime
+  //: iteration cursor, which a resumed stage may have advanced already.
+  std::size_t iteration{0};
+  //: The tokens this step generated, present only on a `token` event and
+  //: absent on every other kind. It is the int64 [batch, 1] tensor that was
+  //: fed back into the stage, so a lane that has already emitted its
+  //: end-of-sequence token reads as that token here.
+  std::optional<Tensor> token_ids;
+  //: The stage's public outputs as of this event. Storage is preserved
+  //: exactly as RunStage preserves it, so a device-backed output stays on its
+  //: device and a host reader calls Tensor::CopyToCpu() first.
+  NamedTensors outputs;
+  //: True only on the terminal `completed` event.
+  bool finished{false};
+};
+
+//: One incremental execution of a single stage, produced only by
+//: PipelineSession::BeginStage(). Step() advances the session by exactly one
+//: model or scheduler step and returns what that step produced, so a caller
+//: can stream tokens or diffusion steps without giving up the parity that
+//: RunStage guarantees: Finish() returns exactly what RunStage would have
+//: returned for the same arguments because both drain this state machine.
+//:
+//: A run is synchronous and single-consumer. Step() blocks until its step
+//: finishes; a step already in flight cannot be cancelled and carries no
+//: deadline. Concurrent calls on one handle serialize on the session lock and
+//: only one of them advances the run.
+//:
+//: A session has one run slot. While this run holds it the session throws
+//: ErrorCode::state from every execution and state-mutating method --
+//: BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint,
+//: RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage -- because an
+//: in-flight decode loop is not part of PipelineSessionSnapshot and capturing
+//: the session mid-run would silently drop it. Reading outputs(), state(),
+//: and HasCheckpoint() stays legal.
+//:
+//: The handle owns a share of the session's execution state, so it stays
+//: valid even if the PipelineSession that produced it is moved or destroyed
+//: first. Cancel() and the destructor release the run slot where the run
+//: stopped; they never roll back what the run already applied.
+class StageRun {
+ public:
+  StageRun(StageRun&&) noexcept;
+  StageRun& operator=(StageRun&&) noexcept;
+  ~StageRun();
+
+  StageRun(const StageRun&) = delete;
+  StageRun& operator=(const StageRun&) = delete;
+
+  //: The stage this run drives. Throws ErrorCode::state on a moved-from
+  //: handle, which owns no run at all.
+  [[nodiscard]] std::string_view stage() const;
+  //: True once the run has produced its terminal `completed` event, and also
+  //: for a moved-from, cancelled, or failed handle, so this is the one query
+  //: that is always answerable.
+  [[nodiscard]] bool done() const noexcept;
+  //: How many step events this run has returned so far, which is the
+  //: `iteration` the next step event would carry. Throws ErrorCode::state on
+  //: a moved-from handle.
+  [[nodiscard]] std::size_t iteration() const;
+
+  //: Advances the run by one step and returns that step's event. A run
+  //: returns exactly one `completed` event: a stage with no work left reports
+  //: it on the next Step() rather than folding it into the last step event,
+  //: and Step() after it throws ErrorCode::state. A failing step releases the
+  //: session's run slot, closes this handle, keeps whatever the run already
+  //: applied to the session, and rethrows.
+  [[nodiscard]] StageEvent Step();
+  //: Drains the remaining steps under one session-lock acquisition and
+  //: returns the same outputs RunStage returns for this stage. Calling it
+  //: after the run completed returns that cached result again without
+  //: re-running anything.
+  [[nodiscard]] NamedTensors Finish();
+  //: Abandons an unfinished run and releases the session's run slot, leaving
+  //: every effect the run already applied in place. Idempotent, and a no-op
+  //: on a completed, cancelled, or moved-from handle.
+  void Cancel() noexcept;
+
+ private:
+  struct Impl;
+  explicit StageRun(std::unique_ptr<Impl> state) noexcept;
+
+  std::unique_ptr<Impl> impl_;
+
+  friend class PipelineSession;
+};
+
 class PipelineSession {
  public:
   PipelineSession(PipelineSession&&) noexcept;
@@ -241,6 +348,22 @@ class PipelineSession {
       const NamedTensors& inputs = {},
       const NamedTensors& overrides = {},
       const PipelineRunOptions& options = {});
+  //: Starts an incremental execution of `stage` and returns the handle that
+  //: drives it. The stage kind, inputs, overrides, options, and every
+  //: autoregressive decision -- sampling configuration, end-of-sequence
+  //: tokens, the seeded random engine, and the token budget the prompt length
+  //: allows -- are resolved once, here, so a streamed run cannot drift from
+  //: the equivalent RunStage call. A session runs one stage at a time: this
+  //: throws ErrorCode::state while another StageRun is still active.
+  [[nodiscard]] StageRun BeginStage(
+      std::string_view stage,
+      const NamedTensors& inputs = {},
+      const NamedTensors& overrides = {},
+      const PipelineRunOptions& options = {});
+  //: Executes exactly one pass of `stage` for a caller that drives its own
+  //: loop. This is the low-level primitive underneath BeginStage, so it
+  //: throws ErrorCode::state while a StageRun is active rather than
+  //: interleaving with it.
   [[nodiscard]] NamedTensors StepStage(
       std::string_view stage,
       const NamedTensors& inputs = {},
@@ -292,9 +415,14 @@ class PipelineSession {
   struct Impl;
   explicit PipelineSession(std::shared_ptr<const PipelinePackage> package);
 
-  std::unique_ptr<Impl> impl_;
+  //: Shared rather than unique so a StageRun can hold the same execution
+  //: state: a run outlives a moved or destroyed session wrapper instead of
+  //: dangling. The pointer stays private and the session itself stays
+  //: move-only, so callers cannot alias one session's state.
+  std::shared_ptr<Impl> impl_;
 
   friend class Pipeline;
+  friend class StageRun;
 };
 
 }  // namespace onnx_world_model

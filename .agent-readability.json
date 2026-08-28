@@ -2,7 +2,7 @@
   "version": 1,
   "exemptions": {
     "oversizedFiles": {
-      "src/pipeline_session.cpp": "All behavior belongs to the single PipelineSession::Impl class, whose ~60 members are defined inline and share the session's tensor caches, scheduler histories, and cursors that the file-local SessionState base bundles. Splitting it would require publishing Impl in an internal header and redistributing interlocking members across translation units, which is a mechanical split with no natural, testable responsibility boundary. Independent concerns were already factored out of the pipeline layer into src/pipeline_manifest_common.cpp and src/pipeline_manifest_validation.cpp."
+      "src/pipeline_session.cpp": "All behavior belongs to the single PipelineSession::Impl class, whose ~60 members are defined inline and share the session's tensor caches, scheduler histories, and cursors that the file-local SessionState base bundles, plus StageRun::Impl, the stage state machine that reaches directly into those same members and exists only to drive them one step at a time. Splitting either out would require publishing Impl in an internal header and redistributing interlocking members across translation units, which is a mechanical split with no natural, testable responsibility boundary. Independent concerns were already factored out of the pipeline layer into src/pipeline_manifest_common.cpp and src/pipeline_manifest_validation.cpp."
     }
   }
 }

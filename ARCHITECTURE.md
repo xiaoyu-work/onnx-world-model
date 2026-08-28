@@ -47,7 +47,7 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `Model`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `WorldModel`, `Rollout`. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `Model`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
 | Core library | `src/` | ORT loading, tensor marshalling, manifest parsing and validation, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
@@ -67,8 +67,9 @@ Within `src/` the runtime is layered:
 - `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
   share.
-- `pipeline_session` executes stages, owns per-trajectory state, and captures
-  or restores that state as an in-memory snapshot.
+- `pipeline_session` executes stages, owns per-trajectory state, drives one
+  stage at a time through the `StageRun` state machine, and captures or
+  restores that state as an in-memory snapshot.
 - `world_model` provides the fixed latent-dynamics compatibility API.
 
 ## Dependency Rules
@@ -123,6 +124,28 @@ Generation, using video as the example:
 7. The generator unpacks latent tokens and returns a modality-specific output
    dataclass.
 
+Every stage runs through one state machine. `BeginStage` resolves the stage
+kind, inputs, overrides, options, and all autoregressive configuration once and
+returns a `StageRun`; each `Step()` takes the session lock, performs exactly
+one component pass or scheduler step, and returns a `StageEvent` describing it;
+the run ends with exactly one terminal `completed` event whose outputs are the
+stage's result. `RunStage` and `StageRun` drain the same state machine, so
+incremental and all-at-once execution cannot diverge. `RunStage` holds the
+session lock for its entire drain, preserving whole-stage serialization;
+explicit `Step()` releases it between events. Stepping is synchronous: an event
+is the result of work already done, not a notification, and there is no background
+thread, no cancellation of a step in flight, and no deadline in this milestone.
+
+A session has one run slot, held from `BeginStage` until the run completes, is
+cancelled, or is dropped. While it is held, `BeginStage`, `RunStage`,
+`StepStage`, `Snapshot`, `Restore`, `Fork`, `Checkpoint`, `RestoreCheckpoint`,
+`DropCheckpoint`, `Reset`, and `ReleaseStage` throw `ErrorCode::state`, while
+`outputs()`, `state()`, and `HasCheckpoint()` stay legal. That exclusion is
+deliberate: a run's decode history, per-lane stop latch, and token budget live
+on the run rather than in `SessionState`, so capturing or rewinding the session
+mid-run would silently drop them. A failed or cancelled run releases the slot
+without rolling anything back, exactly as a failed `RunStage` always did.
+
 A session can capture all of that mutable execution state — external,
 endpoint, recurrent-state and guidance tensors, stage cursors, scheduler
 histories, position cursors, and the random engine — as an immutable
@@ -148,7 +171,8 @@ tensor constructors allocate copy-on-write CPU storage; device-only buffers
 must be explicitly materialized before host access. Tensors cross the Python
 language boundary as independent NumPy arrays, so the binding materializes
 device storage to CPU before copying it; `float16` and `bfloat16` cross as raw
-two-byte views.
+two-byte views. A `StageEvent` is no exception: its outputs keep their device
+buffers in C++ and become NumPy arrays in Python.
 
 The generic ORT backend uses I/O binding. By default it binds outputs to CPU;
 when `RuntimeOptions.device_outputs` is enabled after registering the
@@ -169,7 +193,8 @@ Python:
   generation API, exposing `.text`, `.image`, `.video`, and `.action`, each with
   a `generate()` method.
 - `onnx_world_model.Pipeline` and `PipelineSession` — direct stage execution,
-  plus `snapshot()`, `restore()`, `fork()`, and the named `checkpoint()`,
+  plus `begin_stage()` and `iter_stage()` for incremental execution, and
+  `snapshot()`, `restore()`, `fork()`, and the named `checkpoint()`,
   `restore_checkpoint()`, `drop_checkpoint()`, and `has_checkpoint()` methods
   for in-memory session branching.
 - `onnx_world_model.OnnxModel` — one ONNX graph with named tensors.
@@ -184,7 +209,7 @@ Python:
 C++:
 
 - `onnx_world_model::Pipeline::Load` then `Pipeline::CreateSession` and
-  `PipelineSession::RunStage` or `StepStage`.
+  `PipelineSession::RunStage`, `BeginStage`, or `StepStage`.
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
   in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
@@ -212,11 +237,20 @@ and the `onnx-world-model` wheel built by scikit-build-core.
 - **Ownership split.** `Pipeline` is immutable and shareable; `PipelineSession`
   is move-only and owns exactly one request or trajectory. Session state is
   guarded by `impl_->mutex`, and `Rollout` guards its state by its own mutex.
+  The session holds that state through a `shared_ptr` and a `StageRun` holds
+  the same pointer, so an incremental run stays valid even if the session
+  wrapper is moved or destroyed while the run is in flight.
   `PipelineSession::Snapshot`, `Restore`, `Fork`, and the named-checkpoint
   operations take that same lock; no public method calls `Snapshot` or
   `Restore` while already holding it, so they cannot deadlock. `Restore`
   copies every container before taking it and commits by swapping, so a
   failure leaves the target session unchanged.
+- **One stage run at a time.** A session executes one stage at a time and says
+  so: an active `StageRun` rejects every other execution and state-mutating
+  call with `ErrorCode::state` instead of interleaving with it or capturing a
+  half-executed stage. `RunStage` and `BeginStage` use the same internal state
+  machine rather than two implementations that can drift apart; ordinary
+  concurrent `RunStage` calls still serialize for the whole stage.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
   CPU buffer is cloned before mutation. Device buffers expose immutable
   storage and an explicit synchronous CPU-copy operation.
@@ -246,6 +280,8 @@ and the `onnx-world-model` wheel built by scikit-build-core.
 
 Text, image, video, and action generation from Mobius packages; one image or
 video per text-generation request; image-to-video conditioning and
-classifier-free guidance for packages that declare them. Output media encoding
-is not included, and fixed-step stochastic FlowMatch schedules are not yet
-supported.
+classifier-free guidance for packages that declare them. Incremental stage
+execution is synchronous and single-consumer: cancelling a step already in
+flight, step deadlines, and snapshotting a session mid-run are not included.
+Output media encoding is not included, and fixed-step stochastic FlowMatch
+schedules are not yet supported.

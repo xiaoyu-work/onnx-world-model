@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T10:57:58.621Z",
+  "generatedAt": "2026-08-28T13:10:28.016Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "b61adeaa0267a4fe3916cad9d2ff24da73232e8d9863d84beb91f11aa8982766",
+  "sourceFingerprint": "6ab518496d3036520c325be7ba79619aa64cdffd52a84f77037bd059f3ec8d65",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -46,6 +46,7 @@
         "Pipeline",
         "PipelineSession",
         "PipelineSessionSnapshot",
+        "StageRun",
         "Rollout"
       ]
     },
@@ -97,7 +98,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, and the session's named in-memory checkpoints.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -113,6 +114,9 @@
         "PipelineRunOptions",
         "Pipeline",
         "PipelineSessionSnapshot",
+        "StageEventKind",
+        "StageEvent",
+        "StageRun",
         "PipelineSession"
       ]
     },
@@ -171,6 +175,8 @@
         "RawImage",
         "RawVideo",
         "Rollout",
+        "StageEvent",
+        "StageRun",
         "StepResult",
         "TensorSpec",
         "TextGenerator",
@@ -192,7 +198,7 @@
     {
       "path": "python/onnx_world_model/_api.py",
       "kind": "source",
-      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, and latent-dynamics APIs.",
+      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, incremental stage run, and latent-dynamics APIs.",
       "publicSymbols": [
         "TensorSpec",
         "ModelMetadata",
@@ -200,6 +206,9 @@
         "PipelineOutputSpec",
         "PipelineStageSpec",
         "StepResult",
+        "StageEventKind",
+        "StageEvent",
+        "StageRun",
         "ProviderOptionValue",
         "ProviderOptions",
         "available_execution_providers",
@@ -402,13 +411,14 @@
     {
       "path": "src/pipeline_session.cpp",
       "kind": "source",
-      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations.",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations and the StageRun state machine that drives every stage one step at a time.",
       "publicSymbols": [
         "Pipeline::manifest",
         "Pipeline::execution_providers",
         "Pipeline::CreateSession",
         "PipelineSession move operations and destructor",
         "PipelineSession::RunStage",
+        "PipelineSession::BeginStage",
         "PipelineSession::StepStage",
         "PipelineSession::outputs",
         "PipelineSession::state",
@@ -421,7 +431,14 @@
         "PipelineSession::RestoreCheckpoint",
         "PipelineSession::DropCheckpoint",
         "PipelineSession::HasCheckpoint",
-        "PipelineSessionSnapshot::valid"
+        "PipelineSessionSnapshot::valid",
+        "StageRun move operations and destructor",
+        "StageRun::stage",
+        "StageRun::done",
+        "StageRun::iteration",
+        "StageRun::Step",
+        "StageRun::Finish",
+        "StageRun::Cancel"
       ]
     },
     {
@@ -486,6 +503,14 @@
       ]
     },
     {
+      "path": "tests/cpp/pipeline_stream_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for the incremental stage API: it holds PipelineSession::BeginStage, StageRun stepping, and StageEvent reporting to exact parity with RunStage across every stage kind, and covers the run slot's exclusion, cancellation, failure, and ownership rules.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/pipeline_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for the pipeline layer: manifest parsing and rejection cases, stage execution, guidance, schedulers, and recurrent state, driven by in-process stub backends.",
@@ -540,6 +565,12 @@
       "path": "tests/python/test_pipeline_snapshot.py",
       "kind": "test",
       "purpose": "Tests the PipelineSessionSnapshot wrapper, the PipelineSession snapshot, restore, and fork methods, and the named in-memory checkpoint methods against a small counter package built with onnx_ir.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_pipeline_stream.py",
+      "kind": "test",
+      "purpose": "Tests the Python StageEvent dataclass, the StageRun iterator and lifetime protocol, and PipelineSession.begin_stage and iter_stage against a state-transition package and an autoregressive package built with onnx_ir.",
       "publicSymbols": []
     },
     {

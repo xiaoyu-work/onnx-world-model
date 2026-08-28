@@ -1,14 +1,15 @@
 /**
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
- * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime or provider-library call and around the session snapshot, restore, fork, and named-checkpoint operations that take the session lock, and C++ Error is translated into the Python WorldModelError. PipelineSessionSnapshot is exposed as an opaque handle with no Python constructor, so it can only come from PipelineSession.snapshot(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle.
+ * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, StageRun, Rollout
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call and every session or run method that takes the session lock: run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, done, and iteration. A C++ Error is translated into the Python WorldModelError. PipelineSessionSnapshot and StageRun are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot() and PipelineSession.begin_stage(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync.
  * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +36,9 @@ using onnx_world_model::PipelineSessionSnapshot;
 using onnx_world_model::RegisterExecutionProviderLibrary;
 using onnx_world_model::Rollout;
 using onnx_world_model::RuntimeOptions;
+using onnx_world_model::StageEvent;
+using onnx_world_model::StageEventKind;
+using onnx_world_model::StageRun;
 using onnx_world_model::StepOutput;
 using onnx_world_model::Tensor;
 using onnx_world_model::TensorSpec;
@@ -204,6 +208,37 @@ using onnx_world_model::WorldModel;
   for (const auto& [name, tensor] : values) {
     result[py::str(name)] = TensorToNumpy(tensor);
   }
+  return result;
+}
+
+[[nodiscard]] const char* StageEventKindName(StageEventKind kind) {
+  switch (kind) {
+    case StageEventKind::token:
+      return "token";
+    case StageEventKind::iteration:
+      return "iteration";
+    case StageEventKind::transition:
+      return "transition";
+    case StageEventKind::completed:
+      return "completed";
+  }
+  throw py::value_error("Unsupported pipeline stage event kind");
+}
+
+// Events cross as plain dictionaries and the typed StageEvent is assembled in
+// Python, which keeps the binding free of a second value type to keep in sync
+// and materializes every device tensor exactly where the boundary requires
+// an independent NumPy array.
+[[nodiscard]] py::dict StageEventToDictionary(const StageEvent& event) {
+  py::dict result;
+  result["kind"] = StageEventKindName(event.kind);
+  result["stage"] = event.stage;
+  result["iteration"] = event.iteration;
+  result["token_ids"] = event.token_ids.has_value()
+                            ? py::object(TensorToNumpy(*event.token_ids))
+                            : py::object(py::none());
+  result["outputs"] = NamedTensorsToDictionary(event.outputs);
+  result["finished"] = event.finished;
   return result;
 }
 
@@ -513,6 +548,54 @@ PYBIND11_MODULE(_native, module) {
   py::class_<PipelineSessionSnapshot>(module, "PipelineSessionSnapshot")
       .def_property_readonly("valid", &PipelineSessionSnapshot::valid);
 
+  // Opaque like PipelineSessionSnapshot: a run can only come from
+  // PipelineSession.begin_stage, so Python cannot fabricate one that claims a
+  // session's run slot.
+  py::class_<StageRun>(module, "StageRun")
+      .def_property_readonly(
+          "stage",
+          [](const StageRun& run) { return std::string(run.stage()); })
+      .def_property_readonly(
+          "done",
+          [](const StageRun& run) {
+            // Takes the session lock, so it must not block another thread's
+            // step while holding the GIL.
+            py::gil_scoped_release release;
+            return run.done();
+          })
+      .def_property_readonly(
+          "iteration",
+          [](const StageRun& run) {
+            py::gil_scoped_release release;
+            return run.iteration();
+          })
+      .def(
+          "step",
+          [](StageRun& run) {
+            StageEvent event;
+            {
+              py::gil_scoped_release release;
+              event = run.Step();
+            }
+            return StageEventToDictionary(event);
+          })
+      .def(
+          "finish",
+          [](StageRun& run) {
+            NamedTensors outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = run.Finish();
+            }
+            return NamedTensorsToDictionary(outputs);
+          })
+      .def(
+          "cancel",
+          [](StageRun& run) {
+            py::gil_scoped_release release;
+            run.Cancel();
+          });
+
   py::class_<PipelineSession>(module, "PipelineSession")
       .def(
           "run_stage",
@@ -570,16 +653,51 @@ PYBIND11_MODULE(_native, module) {
           py::arg("inputs") = py::dict(),
           py::arg("overrides") = py::dict(),
           py::arg("options") = py::dict())
+      .def(
+          "begin_stage",
+          [](PipelineSession& session,
+             const std::string& stage,
+             const py::dict& inputs,
+             const py::dict& overrides,
+             const py::dict& options) {
+            NamedTensors input_tensors =
+                NamedTensorsFromDictionary(inputs);
+            NamedTensors override_tensors =
+                NamedTensorsFromDictionary(overrides);
+            PipelineRunOptions run_options =
+                PipelineOptionsFromDictionary(options);
+            py::gil_scoped_release release;
+            return std::make_unique<StageRun>(session.BeginStage(
+                stage,
+                input_tensors,
+                override_tensors,
+                run_options));
+          },
+          py::arg("stage"),
+          py::arg("inputs") = py::dict(),
+          py::arg("overrides") = py::dict(),
+          py::arg("options") = py::dict())
       .def_property_readonly(
           "outputs",
           [](const PipelineSession& session) {
-            return NamedTensorsToDictionary(session.outputs());
+            NamedTensors outputs;
+            {
+              // Reading stays legal while a stage run is active, so it must
+              // wait for that run's lock without holding the GIL.
+              py::gil_scoped_release release;
+              outputs = session.outputs();
+            }
+            return NamedTensorsToDictionary(outputs);
           })
       .def(
           "state",
           [](const PipelineSession& session,
              const std::string& name) -> py::object {
-            const auto value = session.state(name);
+            std::optional<Tensor> value;
+            {
+              py::gil_scoped_release release;
+              value = session.state(name);
+            }
             if (!value.has_value()) {
               return py::none();
             }
@@ -588,9 +706,17 @@ PYBIND11_MODULE(_native, module) {
           py::arg("name"))
       .def(
           "release_stage",
-          &PipelineSession::ReleaseStage,
+          [](PipelineSession& session, const std::string& stage) {
+            py::gil_scoped_release release;
+            session.ReleaseStage(stage);
+          },
           py::arg("stage"))
-      .def("reset", &PipelineSession::Reset)
+      .def(
+          "reset",
+          [](PipelineSession& session) {
+            py::gil_scoped_release release;
+            session.Reset();
+          })
       .def(
           "snapshot",
           [](const PipelineSession& session) {

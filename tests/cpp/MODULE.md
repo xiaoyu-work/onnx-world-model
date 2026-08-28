@@ -23,6 +23,10 @@ Runtime library and no real ONNX model.
   create, query, replace, rewind, drop, empty and unknown names, `Reset`
   clearing, and a fork's empty checkpoint namespace. This is also a separate
   executable.
+- Cover the incremental `StageRun` contract in its own executable: parity with
+  `RunStage` for every stage kind, the single terminal event, the run slot's
+  exclusion of conflicting session calls, cancellation, failure, handle and
+  session ownership, and device-preserving stage events.
 
 ## Key Files
 
@@ -33,6 +37,7 @@ Runtime library and no real ONNX model.
 | `pipeline_test.cpp` | `pipeline_test` | Manifest parsing and rejection, stage execution, guidance, schedulers, state lifecycle. |
 | `pipeline_device_test.cpp` | `pipeline_device_test` | Device-tensor preservation across `PipelineSession`: rank adaptation, transform-free connections, reshape, public outputs, and CPU-transform materialization. |
 | `pipeline_snapshot_test.cpp` | `pipeline_snapshot_test` | `PipelineSession::Snapshot`, `Restore`, `Fork`, and the named `Checkpoint`, `RestoreCheckpoint`, `DropCheckpoint`, and `HasCheckpoint`: state round trips, fork independence, package identity rejection, zero-copy device sharing, random-engine determinism, and checkpoint create/replace/rewind/drop plus empty and unknown name failures. |
+| `pipeline_stream_test.cpp` | `pipeline_stream_test` | `PipelineSession::BeginStage` and `StageRun`: greedy, sampled, and per-lane early-stopping autoregressive parity with `RunStage`, the once-only token budget, iterative and single-pass parity, one terminal `StageEvent`, `Finish` after partial stepping, the active-run exclusions, cancellation and destruction, failure without rollback, moved handles, session move and destruction safety, and device-preserving event outputs. |
 
 Each file is a self-contained `main()` with local `Check` and `CheckThrows`
 helpers (and `CheckThrowsMessage` where a message is asserted, or
@@ -51,14 +56,15 @@ third-party test framework; a new test is a new check inside an existing
   `onnx_world_model::ModelBackend` defined inside each test file, plus
   `FakeDeviceBuffer`, a stub `onnx_world_model::TensorBuffer` in
   `pipeline_device_test.cpp` that reports a non-CPU device, refuses host
-  access, and counts each `CopyToCpu`; `pipeline_snapshot_test.cpp` has its own
-  `CountingDeviceBuffer` with the same shape.
+  access, and counts each `CopyToCpu`; `pipeline_snapshot_test.cpp` and
+  `pipeline_stream_test.cpp` have their own `CountingDeviceBuffer` with the
+  same shape.
 - `pipeline_test.cpp` writes temporary package and scheduler directories under
   the filesystem temporary directory, and optionally accepts a real package
   directory and ORT library path as `argv[1]` and `argv[2]`.
-- `pipeline_device_test.cpp` and `pipeline_snapshot_test.cpp` take no arguments
-  and touch no filesystem: they build each `PipelinePackage` in memory from an
-  embedded manifest string.
+- `pipeline_device_test.cpp`, `pipeline_snapshot_test.cpp`, and
+  `pipeline_stream_test.cpp` take no arguments and touch no filesystem: they
+  build each `PipelinePackage` in memory from an embedded manifest string.
 
 ## Tests
 

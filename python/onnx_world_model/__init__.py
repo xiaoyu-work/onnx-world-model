@@ -1,6 +1,6 @@
 # @agent-file
 # @agent-purpose: Declares the public `onnx_world_model` package surface by re-exporting the generation, pipeline, and preprocessing symbols that users are expected to import.
-# @agent-public-api: ActionGenerator, ActionOutput, ConditioningFramePreprocessor, GeneratorPromptPacker, ImageGenerator, ImageOutput, ImagePreprocessor, LatentDynamicsModel, LegacyWorldModel, ModelMetadata, OnnxModel, PackedImage, PackedImagePreprocessor, PackedVideoPreprocessor, Pipeline, PipelineInputSpec, PipelineOutputSpec, PipelineSession, PipelineSessionSnapshot, PipelineStageSpec, PreparedConditioning, PreparedReasonerInputs, PreparedVideo, PreparedWorldInputs, RawImage, RawVideo, Rollout, StepResult, TensorSpec, TextGenerator, TextOutput, TextPreprocessor, VideoGenerator, VideoOutput, WorldModel, WorldModelError, WorldModelPipeline, WorldModelPreprocessor, available_execution_providers, pack_latent_tokens, register_execution_provider_library, supported_pipeline_capabilities, unpack_latent_tokens
+# @agent-public-api: ActionGenerator, ActionOutput, ConditioningFramePreprocessor, GeneratorPromptPacker, ImageGenerator, ImageOutput, ImagePreprocessor, LatentDynamicsModel, LegacyWorldModel, ModelMetadata, OnnxModel, PackedImage, PackedImagePreprocessor, PackedVideoPreprocessor, Pipeline, PipelineInputSpec, PipelineOutputSpec, PipelineSession, PipelineSessionSnapshot, PipelineStageSpec, PreparedConditioning, PreparedReasonerInputs, PreparedVideo, PreparedWorldInputs, RawImage, RawVideo, Rollout, StageEvent, StageRun, StepResult, TensorSpec, TextGenerator, TextOutput, TextPreprocessor, VideoGenerator, VideoOutput, WorldModel, WorldModelError, WorldModelPipeline, WorldModelPreprocessor, available_execution_providers, pack_latent_tokens, register_execution_provider_library, supported_pipeline_capabilities, unpack_latent_tokens
 # @agent-invariants: Contains re-exports only and no logic; `__all__` must stay sorted and list exactly the imported names, because it is the documented public surface. Removing or renaming an entry is a breaking change for users.
 # @agent-side-effects: Importing this package imports the compiled `_native` extension, which loads the ONNX Runtime shared library.
 
@@ -16,6 +16,8 @@ from onnx_world_model._api import (
     PipelineSessionSnapshot,
     PipelineStageSpec,
     Rollout,
+    StageEvent,
+    StageRun,
     StepResult,
     TensorSpec,
     WorldModelPipeline,
@@ -82,6 +84,8 @@ __all__ = [
     "RawImage",
     "RawVideo",
     "Rollout",
+    "StageEvent",
+    "StageRun",
     "StepResult",
     "TensorSpec",
     "TextGenerator",

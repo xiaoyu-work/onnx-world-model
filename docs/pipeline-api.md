@@ -292,6 +292,9 @@ selects the official behavior; any other field under `chat` is rejected.
 
 - `run_stage()` executes the strategy declared by the manifest: single pass,
   autoregressive generation, or all iterative scheduler steps.
+- `begin_stage()` executes the same strategy one step at a time and reports
+  each step as a `StageEvent`; `run_stage()` is exactly that run drained to
+  completion.
 - `step_stage()` executes exactly one pass for callers that manage a loop.
 - `overrides` supplies generated tensors or transformed targets explicitly.
 - `release_stage()` releases state according to the manifest lifecycle.
@@ -300,6 +303,79 @@ selects the official behavior; any other field under `chat` is rejected.
 `PipelineSession.run()` executes selected stages in declaration order and
 releases each stage after execution. Explicit `run_stage()` calls are clearer
 when stages need different prepared inputs.
+
+## Incremental stage execution
+
+`begin_stage()` returns a `StageRun`: a handle over one execution of one stage
+that reports what each model or scheduler step produced.
+
+```python
+session = pipeline.create_session()
+
+with session.begin_stage("reasoner_decode", options={"max_tokens": 64}) as run:
+    for event in run:
+        if event.kind == "token":
+            print(event.token_ids)          # int64 [batch, 1]
+        elif event.finished:
+            reasoning = event.outputs       # what run_stage() would return
+```
+
+`session.iter_stage(...)` is the same loop without the handle, for callers that
+consume every event:
+
+```python
+for event in session.iter_stage("world_generation", world_inputs, options=opts):
+    progress(event.iteration)
+```
+
+Each event carries:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"token"` for autoregressive decoding, `"iteration"` for an iterative scheduler step, `"transition"` for the single pass of every other stage kind, `"completed"` for the terminal event. |
+| `stage` | The stage this run drives. |
+| `iteration` | Zero-based index of this step event within this run; the terminal event reports how many step events preceded it. |
+| `token_ids` | The tokens this step generated, on `"token"` events only. |
+| `outputs` | The stage's public outputs as of this event, as NumPy arrays. |
+| `finished` | True on the terminal `"completed"` event and nowhere else. |
+
+The rules the API guarantees:
+
+- **Parity.** `run.finish()` returns exactly what `run_stage()` returns for the
+  same arguments, because `run_stage()` is `begin_stage(...).finish()`. The
+  token budget, sampling configuration, seed, end-of-sequence tokens, and
+  iterative target are resolved once, when the run begins.
+- **Synchronous steps.** One `step()` blocks until one model or scheduler step
+  finishes. Events are results, not notifications; there is no background
+  thread. Cancelling a step already in flight, and step deadlines, are a later
+  milestone.
+- **One terminal event.** A stopping condition — the end-of-sequence token in
+  every lane, the token budget, or the last scheduler step — is reported by the
+  *next* `step()` as the `"completed"` event, so every run ends the same way.
+  Stepping past it raises `WorldModelError`, and `finish()` keeps returning the
+  cached result.
+- **One run per session.** While a run is unfinished the session raises
+  `WorldModelError` from `begin_stage()`, `run_stage()`, `step_stage()`,
+  `snapshot()`, `restore()`, `fork()`, `checkpoint()`, `restore_checkpoint()`,
+  `drop_checkpoint()`, `reset()`, and `release_stage()`. An in-flight decode
+  loop is not part of a snapshot, so the runtime refuses to capture one rather
+  than hand back a snapshot that silently drops it. Reading `outputs`,
+  `state()`, and `has_checkpoint()` stays legal.
+- **No implicit rewind.** `close()`, the context manager, a failed step, and
+  dropping the handle all release the session where the run stopped and keep
+  everything it already applied. Use `snapshot()` before the run, or
+  `checkpoint()`, when a caller wants to rewind.
+- **Python materializes.** `token_ids` and `outputs` are independent NumPy
+  arrays, exactly as `run_stage()` returns them; in C++ a device-backed output
+  stays on its device.
+
+Stopping early releases the session only when the run is closed. A `with`
+block or an explicit `close()` does that deterministically; a bare `break` out
+of `iter_stage()` waits for the generator to be closed or collected.
+
+The C++ API is the same shape: `PipelineSession::BeginStage` returns a
+move-only `StageRun` with `Step()`, `Finish()`, and `Cancel()`, and a
+`StageEvent` there keeps its device-resident tensors.
 
 ## Session snapshots and named checkpoints
 
@@ -336,7 +412,9 @@ device-resident tensor to the host. They are not written to disk, are not
 paged out, and cannot be sent to another process. A snapshot stays bound to
 the `Pipeline` it was taken from: restoring it into a session from a
 separately loaded `Pipeline` raises `WorldModelError` even when both packages
-are byte-for-byte identical.
+are byte-for-byte identical. An unfinished `StageRun` also blocks every one of
+these calls, because a decode or scheduler loop in flight is not part of the
+capture.
 
 ### Named checkpoints
 

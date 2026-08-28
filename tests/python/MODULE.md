@@ -12,6 +12,8 @@ package, including the compiled `_native` extension, through its public API.
   and latent-dynamics stepping.
 - Verify pipeline loading and staged execution through `Pipeline` and
   `PipelineSession`.
+- Verify incremental stage execution: the `StageEvent` dataclass, the
+  `StageRun` iterator and lifetime protocol, `begin_stage`, and `iter_stage`.
 - Verify the in-memory `PipelineSessionSnapshot` wrapper: snapshot, restore,
   fork, the named-checkpoint methods, and the pipeline-identity check that
   mirrors the native one.
@@ -27,6 +29,7 @@ package, including the compiled `_native` extension, through its public API.
 | `test_api.py` | `_api.py` wrappers, providers, `LatentDynamicsModel`, `Rollout`. |
 | `test_pipeline.py` | `Pipeline` and `PipelineSession` contract and stage execution. |
 | `test_pipeline_snapshot.py` | `PipelineSessionSnapshot` plus `PipelineSession.snapshot`, `restore`, `fork`, `checkpoint`, `restore_checkpoint`, `drop_checkpoint`, and `has_checkpoint` on a counter package built with `onnx_ir`. |
+| `test_pipeline_stream.py` | `StageEvent`, `StageRun`, `PipelineSession.begin_stage`, and `iter_stage`: payload conversion and iteration against a local fake native handle, plus event, parity, active-run, and token-shape assertions on counter and decoder packages built with `onnx_ir`. |
 | `test_preprocessing.py` | `preprocessing.py` and `media.py`, including latent-token round trips. |
 | `test_guided_generation.py` | Classifier-free guidance on graphs synthesized with `onnx_ir`. |
 | `test_image_to_video_smoke.py` | The `tools/image_to_video_smoke.py` dry run and generation path. |
@@ -42,14 +45,14 @@ package, including the compiled `_native` extension, through its public API.
     `pytest.importorskip`, so `test_api.py` and `test_pipeline.py` skip
     without it;
   - `onnx_ir` — required by `test_guided_generation.py`, and by the package
-    fixture in `test_pipeline_snapshot.py`, which calls
-    `pytest.importorskip` so the rest of that module still runs;
+    fixtures in `test_pipeline_snapshot.py` and `test_pipeline_stream.py`,
+    which call `pytest.importorskip` so the rest of those modules still runs;
   - an exported image-to-video package — guards the generation test in
     `test_image_to_video_smoke.py` with `skipif`.
 
 Fixtures that build a package in `tmp_path` need no exporter and no network, so
-`test_preprocessing.py`, `test_guided_generation.py`, and
-`test_pipeline_snapshot.py` always run.
+`test_preprocessing.py`, `test_guided_generation.py`,
+`test_pipeline_snapshot.py`, and `test_pipeline_stream.py` always run.
 
 ## Tests
 
