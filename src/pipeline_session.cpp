@@ -2,8 +2,8 @@
  * @agent-file
  * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling.
  * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset
- * @agent-invariants: All mutable state lives in PipelineSession::Impl behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused.
- * @agent-side-effects: Runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling.
+ * @agent-invariants: All mutable state lives in PipelineSession::Impl behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Until the device execution path is enabled, caller tensors are materialized before taking the session lock and component outputs are materialized before entering CPU transforms or session state. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused.
+ * @agent-side-effects: May transfer device tensors to CPU, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling.
  */
 
 #include "onnx_world_model/pipeline.hpp"
@@ -34,6 +34,15 @@ using Json = nlohmann::json;
 
 [[noreturn]] void ExecutionError(std::string message) {
   throw Error(ErrorCode::runtime_execution, std::move(message));
+}
+
+[[nodiscard]] NamedTensors CopyTensorsToCpu(const NamedTensors& tensors) {
+  NamedTensors result;
+  result.reserve(tensors.size());
+  for (const auto& [name, tensor] : tensors) {
+    result.emplace(name, tensor.CopyToCpu());
+  }
+  return result;
 }
 
 const PipelineStage& FindStage(
@@ -2702,7 +2711,7 @@ struct PipelineSession::Impl {
           package->Component(component.name).Run(model_inputs);
       for (auto& [name, tensor] : model_outputs) {
         endpoint_values.insert_or_assign(
-            component.name + "." + name, std::move(tensor));
+            component.name + "." + name, tensor.CopyToCpu());
       }
     }
   }
@@ -3236,8 +3245,10 @@ NamedTensors PipelineSession::RunStage(
     const NamedTensors& inputs,
     const NamedTensors& overrides,
     const PipelineRunOptions& options) {
+  NamedTensors cpu_inputs = CopyTensorsToCpu(inputs);
+  NamedTensors cpu_overrides = CopyTensorsToCpu(overrides);
   std::scoped_lock lock(impl_->mutex);
-  return impl_->RunStage(stage, inputs, overrides, options);
+  return impl_->RunStage(stage, cpu_inputs, cpu_overrides, options);
 }
 
 NamedTensors PipelineSession::StepStage(
@@ -3245,8 +3256,10 @@ NamedTensors PipelineSession::StepStage(
     const NamedTensors& inputs,
     const NamedTensors& overrides,
     const PipelineRunOptions& options) {
+  NamedTensors cpu_inputs = CopyTensorsToCpu(inputs);
+  NamedTensors cpu_overrides = CopyTensorsToCpu(overrides);
   std::scoped_lock lock(impl_->mutex);
-  return impl_->StepStage(stage, inputs, overrides, options);
+  return impl_->StepStage(stage, cpu_inputs, cpu_overrides, options);
 }
 
 NamedTensors PipelineSession::outputs() const {

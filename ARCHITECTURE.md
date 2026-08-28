@@ -122,8 +122,18 @@ Generation, using video as the example:
 7. The generator unpacks latent tokens and returns a modality-specific output
    dataclass.
 
-Tensors cross the language boundary as NumPy arrays converted to `Tensor` values
-with copy-on-write storage; `float16` and `bfloat16` cross as raw two-byte views.
+`Tensor` can retain an ORT-independent `TensorBuffer` on a named device. Owned
+tensor constructors allocate copy-on-write CPU storage; device-only buffers
+must be explicitly materialized before host access. Tensors cross the Python
+language boundary as independent NumPy arrays, so the binding materializes
+device storage to CPU before copying it; `float16` and `bfloat16` cross as raw
+two-byte views.
+
+Until device I/O binding is selected by the pipeline executor, the generic ORT
+backend and pipeline execution boundary materialize device buffers to CPU. This
+keeps custom device-buffer inputs correct without labeling accelerator pointers
+as CPU memory; the I/O-binding layer replaces that staging path for compatible
+component connections.
 
 ## Entry Points
 
@@ -168,7 +178,8 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   is move-only and owns exactly one request or trajectory. Session state is
   guarded by `impl_->mutex`, and `Rollout` guards its state by its own mutex.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
-  buffer is cloned before mutation.
+  CPU buffer is cloned before mutation. Device buffers expose immutable
+  storage and an explicit synchronous CPU-copy operation.
 - **Portable, contained packages.** Every manifest path must stay inside the
   package root, and component names must be safe portable path segments.
 - **Deterministic sampling.** A `PipelineSession` seeds its own random engine, so

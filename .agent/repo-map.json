@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T04:40:07.379Z",
+  "generatedAt": "2026-08-28T05:14:57.689Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "f7cbbc82d519d705e8fe31dc352cc07431357c5b612d9fa6f26140b12c1b89bb",
+  "sourceFingerprint": "322f267ce34aea7ebf1ba42252d2e09de6be746c3aa92c42f7b586c96752c0a8",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -115,12 +115,14 @@
     {
       "path": "include/onnx_world_model/tensor.hpp",
       "kind": "source",
-      "purpose": "Declares the DataType enumeration and the Tensor value type that carries dense typed tensor data across the whole runtime.",
+      "purpose": "Declares dense tensor data types, canonical device identities, the device-buffer contract, and the Tensor value type shared by every runtime layer.",
       "publicSymbols": [
         "DataType",
         "ToString",
         "DataTypeSize",
         "DataTypeOf",
+        "TensorDevice",
+        "TensorBuffer",
         "Tensor"
       ]
     },
@@ -407,14 +409,21 @@
     {
       "path": "src/tensor.cpp",
       "kind": "source",
-      "purpose": "Implements the Tensor value type: checked shape and byte-size arithmetic, zero and byte construction, DataType naming and sizing, and copy-on-write mutable access.",
+      "purpose": "Implements canonical tensor devices, owned CPU buffers, checked tensor layout construction, host-access guards, CPU materialization, and copy-on-write mutation.",
       "publicSymbols": [
+        "TensorDevice::TensorDevice",
         "ToString",
         "DataTypeSize",
         "Tensor::Tensor",
         "Tensor::FromBytes",
+        "Tensor::FromBuffer",
         "Tensor::Zeros",
-        "Tensor::mutable_bytes"
+        "Tensor::size_bytes",
+        "Tensor::device",
+        "Tensor::is_host_accessible",
+        "Tensor::bytes",
+        "Tensor::mutable_bytes",
+        "Tensor::CopyToCpu"
       ]
     },
     {
@@ -453,7 +462,7 @@
     {
       "path": "tests/cpp/tensor_test.cpp",
       "kind": "test",
-      "purpose": "Standalone test executable for the Tensor value type: shape and byte-size arithmetic, typed construction and views, zero initialization, and copy-on-write semantics.",
+      "purpose": "Standalone test executable for Tensor: checked layout arithmetic, CPU and device-buffer construction, explicit CPU materialization, typed access, zero initialization, and copy-on-write semantics.",
       "publicSymbols": [
         "main"
       ]

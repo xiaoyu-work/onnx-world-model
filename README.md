@@ -58,7 +58,9 @@ C++ API ───────────────┤                  │
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in
   [Low-level APIs](docs/low-level-apis.md).
-- `Tensor` has value semantics with copy-on-write storage.
+- `Tensor` has value semantics with copy-on-write CPU storage and an
+  ORT-independent device-buffer contract; host access to accelerator storage
+  requires explicit CPU materialization.
 - ORT is loaded dynamically, so the library does not link to one ORT binary.
 
 ## Build
@@ -78,6 +80,9 @@ ctest --preset dev
 The build SHA256-verifies downloaded ONNX Runtime 1.28 and nlohmann/json
 headers. Offline builds can set `ONNXRUNTIME_INCLUDE_DIR` and
 `NLOHMANN_JSON_INCLUDE_DIR`.
+
+Version 0.2 introduces the device-aware `TensorBuffer` ABI. C++ applications
+built against version 0.1 must be recompiled when upgrading.
 
 ## Install
 

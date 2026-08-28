@@ -2,8 +2,8 @@
  * @agent-file
  * @agent-purpose: Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.
  * @agent-public-api: CreateOrtBackend, GetAvailableOrtProviders
- * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options, including log severity and execution providers. Requested execution providers are matched by NormalizeExecutionProviderName, and a provider the loaded ORT build does not offer is an error rather than a silent CPU fallback. DataType and ONNXTensorElementDataType map one-to-one; an unmapped ONNX element type throws ErrorCode::model_contract.
- * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions, and runs inference.
+ * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options, including log severity and execution providers. Until device I/O binding is enabled, every device-buffer input is synchronously materialized and retained on CPU for the complete ORT Run call. Requested execution providers are matched by NormalizeExecutionProviderName, and a provider the loaded ORT build does not offer is an error rather than a silent CPU fallback. DataType and ONNXTensorElementDataType map one-to-one; an unmapped ONNX element type throws ErrorCode::model_contract.
+ * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions, may transfer device inputs to CPU, and runs inference.
  */
 
 #include "ort_backend.hpp"
@@ -471,13 +471,17 @@ class OrtBackend final : public ModelBackend {
 
   [[nodiscard]] NamedTensors Run(const NamedTensors& inputs) const override {
     try {
+      std::vector<Tensor> cpu_inputs;
+      cpu_inputs.reserve(metadata_.inputs.size());
       std::vector<Ort::Value> input_values;
       input_values.reserve(metadata_.inputs.size());
       std::vector<const char*> input_names;
       input_names.reserve(metadata_.inputs.size());
       for (const auto& spec : metadata_.inputs) {
         input_names.push_back(spec.name.c_str());
-        input_values.push_back(MakeOrtTensor(inputs.at(spec.name), memory_info_));
+        cpu_inputs.push_back(inputs.at(spec.name).CopyToCpu());
+        input_values.push_back(
+            MakeOrtTensor(cpu_inputs.back(), memory_info_));
       }
 
       std::vector<const char*> output_names;

@@ -2,8 +2,8 @@
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
  * @agent-public-api: _native module, WorldModelError, available_execution_providers, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views; the GIL is released around every blocking ONNX Runtime call; C++ Error is translated into the Python WorldModelError.
- * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files from disk.
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime call, and C++ Error is translated into the Python WorldModelError.
+ * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files from disk, and output conversion may transfer tensors to CPU.
  */
 
 #include <cstddef>
@@ -136,13 +136,21 @@ using onnx_world_model::WorldModel;
 }
 
 [[nodiscard]] py::array TensorToNumpy(const Tensor& tensor) {
+  Tensor cpu_tensor;
+  {
+    py::gil_scoped_release release;
+    cpu_tensor = tensor.CopyToCpu();
+  }
   std::vector<py::ssize_t> shape;
-  shape.reserve(tensor.shape().size());
-  for (const std::int64_t dimension : tensor.shape()) {
+  shape.reserve(cpu_tensor.shape().size());
+  for (const std::int64_t dimension : cpu_tensor.shape()) {
     shape.push_back(static_cast<py::ssize_t>(dimension));
   }
-  py::array array(NumpyDataType(tensor.data_type()), shape);
-  std::memcpy(array.mutable_data(), tensor.bytes().data(), tensor.size_bytes());
+  py::array array(NumpyDataType(cpu_tensor.data_type()), shape);
+  std::memcpy(
+      array.mutable_data(),
+      cpu_tensor.bytes().data(),
+      cpu_tensor.size_bytes());
   return array;
 }
 
