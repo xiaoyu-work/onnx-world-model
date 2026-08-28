@@ -133,9 +133,12 @@ The generic ORT backend uses I/O binding. By default it binds outputs to CPU;
 when `RuntimeOptions.device_outputs` is enabled after registering the
 corresponding EP library, it leaves each output on the device selected by graph
 partitioning. An ORT-backed tensor can bind directly into a later model
-invocation; foreign device buffers use explicit CPU staging. The pipeline
-execution boundary still materializes component outputs before its CPU
-transforms until device-aware connection planning is enabled.
+invocation; foreign device buffers use explicit CPU staging. `PipelineSession`
+preserves that storage: caller inputs, overrides, component outputs, recurrent
+state, and public outputs keep the producing buffer, a transform-free
+connection forwards the identical `TensorBuffer`, and rank adaptation and the
+`reshape` transform reuse it because they only relabel axes. Each host-side
+transform materializes its device operands exactly once at its own boundary.
 
 ## Entry Points
 
@@ -196,6 +199,11 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   `Ort::Value` plus a flattened set of required session, binding, and aliased
   input lifetime roots, and use an environment-registered EP data transfer for
   explicit CPU materialization.
+- **One materialization per host transform.** `PipelineSession` never copies a
+  tensor to CPU implicitly. It materializes a device operand only where a
+  host-evaluated transform, scheduler, sampler, or generated-input program
+  needs the values, and does so once per source at that transform's outer
+  boundary rather than inside a per-element helper.
 - **Compatibility aliases.** `WorldModelPipeline` and `LegacyWorldModel` must
   keep pointing at `Pipeline` and `LatentDynamicsModel`.
 

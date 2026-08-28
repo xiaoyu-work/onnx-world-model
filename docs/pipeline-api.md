@@ -383,8 +383,14 @@ NamedTensors outputs = session.RunStage(
 - Scheduler, cast, reshape, packed video finalization, and audio finalization
   transforms.
 
-Pipeline scheduling and host transforms operate on CPU tensors. ONNX Runtime
-performs device transfers at component boundaries.
+Pipeline scheduling and host transforms operate on CPU tensors, but the session
+no longer forces every tensor to CPU. Direct connections, recurrent state,
+rank adaptation, and `reshape` keep the producer's buffer, so a device-resident
+component output can reach the next component and the public outputs untouched.
+Each host transform materializes its device operands once at its own boundary.
+In C++ this means a stage output may be device-only; call
+`Tensor::CopyToCpu()` before reading it. The Python API is unaffected because
+it always converts results to independent NumPy arrays.
 
 Scheduler modes are never inferred: `mode` selects a declared `mode_overrides`
 entry, and an absent mode uses the stage defaults. Conditioning handoffs

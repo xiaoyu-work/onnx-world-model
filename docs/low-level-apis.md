@@ -40,9 +40,17 @@ materialization uses the process-wide ORT data-transfer registry.
 Python `OnnxModel.run()` always returns independent NumPy arrays and therefore
 materializes device outputs.
 
-Pipeline execution currently materializes component outputs before applying its
-CPU transforms. Device-to-device pipeline connections are enabled separately by
-the connection planner.
+`PipelineSession::RunStage` and `StepStage` preserve device storage. Caller
+inputs, overrides, component outputs, recurrent state, and public outputs keep
+whatever buffer the producer supplied, and a transform-free connection hands
+the identical `TensorBuffer` to the next component. Rank adaptation of an
+external input and the `reshape` transform only relabel axes, so they reuse the
+same buffer as well. A transform this runtime evaluates on the host — `cast`,
+scheduler steps, guidance combination, packed video and audio finalization,
+token sampling, and the generated-input programs that read tensor values —
+materializes each device operand once at its own boundary and then reads only
+host memory. A public output can therefore be device-only, so call
+`Tensor::CopyToCpu()` before `bytes()` or `values<T>()`.
 
 ## Latent dynamics
 

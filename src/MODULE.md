@@ -19,6 +19,9 @@ execution, and the fixed latent-dynamics compatibility layer.
   state lifecycles.
 - Keep `Pipeline` immutable and shareable while `PipelineSession` owns one
   request's mutable state.
+- Preserve device-backed tensor storage through the session and materialize a
+  device source to CPU only once, at the outer boundary of each host-evaluated
+  transform, scheduler, sampler, or generated-input program.
 
 ## Key Files
 
@@ -32,7 +35,7 @@ execution, and the fixed latent-dynamics compatibility layer.
 | `pipeline.cpp` | `pipeline.json` parsing and `PipelinePackage` / `Pipeline` loading. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
-| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine and all per-trajectory state. |
+| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state, and the device-versus-host materialization boundaries. |
 
 `dynamic_library.hpp`, `ort_backend.hpp`, `pipeline_manifest_common.hpp`, and
 `pipeline_manifest_validation.hpp` are internal: they live in
@@ -64,8 +67,10 @@ cmake --build --preset dev
 ctest --preset dev
 ```
 
-`tests/cpp/tensor_test.cpp`, `tests/cpp/model_test.cpp`, and
-`tests/cpp/pipeline_test.cpp` cover this directory directly;
-`tests/cpp/pipeline_test.cpp` is the primary coverage for manifest parsing and
-validation. `tests/python/` exercises the same code through the `_native`
-extension module.
+`tests/cpp/tensor_test.cpp`, `tests/cpp/model_test.cpp`,
+`tests/cpp/pipeline_test.cpp`, and `tests/cpp/pipeline_device_test.cpp` cover
+this directory directly; `tests/cpp/pipeline_test.cpp` is the primary coverage
+for manifest parsing and validation, and `tests/cpp/pipeline_device_test.cpp`
+is the primary coverage for the device-versus-host materialization boundaries
+in `pipeline_session.cpp`. `tests/python/` exercises the same code through the
+`_native` extension module.

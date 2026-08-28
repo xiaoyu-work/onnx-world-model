@@ -2,8 +2,8 @@
  * @agent-file
  * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling.
  * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset
- * @agent-invariants: All mutable state lives in PipelineSession::Impl behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Until the device execution path is enabled, caller tensors are materialized before taking the session lock and component outputs are materialized before entering CPU transforms or session state. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused.
- * @agent-side-effects: May transfer device tensors to CPU, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling.
+ * @agent-invariants: All mutable state lives in PipelineSession::Impl behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, and public outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused.
+ * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling.
  */
 
 #include "onnx_world_model/pipeline.hpp"
@@ -34,15 +34,6 @@ using Json = nlohmann::json;
 
 [[noreturn]] void ExecutionError(std::string message) {
   throw Error(ErrorCode::runtime_execution, std::move(message));
-}
-
-[[nodiscard]] NamedTensors CopyTensorsToCpu(const NamedTensors& tensors) {
-  NamedTensors result;
-  result.reserve(tensors.size());
-  for (const auto& [name, tensor] : tensors) {
-    result.emplace(name, tensor.CopyToCpu());
-  }
-  return result;
 }
 
 const PipelineStage& FindStage(
@@ -495,47 +486,50 @@ void WriteInteger(
   }
 }
 
+// Materializes the source once and then reads only host memory, so a device
+// tensor crosses the transfer boundary exactly one time per cast.
 Tensor CastTensor(const Tensor& source, DataType target_type) {
   if (source.data_type() == target_type) {
     return source;
   }
-  Tensor result(target_type, source.shape());
-  if (IsIntegral(source.data_type()) && IsIntegral(target_type)) {
-    for (std::size_t index = 0; index < source.element_count(); ++index) {
-      if (IsUnsigned(source.data_type())) {
+  const Tensor host = source.CopyToCpu();
+  Tensor result(target_type, host.shape());
+  if (IsIntegral(host.data_type()) && IsIntegral(target_type)) {
+    for (std::size_t index = 0; index < host.element_count(); ++index) {
+      if (IsUnsigned(host.data_type())) {
         WriteInteger(
-            result, index, ReadUnsignedInteger(source, index));
+            result, index, ReadUnsignedInteger(host, index));
       } else {
-        WriteInteger(result, index, ReadSignedInteger(source, index));
+        WriteInteger(result, index, ReadSignedInteger(host, index));
       }
     }
     return result;
   }
-  if (IsIntegral(source.data_type()) &&
+  if (IsIntegral(host.data_type()) &&
       target_type == DataType::float64) {
     auto values = std::span(
         reinterpret_cast<double*>(result.mutable_bytes().data()),
         result.element_count());
-    for (std::size_t index = 0; index < source.element_count(); ++index) {
+    for (std::size_t index = 0; index < host.element_count(); ++index) {
       values[index] =
-          IsUnsigned(source.data_type())
-              ? static_cast<double>(ReadUnsignedInteger(source, index))
-              : static_cast<double>(ReadSignedInteger(source, index));
+          IsUnsigned(host.data_type())
+              ? static_cast<double>(ReadUnsignedInteger(host, index))
+              : static_cast<double>(ReadSignedInteger(host, index));
     }
     return result;
   }
-  if (!IsIntegral(source.data_type()) && IsIntegral(target_type)) {
-    for (std::size_t index = 0; index < source.element_count(); ++index) {
+  if (!IsIntegral(host.data_type()) && IsIntegral(target_type)) {
+    for (std::size_t index = 0; index < host.element_count(); ++index) {
       const double value =
-          source.data_type() == DataType::float64
-              ? source.values<double>()[index]
-              : static_cast<double>(ReadFloat(source, index));
+          host.data_type() == DataType::float64
+              ? host.values<double>()[index]
+              : static_cast<double>(ReadFloat(host, index));
       WriteInteger(result, index, value);
     }
     return result;
   }
-  for (std::size_t index = 0; index < source.element_count(); ++index) {
-    WriteFloat(result, index, ReadFloat(source, index));
+  for (std::size_t index = 0; index < host.element_count(); ++index) {
+    WriteFloat(result, index, ReadFloat(host, index));
   }
   return result;
 }
@@ -548,12 +542,15 @@ Tensor EulerStep(
     ExecutionError(
         "Scheduler state and velocity must have identical shapes");
   }
-  Tensor result(state.data_type(), state.shape());
-  for (std::size_t index = 0; index < state.element_count(); ++index) {
+  const Tensor host_state = state.CopyToCpu();
+  const Tensor host_velocity = velocity.CopyToCpu();
+  Tensor result(host_state.data_type(), host_state.shape());
+  for (std::size_t index = 0; index < host_state.element_count(); ++index) {
     WriteFloat(
         result,
         index,
-        ReadFloat(state, index) + delta * ReadFloat(velocity, index));
+        ReadFloat(host_state, index) +
+            delta * ReadFloat(host_velocity, index));
   }
   return result;
 }
@@ -575,15 +572,18 @@ Tensor EulerStepIndexed(
     ExecutionError(
         "Indexed scheduler update has incompatible state, velocity, or indexes");
   }
-  Tensor result = state;
-  const auto rows = indexes->values<std::int64_t>();
+  const Tensor host_state = state.CopyToCpu();
+  const Tensor host_velocity = velocity.CopyToCpu();
+  const Tensor host_indexes = indexes->CopyToCpu();
+  Tensor result = host_state;
+  const auto rows = host_indexes.values<std::int64_t>();
   const std::size_t width =
-      static_cast<std::size_t>(state.shape()[1]);
+      static_cast<std::size_t>(host_state.shape()[1]);
   for (std::size_t velocity_row = 0;
        velocity_row < rows.size();
        ++velocity_row) {
     if (rows[velocity_row] < 0 ||
-        rows[velocity_row] >= state.shape()[0]) {
+        rows[velocity_row] >= host_state.shape()[0]) {
       ExecutionError("Scheduler token index is outside the state tensor");
     }
     const std::size_t state_row =
@@ -595,8 +595,8 @@ Tensor EulerStepIndexed(
       WriteFloat(
           result,
           state_index,
-          ReadFloat(state, state_index) +
-              delta * ReadFloat(velocity, velocity_index));
+          ReadFloat(host_state, state_index) +
+              delta * ReadFloat(host_velocity, velocity_index));
     }
   }
   return result;
@@ -702,6 +702,8 @@ struct PipelineSession::Impl {
         });
   }
 
+  // Rank adaptation only relabels axes, so the byte layout is unchanged and
+  // the original buffer -- device-backed or not -- is retained as is.
   [[nodiscard]] Tensor AdaptExternal(
       const Tensor& tensor,
       const TensorSpec& spec) const {
@@ -712,15 +714,15 @@ struct PipelineSession::Impl {
         (spec.shape[0] < 0 || spec.shape[0] == 1)) {
       std::vector<std::int64_t> shape{1};
       shape.insert(shape.end(), tensor.shape().begin(), tensor.shape().end());
-      return Tensor::FromBytes(
-          tensor.data_type(), std::move(shape), tensor.bytes());
+      return Tensor::FromBuffer(
+          tensor.data_type(), std::move(shape), tensor.buffer());
     }
     if (tensor.shape().size() == spec.shape.size() + 1 &&
         tensor.shape()[0] == 1) {
       std::vector<std::int64_t> shape(
           tensor.shape().begin() + 1, tensor.shape().end());
-      return Tensor::FromBytes(
-          tensor.data_type(), std::move(shape), tensor.bytes());
+      return Tensor::FromBuffer(
+          tensor.data_type(), std::move(shape), tensor.buffer());
     }
     return tensor;
   }
@@ -1234,16 +1236,19 @@ struct PipelineSession::Impl {
       ExecutionError(
           "Conditional and unconditional predictions have different shapes");
     }
+    const Tensor host_conditional = conditional.CopyToCpu();
+    const Tensor host_unconditional = unconditional.CopyToCpu();
     Tensor result(conditional.data_type(), conditional.shape());
     for (std::size_t index = 0;
-         index < conditional.element_count();
+         index < host_conditional.element_count();
          ++index) {
-      const double guided = ReadFloat(unconditional, index);
+      const double guided = ReadFloat(host_unconditional, index);
       WriteFloat(
           result,
           index,
           static_cast<float>(
-              guided + scale * (ReadFloat(conditional, index) - guided)));
+              guided +
+              scale * (ReadFloat(host_conditional, index) - guided)));
     }
     return result;
   }
@@ -1559,6 +1564,10 @@ struct PipelineSession::Impl {
     if (state.shape() == updated.shape() && indexes == nullptr) {
       return updated;
     }
+    if (indexes == nullptr) {
+      ExecutionError(
+          "Scheduler row scatter requires int64 token indexes");
+    }
     Tensor result = state;
     const auto rows = indexes->values<std::int64_t>();
     const std::size_t width =
@@ -1605,14 +1614,27 @@ struct PipelineSession::Impl {
             : iteration_entry->second,
         steps - 1);
     const auto sigmas = SchedulerSigmas(stage_name, options);
-    Tensor sample = SelectSchedulerRows(state, velocity, indexes);
+    // Each operand crosses to the host once here; row selection and scattering
+    // reuse these tensors throughout the complete scheduler step.
+    const Tensor host_state = state.CopyToCpu();
+    const Tensor host_velocity = velocity.CopyToCpu();
+    std::optional<Tensor> host_indexes;
+    if (indexes != nullptr) {
+      host_indexes = indexes->CopyToCpu();
+    }
+    const Tensor* host_index_values =
+        host_indexes.has_value() ? &*host_indexes : nullptr;
+    Tensor sample = SelectSchedulerRows(
+        host_state,
+        host_velocity,
+        host_index_values);
     Tensor converted(sample.data_type(), sample.shape());
     for (std::size_t element = 0; element < sample.element_count(); ++element) {
       WriteFloat(
           converted,
           element,
           ReadFloat(sample, element) -
-              sigmas[index] * ReadFloat(velocity, element));
+              sigmas[index] * ReadFloat(host_velocity, element));
     }
 
     SchedulerHistory& history =
@@ -1750,7 +1772,10 @@ struct PipelineSession::Impl {
     history.lower_order = std::min(
         history.lower_order + 1,
         static_cast<std::size_t>(configured_order));
-    return ScatterSchedulerRows(state, predicted, indexes);
+    return ScatterSchedulerRows(
+        host_state,
+        predicted,
+        host_index_values);
   }
 
   [[nodiscard]] Tensor Generate(
@@ -1775,7 +1800,10 @@ struct PipelineSession::Impl {
         const std::size_t length =
             static_cast<std::size_t>(value->shape().back());
         const std::size_t axis_stride = batch * length;
-        const auto positions = value->values<std::int64_t>();
+        // Cursor tracking needs the values on the host; the override itself
+        // is returned unchanged so a device tensor stays on its device.
+        const Tensor host_value = value->CopyToCpu();
+        const auto positions = host_value.values<std::int64_t>();
         std::vector<std::int64_t> cursors(batch, 0);
         for (std::size_t batch_index = 0;
              batch_index < batch;
@@ -1874,9 +1902,23 @@ struct PipelineSession::Impl {
           cursors.assign(
               batch, static_cast<std::int64_t>(past_length));
         }
-        const auto ids = sequence->values<std::int64_t>();
+        // The token sequence and the vision grid each cross to the host once
+        // for the whole batch loop below.
+        const Tensor host_sequence = sequence->CopyToCpu();
+        const auto ids = host_sequence.values<std::int64_t>();
         const auto image_features =
             endpoint_values.find("reasoner_vision_encoder.image_features");
+        const auto grid_value =
+            endpoint_values.find("reasoner_vision_encoder.grid_thw");
+        // Only the prefill branch below reads the grid, so nothing is
+        // materialized while decoding with a populated past state.
+        const bool grid_present = past_length == 0 &&
+                                  grid_value != endpoint_values.end() &&
+                                  grid_value->second.data_type() ==
+                                      DataType::int64 &&
+                                  grid_value->second.element_count() == 3;
+        const Tensor host_grid =
+            grid_present ? grid_value->second.CopyToCpu() : Tensor{};
         for (std::size_t batch_index = 0;
              batch_index < batch;
              ++batch_index) {
@@ -1895,17 +1937,13 @@ struct PipelineSession::Impl {
           }
 
           const Json metadata = Json::parse(manifest().metadata_json());
-          const auto grid_value =
-              endpoint_values.find("reasoner_vision_encoder.grid_thw");
           if (metadata.contains("vision_understanding") &&
               metadata.at("vision_understanding").contains("tokens") &&
               metadata.at("vision_understanding").contains("preprocessing") &&
               metadata.at("vision_understanding")
                   .at("preprocessing")
                   .contains("patchify") &&
-              grid_value != endpoint_values.end() &&
-              grid_value->second.data_type() == DataType::int64 &&
-              grid_value->second.element_count() == 3) {
+              grid_present) {
             const Json& understanding =
                 metadata.at("vision_understanding");
             const Json& tokens = understanding.at("tokens");
@@ -1917,8 +1955,7 @@ struct PipelineSession::Impl {
                 understanding.at("preprocessing")
                     .at("patchify")
                     .value("merge_size", 1);
-            const auto raw_grid =
-                grid_value->second.values<std::int64_t>();
+            const auto raw_grid = host_grid.values<std::int64_t>();
             if (merge <= 0 || raw_grid[0] <= 0 || raw_grid[1] <= 0 ||
                 raw_grid[2] <= 0 || raw_grid[1] % merge != 0 ||
                 raw_grid[2] % merge != 0) {
@@ -2031,13 +2068,8 @@ struct PipelineSession::Impl {
           std::size_t grid_height = static_cast<std::size_t>(
               std::sqrt(static_cast<double>(visual_count)));
           std::size_t grid_width = grid_height;
-          const auto fallback_grid_value =
-              endpoint_values.find("reasoner_vision_encoder.grid_thw");
-          if (fallback_grid_value != endpoint_values.end() &&
-              fallback_grid_value->second.data_type() == DataType::int64 &&
-              fallback_grid_value->second.element_count() == 3) {
-            const auto raw_grid =
-                fallback_grid_value->second.values<std::int64_t>();
+          if (grid_present) {
+            const auto raw_grid = host_grid.values<std::int64_t>();
             const std::int64_t merge =
                 metadata.contains("vision_understanding")
                     ? metadata.at("vision_understanding")
@@ -2190,8 +2222,9 @@ struct PipelineSession::Impl {
           ExecutionError(
               "MSE loss indexes require int64 timestep-token indexes");
         }
+        const Tensor host_indexes = index_tensor->CopyToCpu();
         const auto token_indexes =
-            index_tensor->values<std::int64_t>();
+            host_indexes.values<std::int64_t>();
         std::vector<std::int64_t> values(token_indexes.size());
         const std::size_t offset = PackedOffset(modality);
         const std::size_t token_count = TokenCount(modality);
@@ -2350,6 +2383,7 @@ struct PipelineSession::Impl {
 
     const DataType target_type =
         manifest().Input(connection.target).data_type;
+    const Tensor host_packed = packed.CopyToCpu();
     Tensor result(
         target_type, {batch, channels, frames, height, width});
     for (std::int64_t batch_index = 0; batch_index < batch; ++batch_index) {
@@ -2367,7 +2401,7 @@ struct PipelineSession::Impl {
                       (patch_y * patch + patch_x) * channels + channel;
                   const std::size_t source_index =
                       static_cast<std::size_t>(
-                          token * packed.shape()[1] + packed_channel);
+                          token * host_packed.shape()[1] + packed_channel);
                   const std::size_t target_index =
                       static_cast<std::size_t>(
                           ((((batch_index * channels + channel) * frames +
@@ -2377,7 +2411,9 @@ struct PipelineSession::Impl {
                                 width +
                             grid_x * patch + patch_x));
                   WriteFloat(
-                      result, target_index, ReadFloat(packed, source_index));
+                      result,
+                      target_index,
+                      ReadFloat(host_packed, source_index));
                 }
               }
             }
@@ -2411,6 +2447,7 @@ struct PipelineSession::Impl {
     const std::int64_t channels = packed.shape()[1];
     const DataType target_type =
         manifest().Input(connection.target).data_type;
+    const Tensor host_packed = packed.CopyToCpu();
     Tensor result(target_type, {batch, channels, frames});
     for (std::int64_t batch_index = 0; batch_index < batch; ++batch_index) {
       for (std::int64_t frame = 0; frame < frames; ++frame) {
@@ -2421,7 +2458,8 @@ struct PipelineSession::Impl {
           const std::size_t target_index =
               static_cast<std::size_t>(
                   (batch_index * channels + channel) * frames + frame);
-          WriteFloat(result, target_index, ReadFloat(packed, source_index));
+          WriteFloat(
+              result, target_index, ReadFloat(host_packed, source_index));
         }
       }
     }
@@ -2472,8 +2510,10 @@ struct PipelineSession::Impl {
       if (CheckedElementCount(shape) != source.element_count()) {
         ExecutionError("Reshape transform changes tensor element count");
       }
-      return Tensor::FromBytes(
-          source.data_type(), std::move(shape), source.bytes());
+      // The byte layout is unchanged, so the source buffer is reused and a
+      // device tensor is never materialized for a shape-only view.
+      return Tensor::FromBuffer(
+          source.data_type(), std::move(shape), source.buffer());
     }
     if (*connection.transform == "scheduler_step") {
       const Json parameters = Json::parse(connection.parameters_json);
@@ -2710,8 +2750,10 @@ struct PipelineSession::Impl {
       NamedTensors model_outputs =
           package->Component(component.name).Run(model_inputs);
       for (auto& [name, tensor] : model_outputs) {
+        // Component outputs keep whatever storage the backend produced, so a
+        // device-backed output flows to the next component untouched.
         endpoint_values.insert_or_assign(
-            component.name + "." + name, tensor.CopyToCpu());
+            component.name + "." + name, std::move(tensor));
       }
     }
   }
@@ -2847,14 +2889,15 @@ struct PipelineSession::Impl {
     if (per_batch < vocabulary) {
       ExecutionError("Logits tensor has an invalid shape");
     }
+    const Tensor host_logits = logits.CopyToCpu();
     std::vector<std::int64_t> tokens(batch);
     for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
       const std::size_t begin =
           batch_index * per_batch + per_batch - vocabulary;
       std::size_t best = 0;
-      float best_value = ReadFloat(logits, begin);
+      float best_value = ReadFloat(host_logits, begin);
       for (std::size_t token = 1; token < vocabulary; ++token) {
-        const float value = ReadFloat(logits, begin + token);
+        const float value = ReadFloat(host_logits, begin + token);
         if (value > best_value) {
           best = token;
           best_value = value;
@@ -2904,13 +2947,14 @@ struct PipelineSession::Impl {
     }
 
     std::vector<std::int64_t> tokens(batch);
+    const Tensor host_logits = logits.CopyToCpu();
     for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
       const std::size_t begin =
           batch_index * per_batch + per_batch - vocabulary;
       std::vector<double> scores(vocabulary);
       for (std::size_t token = 0; token < vocabulary; ++token) {
         scores[token] =
-            static_cast<double>(ReadFloat(logits, begin + token));
+            static_cast<double>(ReadFloat(host_logits, begin + token));
       }
       if (repetition_penalty != 1.0) {
         std::set<std::int64_t> previous;
@@ -3245,10 +3289,8 @@ NamedTensors PipelineSession::RunStage(
     const NamedTensors& inputs,
     const NamedTensors& overrides,
     const PipelineRunOptions& options) {
-  NamedTensors cpu_inputs = CopyTensorsToCpu(inputs);
-  NamedTensors cpu_overrides = CopyTensorsToCpu(overrides);
   std::scoped_lock lock(impl_->mutex);
-  return impl_->RunStage(stage, cpu_inputs, cpu_overrides, options);
+  return impl_->RunStage(stage, inputs, overrides, options);
 }
 
 NamedTensors PipelineSession::StepStage(
@@ -3256,10 +3298,8 @@ NamedTensors PipelineSession::StepStage(
     const NamedTensors& inputs,
     const NamedTensors& overrides,
     const PipelineRunOptions& options) {
-  NamedTensors cpu_inputs = CopyTensorsToCpu(inputs);
-  NamedTensors cpu_overrides = CopyTensorsToCpu(overrides);
   std::scoped_lock lock(impl_->mutex);
-  return impl_->StepStage(stage, cpu_inputs, cpu_overrides, options);
+  return impl_->StepStage(stage, inputs, overrides, options);
 }
 
 NamedTensors PipelineSession::outputs() const {

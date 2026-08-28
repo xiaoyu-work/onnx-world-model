@@ -97,7 +97,7 @@ endif()
 
 if(ONNX_WORLD_MODEL_BUILD_TESTS)
   enable_testing()
-  foreach(test_name IN ITEMS tensor model pipeline)
+  foreach(test_name IN ITEMS tensor model pipeline pipeline_device)
     add_executable(${test_name}_test tests/cpp/${test_name}_test.cpp)
     target_link_libraries(${test_name}_test PRIVATE onnx_world_model)
     target_compile_features(${test_name}_test PRIVATE cxx_std_20)

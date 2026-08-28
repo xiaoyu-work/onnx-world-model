@@ -12,6 +12,10 @@ Runtime library and no real ONNX model.
 - Cover `Model` metadata validation and execution-provider name normalization.
 - Cover pipeline manifest parsing, manifest rejection cases, stage execution,
   schedulers, classifier-free guidance, and recurrent state.
+- Cover device-tensor preservation across `PipelineSession`: which paths keep
+  the producer's `TensorBuffer` and which materialize it, using a
+  non-host-accessible stub buffer with a shared CPU-copy counter.
+  This is a separate executable from the manifest and stage-execution tests.
 
 ## Key Files
 
@@ -20,11 +24,13 @@ Runtime library and no real ONNX model.
 | `tensor_test.cpp` | `tensor_test` | `Tensor` construction, typed views, overflow checks, copy-on-write. |
 | `model_test.cpp` | `model_test` | `Model` input and output validation through the `AddOneBackend` stub. |
 | `pipeline_test.cpp` | `pipeline_test` | Manifest parsing and rejection, stage execution, guidance, schedulers, state lifecycle. |
+| `pipeline_device_test.cpp` | `pipeline_device_test` | Device-tensor preservation across `PipelineSession`: rank adaptation, transform-free connections, reshape, public outputs, and CPU-transform materialization. |
 
-Each file is a self-contained `main()` with local `Check`, `CheckThrows`, and
-`CheckThrowsMessage` helpers, a file-local `failures` counter, and a non-zero
-exit code on failure. There is no third-party test framework; a new test is a
-new check inside an existing `main()`, or a new executable added to the
+Each file is a self-contained `main()` with local `Check` and `CheckThrows`
+helpers (and `CheckThrowsMessage` where a message is asserted), a file-local
+`failures` counter, and a non-zero exit code on failure. There is no
+third-party test framework; a new test is a new check inside an existing
+`main()`, or a new executable added to the
 `foreach(test_name IN ITEMS ...)` list in the root `CMakeLists.txt`.
 
 ## Dependencies
@@ -32,10 +38,15 @@ new check inside an existing `main()`, or a new executable added to the
 - Links `onnx_world_model` and includes only public headers from
   `include/onnx_world_model`; it never includes `src/` internal headers.
 - Components under test are stub implementations of
-  `onnx_world_model::ModelBackend` defined inside each test file.
+  `onnx_world_model::ModelBackend` defined inside each test file, plus
+  `FakeDeviceBuffer`, a stub `onnx_world_model::TensorBuffer` in
+  `pipeline_device_test.cpp` that reports a non-CPU device, refuses host
+  access, and counts each `CopyToCpu`.
 - `pipeline_test.cpp` writes temporary package and scheduler directories under
   the filesystem temporary directory, and optionally accepts a real package
   directory and ORT library path as `argv[1]` and `argv[2]`.
+- `pipeline_device_test.cpp` takes no arguments and touches no filesystem: it
+  builds each `PipelinePackage` in memory from an embedded manifest string.
 
 ## Tests
 

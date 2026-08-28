@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T07:31:17.989Z",
+  "generatedAt": "2026-08-28T08:12:11.994Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "d18c7c4d12cfd3e4b5356b0e30c560c49f7c717a34c45cc3236d303cf2c74ab8",
+  "sourceFingerprint": "3e0a1778fc2234cc895a0a09f3adb85279bfa2d6b86b6ebe1490760c7f3797e4",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -450,6 +450,14 @@
       "path": "tests/cpp/model_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for Model, runtime option defaults, provider helpers, and the named-tensor metadata contract, using an in-process AddOneBackend stub.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
+      "path": "tests/cpp/pipeline_device_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for device-tensor preservation across PipelineSession: which paths keep a producer's TensorBuffer untouched and which materialize it on the host, driven by in-process stub backends.",
       "publicSymbols": [
         "main"
       ]
