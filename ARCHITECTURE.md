@@ -47,7 +47,7 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `Model`, `Pipeline`, `PipelineSession`, `WorldModel`, `Rollout`. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `Model`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `WorldModel`, `Rollout`. |
 | Core library | `src/` | ORT loading, tensor marshalling, manifest parsing and validation, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
@@ -67,7 +67,8 @@ Within `src/` the runtime is layered:
 - `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
   share.
-- `pipeline_session` executes stages and owns per-trajectory state.
+- `pipeline_session` executes stages, owns per-trajectory state, and captures
+  or restores that state as an in-memory snapshot.
 - `world_model` provides the fixed latent-dynamics compatibility API.
 
 ## Dependency Rules
@@ -122,6 +123,16 @@ Generation, using video as the example:
 7. The generator unpacks latent tokens and returns a modality-specific output
    dataclass.
 
+A session can capture all of that mutable execution state — external,
+endpoint, recurrent-state and guidance tensors, stage cursors, scheduler
+histories, position cursors, and the random engine — as an immutable
+`PipelineSessionSnapshot`, restore itself from one, or fork an independent
+session initialized from one. This is an in-process capability: a snapshot
+shares tensor storage copy-on-write, never materializes a device buffer, and
+is not serialized to disk or portable across processes. A snapshot records the
+`PipelinePackage` instance it came from, so restoring it into a session built
+on any other package instance fails with `ErrorCode::state`.
+
 `Tensor` can retain an ORT-independent `TensorBuffer` on a named device. Owned
 tensor constructors allocate copy-on-write CPU storage; device-only buffers
 must be explicitly materialized before host access. Tensors cross the Python
@@ -147,7 +158,9 @@ Python:
 - `onnx_world_model.WorldModel.from_pretrained(package_path)` — the primary
   generation API, exposing `.text`, `.image`, `.video`, and `.action`, each with
   a `generate()` method.
-- `onnx_world_model.Pipeline` and `PipelineSession` — direct stage execution.
+- `onnx_world_model.Pipeline` and `PipelineSession` — direct stage execution,
+  plus `snapshot()`, `restore()`, and `fork()` for in-memory session
+  branching.
 - `onnx_world_model.OnnxModel` — one ONNX graph with named tensors.
 - `onnx_world_model.LatentDynamicsModel` and `Rollout` — the fixed
   latent-dynamics API.
@@ -161,6 +174,8 @@ C++:
 
 - `onnx_world_model::Pipeline::Load` then `Pipeline::CreateSession` and
   `PipelineSession::RunStage` or `StepStage`.
+- `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
+  in-memory session branching.
 - `onnx_world_model::Model::Load` and `Model::Run`.
 - `onnx_world_model::WorldModel::Load`, `WorldModel::Step`, and `Rollout`.
 
@@ -185,6 +200,9 @@ and the `onnx-world-model` wheel built by scikit-build-core.
 - **Ownership split.** `Pipeline` is immutable and shareable; `PipelineSession`
   is move-only and owns exactly one request or trajectory. Session state is
   guarded by `impl_->mutex`, and `Rollout` guards its state by its own mutex.
+  `PipelineSession::Snapshot`, `Restore`, and `Fork` take that same lock;
+  `Restore` copies every container before taking it and commits by swapping,
+  so a failure leaves the target session unchanged.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
   CPU buffer is cloned before mutation. Device buffers expose immutable
   storage and an explicit synchronous CPU-copy operation.

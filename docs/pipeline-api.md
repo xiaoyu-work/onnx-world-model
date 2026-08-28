@@ -301,6 +301,43 @@ selects the official behavior; any other field under `chat` is rejected.
 releases each stage after execution. Explicit `run_stage()` calls are clearer
 when stages need different prepared inputs.
 
+## Session snapshots
+
+A session can capture everything it has accumulated and rewind or branch from
+that capture:
+
+```python
+session = pipeline.create_session()
+session.run_stage("world_generation", inputs, options={"num_inference_steps": 20})
+
+checkpoint = session.snapshot()
+
+# Explore one continuation, then rewind and try another.
+first = session.run_stage("world_generation", options={"num_inference_steps": 20})
+session.restore(checkpoint)
+second = session.run_stage("world_generation", options={"num_inference_steps": 20})
+
+# Or branch, and let both sides advance independently.
+branch = session.fork()
+```
+
+- `snapshot()` returns an immutable `PipelineSessionSnapshot` holding the
+  session's external, endpoint, recurrent-state, and guidance tensors, its
+  stage cursors, scheduler histories, position cursors, and random engine.
+- `restore()` replaces the session's state with the captured one. It either
+  succeeds completely or changes nothing.
+- `fork()` returns an independent session on the same pipeline, started from a
+  snapshot of this one. Later runs, releases, and resets on either side never
+  reach the other.
+
+Snapshots are in-memory values only. They share tensor storage
+copy-on-write, so capturing and forking copy no tensor data and never move a
+device-resident tensor to the host. They are not written to disk, are not
+paged out, and cannot be sent to another process. A snapshot stays bound to
+the `Pipeline` it was taken from: restoring it into a session from a
+separately loaded `Pipeline` raises `WorldModelError` even when both packages
+are byte-for-byte identical.
+
 ## Conditioned, guided stages
 
 An iterative stage that declares `guidance` and `conditioning` adds two host
@@ -387,7 +424,16 @@ NamedTensors outputs = session.RunStage(
         .strings = {{"mode", "action"}, {"action_domain", "droid_lerobot"}},
         .integers = {{"num_inference_steps", 50}},
     });
+
+PipelineSessionSnapshot checkpoint = session.Snapshot();
+PipelineSession branch = session.Fork();
+session.Restore(checkpoint);
 ```
+
+`PipelineSessionSnapshot` has no public constructor, so it can only come from
+`PipelineSession::Snapshot()`. `Restore` and `Fork` take the session lock, and
+`Restore` throws `Error` with `ErrorCode::state` when the snapshot came from a
+session on a different `PipelinePackage` instance.
 
 ## Runtime scope
 
@@ -398,6 +444,8 @@ NamedTensors outputs = session.RunStage(
   driven by the stage's `guidance` and `conditioning` options rather than by
   model names.
 - KV-cache, request, sequence, iteration, and session state lifecycles.
+- In-memory session snapshot, restore, and fork. Snapshots are not serialized
+  to disk and do not cross a process boundary.
 - FlowMatch Euler and flow-prediction UniPC order-1/order-2 schedulers.
 - Greedy and temperature/top-k/top-p autoregressive sampling.
 - Packed layout, attention masks, multimodal positions, scheduler timesteps,

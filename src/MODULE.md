@@ -18,7 +18,8 @@ execution, and the fixed latent-dynamics compatibility layer.
   schedulers, classifier-free guidance, autoregressive decoding, and recurrent
   state lifecycles.
 - Keep `Pipeline` immutable and shareable while `PipelineSession` owns one
-  request's mutable state.
+  request's mutable state, and let a session capture that state as an
+  immutable in-memory `PipelineSessionSnapshot` it can restore or fork from.
 - Preserve device-backed tensor storage through the session and materialize a
   device source to CPU only once, at the outer boundary of each host-evaluated
   transform, scheduler, sampler, or generated-input program.
@@ -35,7 +36,7 @@ execution, and the fixed latent-dynamics compatibility layer.
 | `pipeline.cpp` | `pipeline.json` parsing and `PipelinePackage` / `Pipeline` loading. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
-| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state, and the device-versus-host materialization boundaries. |
+| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the snapshot, restore, and fork operations over that bundle, and the device-versus-host materialization boundaries. |
 
 `dynamic_library.hpp`, `ort_backend.hpp`, `pipeline_manifest_common.hpp`, and
 `pipeline_manifest_validation.hpp` are internal: they live in
@@ -68,9 +69,11 @@ ctest --preset dev
 ```
 
 `tests/cpp/tensor_test.cpp`, `tests/cpp/model_test.cpp`,
-`tests/cpp/pipeline_test.cpp`, and `tests/cpp/pipeline_device_test.cpp` cover
-this directory directly; `tests/cpp/pipeline_test.cpp` is the primary coverage
-for manifest parsing and validation, and `tests/cpp/pipeline_device_test.cpp`
-is the primary coverage for the device-versus-host materialization boundaries
-in `pipeline_session.cpp`. `tests/python/` exercises the same code through the
-`_native` extension module.
+`tests/cpp/pipeline_test.cpp`, `tests/cpp/pipeline_device_test.cpp`, and
+`tests/cpp/pipeline_snapshot_test.cpp` cover this directory directly;
+`tests/cpp/pipeline_test.cpp` is the primary coverage for manifest parsing and
+validation, `tests/cpp/pipeline_device_test.cpp` is the primary coverage for
+the device-versus-host materialization boundaries in `pipeline_session.cpp`,
+and `tests/cpp/pipeline_snapshot_test.cpp` is the primary coverage for its
+snapshot, restore, and fork operations. `tests/python/` exercises the same
+code through the `_native` extension module.

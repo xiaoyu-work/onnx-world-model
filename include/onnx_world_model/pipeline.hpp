@@ -2,9 +2,9 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, and the per-trajectory PipelineSession.
- * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first.
+ * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, and its in-memory PipelineSessionSnapshot.
+ * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, PipelinePackage, PipelineRunOptions, Pipeline, PipelineSessionSnapshot, PipelineSession
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -203,6 +203,29 @@ class Pipeline {
   friend class PipelineSession;
 };
 
+//: An immutable in-memory capture of one PipelineSession's mutable execution
+//: state: its external, endpoint, recurrent-state, and guidance tensors, its
+//: stage cursors, its scheduler histories, its position cursors, and its
+//: random engine. Only PipelineSession::Snapshot() produces one, so a caller
+//: cannot fabricate state a session never held. Copies are cheap because the
+//: captured tensors share their storage copy-on-write, and a device-backed
+//: tensor is never materialized to CPU by capturing or restoring it. This is
+//: an in-process value only: it is not serialized to disk and cannot cross a
+//: process boundary.
+class PipelineSessionSnapshot {
+ public:
+  //: False only for a moved-from snapshot, which no session accepts.
+  [[nodiscard]] bool valid() const noexcept;
+
+ private:
+  struct Impl;
+  explicit PipelineSessionSnapshot(std::shared_ptr<const Impl> state);
+
+  std::shared_ptr<const Impl> impl_;
+
+  friend class PipelineSession;
+};
+
 class PipelineSession {
  public:
   PipelineSession(PipelineSession&&) noexcept;
@@ -226,6 +249,18 @@ class PipelineSession {
   [[nodiscard]] std::optional<Tensor> state(std::string_view name) const;
   void ReleaseStage(std::string_view stage);
   void Reset();
+
+  //: Captures every mutable execution field of this session. The result is
+  //: unaffected by anything the session does afterwards.
+  [[nodiscard]] PipelineSessionSnapshot Snapshot() const;
+  //: Replaces every mutable execution field with the captured one. The
+  //: snapshot must come from a session on this session's PipelinePackage
+  //: instance; otherwise this throws ErrorCode::state and changes nothing.
+  void Restore(const PipelineSessionSnapshot& snapshot);
+  //: Returns an independent session on the same immutable PipelinePackage,
+  //: initialized from a snapshot of this one. Neither session observes the
+  //: other's later runs, releases, or resets.
+  [[nodiscard]] PipelineSession Fork() const;
 
  private:
   struct Impl;

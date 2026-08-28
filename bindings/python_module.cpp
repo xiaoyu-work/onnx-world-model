@@ -1,8 +1,8 @@
 /**
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
- * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime or provider-library call, and C++ Error is translated into the Python WorldModelError.
+ * @agent-public-api: _native module, WorldModelError, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, Rollout
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is also released around every blocking ONNX Runtime or provider-library call and around the session snapshot, restore, and fork operations that take the session lock, and C++ Error is translated into the Python WorldModelError. PipelineSessionSnapshot is exposed as an opaque handle with no Python constructor, so it can only come from PipelineSession.snapshot().
  * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
@@ -31,6 +31,7 @@ using onnx_world_model::NamedTensors;
 using onnx_world_model::Pipeline;
 using onnx_world_model::PipelineRunOptions;
 using onnx_world_model::PipelineSession;
+using onnx_world_model::PipelineSessionSnapshot;
 using onnx_world_model::RegisterExecutionProviderLibrary;
 using onnx_world_model::Rollout;
 using onnx_world_model::RuntimeOptions;
@@ -509,6 +510,9 @@ PYBIND11_MODULE(_native, module) {
                 pipeline.CreateSession());
           });
 
+  py::class_<PipelineSessionSnapshot>(module, "PipelineSessionSnapshot")
+      .def_property_readonly("valid", &PipelineSessionSnapshot::valid);
+
   py::class_<PipelineSession>(module, "PipelineSession")
       .def(
           "run_stage",
@@ -586,7 +590,27 @@ PYBIND11_MODULE(_native, module) {
           "release_stage",
           &PipelineSession::ReleaseStage,
           py::arg("stage"))
-      .def("reset", &PipelineSession::Reset);
+      .def("reset", &PipelineSession::Reset)
+      .def(
+          "snapshot",
+          [](const PipelineSession& session) {
+            py::gil_scoped_release release;
+            return session.Snapshot();
+          })
+      .def(
+          "restore",
+          [](PipelineSession& session,
+             const PipelineSessionSnapshot& snapshot) {
+            py::gil_scoped_release release;
+            session.Restore(snapshot);
+          },
+          py::arg("snapshot"))
+      .def(
+          "fork",
+          [](const PipelineSession& session) {
+            py::gil_scoped_release release;
+            return std::make_unique<PipelineSession>(session.Fork());
+          });
 
   py::class_<Rollout>(module, "Rollout")
       .def("reset", py::overload_cast<>(&Rollout::Reset))

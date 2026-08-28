@@ -1,9 +1,9 @@
 /**
  * @agent-file
- * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling.
- * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset
- * @agent-invariants: All mutable state lives in PipelineSession::Impl behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, and public outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused.
- * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling.
+ * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, and fork operations.
+ * @agent-public-api: Pipeline::manifest, Pipeline::execution_providers, Pipeline::CreateSession, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSessionSnapshot::valid
+ * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, and public outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot.
+ * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, and Fork touch memory only; they perform no device transfer, no disk access, and no inference.
  */
 
 #include "onnx_world_model/pipeline.hpp"
@@ -659,21 +659,18 @@ std::vector<std::string> TopologicalComponents(
   return result;
 }
 
-}  // namespace
+struct SchedulerHistory {
+  std::vector<Tensor> model_outputs;
+  std::optional<Tensor> last_sample;
+  std::size_t lower_order{0};
+  std::size_t previous_order{1};
+};
 
-struct PipelineSession::Impl {
-  struct SchedulerHistory {
-    std::vector<Tensor> model_outputs;
-    std::optional<Tensor> last_sample;
-    std::size_t lower_order{0};
-    std::size_t previous_order{1};
-  };
-
-  explicit Impl(std::shared_ptr<const PipelinePackage> pipeline_package)
-      : package(std::move(pipeline_package)) {}
-
-  std::shared_ptr<const PipelinePackage> package;
-  mutable std::mutex mutex;
+// Every mutable execution field a PipelineSession owns, in one copyable
+// bundle. PipelineSession::Impl derives from it and PipelineSessionSnapshot
+// stores one, so capturing, restoring, and forking move the whole bundle and
+// a field added here is carried by all three without further edits.
+struct SessionState {
   NamedTensors external_values;
   NamedTensors endpoint_values;
   NamedTensors state_values;
@@ -684,6 +681,32 @@ struct PipelineSession::Impl {
   mutable std::unordered_map<std::string, std::vector<std::int64_t>>
       position_cursors;
   std::mt19937_64 random_engine{0};
+
+  void Swap(SessionState& other) noexcept {
+    external_values.swap(other.external_values);
+    endpoint_values.swap(other.endpoint_values);
+    state_values.swap(other.state_values);
+    guidance_values.swap(other.guidance_values);
+    stage_iterations.swap(other.stage_iterations);
+    scheduler_histories.swap(other.scheduler_histories);
+    position_cursors.swap(other.position_cursors);
+    std::swap(random_engine, other.random_engine);
+  }
+};
+
+}  // namespace
+
+struct PipelineSessionSnapshot::Impl {
+  std::shared_ptr<const PipelinePackage> package;
+  SessionState state;
+};
+
+struct PipelineSession::Impl : SessionState {
+  explicit Impl(std::shared_ptr<const PipelinePackage> pipeline_package)
+      : package(std::move(pipeline_package)) {}
+
+  std::shared_ptr<const PipelinePackage> package;
+  mutable std::mutex mutex;
 
   [[nodiscard]] const PipelineManifest& manifest() const noexcept {
     return package->manifest();
@@ -3375,6 +3398,54 @@ void PipelineSession::Reset() {
   impl_->stage_iterations.clear();
   impl_->scheduler_histories.clear();
   impl_->position_cursors.clear();
+}
+
+PipelineSessionSnapshot::PipelineSessionSnapshot(
+    std::shared_ptr<const Impl> state)
+    : impl_(std::move(state)) {}
+
+bool PipelineSessionSnapshot::valid() const noexcept {
+  return impl_ != nullptr;
+}
+
+PipelineSessionSnapshot PipelineSession::Snapshot() const {
+  auto captured = std::make_shared<PipelineSessionSnapshot::Impl>();
+  {
+    std::scoped_lock lock(impl_->mutex);
+    captured->package = impl_->package;
+    // Copying the bundle copies Tensor values, which share their storage
+    // copy-on-write, so a device-backed tensor is never materialized here.
+    captured->state = static_cast<const SessionState&>(*impl_);
+  }
+  return PipelineSessionSnapshot(std::move(captured));
+}
+
+void PipelineSession::Restore(const PipelineSessionSnapshot& snapshot) {
+  if (!snapshot.valid()) {
+    throw Error(
+        ErrorCode::state,
+        "Pipeline session snapshot was moved from and holds no state");
+  }
+  const PipelineSessionSnapshot::Impl& captured = *snapshot.impl_;
+  // impl_->package is fixed when the session is constructed and is never
+  // reassigned, so identity can be checked before the session lock is taken.
+  if (captured.package != impl_->package) {
+    throw Error(
+        ErrorCode::state,
+        "Pipeline session snapshot belongs to a different pipeline package");
+  }
+  // Every allocation happens before the session lock is taken and the commit
+  // below only swaps, so a failure here leaves the session exactly as it was.
+  SessionState restored = captured.state;
+  std::scoped_lock lock(impl_->mutex);
+  impl_->Swap(restored);
+}
+
+PipelineSession PipelineSession::Fork() const {
+  const PipelineSessionSnapshot snapshot = Snapshot();
+  PipelineSession forked(snapshot.impl_->package);
+  forked.Restore(snapshot);
+  return forked;
 }
 
 }  // namespace onnx_world_model

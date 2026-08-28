@@ -58,6 +58,10 @@ C++ API ───────────────┤                  │
 - `PipelineSession` owns one request/trajectory's KV cache, diffusion latent,
   action state, outputs, and stage cursors, and preserves device-backed tensors
   across component connections, recurrent state, and public outputs.
+- `PipelineSession.snapshot()` captures all of that mutable state in memory,
+  and `restore()` and `fork()` rewind or branch a trajectory from it without
+  copying tensor data or leaving the process. Snapshots are not written to
+  disk and do not cross a process boundary.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in

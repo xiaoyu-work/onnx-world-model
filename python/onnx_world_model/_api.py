@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, and latent-dynamics APIs.
-# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it.
+# @agent-public-api: TensorSpec, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, StepResult, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -393,6 +393,21 @@ class Pipeline:
 WorldModelPipeline = Pipeline
 
 
+class PipelineSessionSnapshot:
+    """An immutable in-memory capture of one :class:`PipelineSession`'s state.
+
+    Only :meth:`PipelineSession.snapshot` produces one. The native snapshot
+    retains its originating package and rejects restore into an unrelated one.
+    """
+
+    def __init__(self, core: _native.PipelineSessionSnapshot) -> None:
+        self._core = core
+
+    @property
+    def valid(self) -> bool:
+        return bool(self._core.valid)
+
+
 class PipelineSession:
     """Mutable per-request and per-trajectory state for a :class:`Pipeline`."""
 
@@ -484,6 +499,18 @@ class PipelineSession:
 
     def reset(self) -> None:
         self._core.reset()
+
+    def snapshot(self) -> PipelineSessionSnapshot:
+        """Capture every mutable execution field of this session."""
+        return PipelineSessionSnapshot(self._core.snapshot())
+
+    def restore(self, snapshot: PipelineSessionSnapshot) -> None:
+        """Replace every mutable execution field with the captured one."""
+        self._core.restore(snapshot._core)
+
+    def fork(self) -> PipelineSession:
+        """Return an independent session started from a snapshot of this one."""
+        return PipelineSession(self._pipeline, self._core.fork())
 
 
 def _array_mapping(

@@ -76,10 +76,11 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 3 of 3 passing; `pytest` reports 63 passed
+Expected baseline: `ctest` reports 5 of 5 passing; `pytest` reports 70 passed
 and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
-`onnx_ir` package.
+`onnx_ir` package, which also gates the package fixture in
+`tests/python/test_pipeline_snapshot.py`.
 
 C++ changes require `cmake --build --preset dev` before `ctest`, and a
 `--reinstall-package` rebuild before `pytest`.

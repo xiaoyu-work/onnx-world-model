@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T08:29:46.720Z",
+  "generatedAt": "2026-08-28T10:27:39.050Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "3940bf4463b542ed5505509c0ec398f836da8ced58c7c462fed8129e6388d992",
+  "sourceFingerprint": "3d1eb0a66b42838798ad90574814afe7813a147a700ccc06b3c5539c6afe806e",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -45,6 +45,7 @@
         "WorldModel",
         "Pipeline",
         "PipelineSession",
+        "PipelineSessionSnapshot",
         "Rollout"
       ]
     },
@@ -96,7 +97,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, and the per-trajectory PipelineSession.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, the shareable Pipeline, the per-trajectory PipelineSession, and its in-memory PipelineSessionSnapshot.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -111,6 +112,7 @@
         "PipelinePackage",
         "PipelineRunOptions",
         "Pipeline",
+        "PipelineSessionSnapshot",
         "PipelineSession"
       ]
     },
@@ -160,6 +162,7 @@
         "PipelineInputSpec",
         "PipelineOutputSpec",
         "PipelineSession",
+        "PipelineSessionSnapshot",
         "PipelineStageSpec",
         "PreparedConditioning",
         "PreparedReasonerInputs",
@@ -206,6 +209,7 @@
         "Pipeline",
         "WorldModelPipeline",
         "PipelineSession",
+        "PipelineSessionSnapshot",
         "LatentDynamicsModel",
         "LegacyWorldModel",
         "Rollout"
@@ -398,7 +402,7 @@
     {
       "path": "src/pipeline_session.cpp",
       "kind": "source",
-      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling.",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, and fork operations.",
       "publicSymbols": [
         "Pipeline::manifest",
         "Pipeline::execution_providers",
@@ -409,7 +413,11 @@
         "PipelineSession::outputs",
         "PipelineSession::state",
         "PipelineSession::ReleaseStage",
-        "PipelineSession::Reset"
+        "PipelineSession::Reset",
+        "PipelineSession::Snapshot",
+        "PipelineSession::Restore",
+        "PipelineSession::Fork",
+        "PipelineSessionSnapshot::valid"
       ]
     },
     {
@@ -466,6 +474,14 @@
       ]
     },
     {
+      "path": "tests/cpp/pipeline_snapshot_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for the in-memory PipelineSession snapshot, restore, and fork contract: recurrent-state round trips, parent/child independence, package identity, device-buffer sharing, and random-engine determinism.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/pipeline_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for the pipeline layer: manifest parsing and rejection cases, stage execution, guidance, schedulers, and recurrent state, driven by in-process stub backends.",
@@ -514,6 +530,12 @@
       "path": "tests/python/test_pipeline.py",
       "kind": "test",
       "purpose": "Tests the Pipeline and PipelineSession wrappers: manifest contract exposure, provider selection, graph-optimization levels, single-stage runs, stage subsets, and unknown-input rejection.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_pipeline_snapshot.py",
+      "kind": "test",
+      "purpose": "Tests the PipelineSessionSnapshot wrapper and the PipelineSession snapshot, restore, and fork methods against a small counter package built with onnx_ir.",
       "publicSymbols": []
     },
     {

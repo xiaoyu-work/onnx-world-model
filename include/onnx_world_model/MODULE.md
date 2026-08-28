@@ -11,8 +11,9 @@ and the fixed latent-dynamics compatibility types.
 - Define every type, function, and enumeration that a C++ consumer or the
   pybind11 binding layer is allowed to use.
 - Keep implementation details out of the installed surface: `PipelineSession`
-  hides its state behind a private `Impl` pointer, and `Model` and `WorldModel`
-  hold abstract backend pointers rather than ONNX Runtime types.
+  and `PipelineSessionSnapshot` hide their state behind a private `Impl`
+  pointer, and `Model` and `WorldModel` hold abstract backend pointers rather
+  than ONNX Runtime types.
 - Stay free of ONNX Runtime and nlohmann/json includes so that consumers do not
   need those headers on their include path.
 
@@ -24,7 +25,7 @@ and the fixed latent-dynamics compatibility types.
 | `tensor.hpp` | `DataType`, canonical `TensorDevice` identities, the ORT-independent `TensorBuffer` contract, and the device-aware copy-on-write `Tensor`. |
 | `backend.hpp` | `TensorSpec`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
 | `model.hpp` | `RuntimeOptions`, device-output policy, provider discovery and library registration, `NamedTensors`, `ModelBackend`, and `Model`. |
-| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `PipelinePackage`, `Pipeline`, `PipelineSession`, `PipelineRunOptions`. |
+| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `PipelinePackage`, `Pipeline`, `PipelineSession`, `PipelineSessionSnapshot`, `PipelineRunOptions`. |
 | `world_model.hpp` | `WorldModel` and `Rollout`, the fixed three-input/four-output latent-dynamics API. |
 | `onnx_world_model.hpp` | Umbrella header that includes all of the above. |
 
@@ -55,6 +56,6 @@ ctest --preset dev
 ```
 
 `tests/cpp/tensor_test.cpp` covers `tensor.hpp`, `tests/cpp/model_test.cpp`
-covers `model.hpp` and `backend.hpp`, and `tests/cpp/pipeline_test.cpp` covers
-`pipeline.hpp`. `tests/python/` reaches the same declarations through the
-`_native` extension module.
+covers `model.hpp` and `backend.hpp`, and `tests/cpp/pipeline_test.cpp` and
+`tests/cpp/pipeline_snapshot_test.cpp` cover `pipeline.hpp`. `tests/python/`
+reaches the same declarations through the `_native` extension module.

@@ -16,6 +16,10 @@ Runtime library and no real ONNX model.
   the producer's `TensorBuffer` and which materialize it, using a
   non-host-accessible stub buffer with a shared CPU-copy counter.
   This is a separate executable from the manifest and stage-execution tests.
+- Cover the in-memory `PipelineSessionSnapshot` contract: recurrent-state
+  round trips, parent and child independence after a fork, package identity,
+  device-buffer sharing without materialization, and random-engine
+  determinism. This is also a separate executable.
 
 ## Key Files
 
@@ -25,6 +29,7 @@ Runtime library and no real ONNX model.
 | `model_test.cpp` | `model_test` | `Model` input and output validation through the `AddOneBackend` stub. |
 | `pipeline_test.cpp` | `pipeline_test` | Manifest parsing and rejection, stage execution, guidance, schedulers, state lifecycle. |
 | `pipeline_device_test.cpp` | `pipeline_device_test` | Device-tensor preservation across `PipelineSession`: rank adaptation, transform-free connections, reshape, public outputs, and CPU-transform materialization. |
+| `pipeline_snapshot_test.cpp` | `pipeline_snapshot_test` | `PipelineSession::Snapshot`, `Restore`, and `Fork`: state round trips, fork independence, package identity rejection, zero-copy device sharing, and random-engine determinism. |
 
 Each file is a self-contained `main()` with local `Check` and `CheckThrows`
 helpers (and `CheckThrowsMessage` where a message is asserted), a file-local
@@ -41,12 +46,14 @@ third-party test framework; a new test is a new check inside an existing
   `onnx_world_model::ModelBackend` defined inside each test file, plus
   `FakeDeviceBuffer`, a stub `onnx_world_model::TensorBuffer` in
   `pipeline_device_test.cpp` that reports a non-CPU device, refuses host
-  access, and counts each `CopyToCpu`.
+  access, and counts each `CopyToCpu`; `pipeline_snapshot_test.cpp` has its own
+  `CountingDeviceBuffer` with the same shape.
 - `pipeline_test.cpp` writes temporary package and scheduler directories under
   the filesystem temporary directory, and optionally accepts a real package
   directory and ORT library path as `argv[1]` and `argv[2]`.
-- `pipeline_device_test.cpp` takes no arguments and touches no filesystem: it
-  builds each `PipelinePackage` in memory from an embedded manifest string.
+- `pipeline_device_test.cpp` and `pipeline_snapshot_test.cpp` take no arguments
+  and touch no filesystem: they build each `PipelinePackage` in memory from an
+  embedded manifest string.
 
 ## Tests
 
