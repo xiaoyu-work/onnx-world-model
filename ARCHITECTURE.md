@@ -60,8 +60,9 @@ Within `src/` the runtime is layered:
 
 - `dynamic_library` loads the ORT shared library and binds `OrtApi` once per
   process.
-- `ort_backend` is the only other translation unit that touches ORT; it builds
-  sessions and marshals tensors.
+- `ort_backend` is the only other translation unit that touches ORT; it owns
+  the process-wide ORT environment, builds component sessions, and marshals
+  tensors.
 - `model` validates named tensors against graph signatures.
 - `pipeline` parses `pipeline.json`; `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
@@ -174,6 +175,9 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   a given seed reproduces a generation.
 - **Run-time ORT binding.** ORT is initialized once per process from a single
   library path; a second, different path is an error.
+- **Shared ORT environment.** Every component session uses one process-wide
+  `Ort::Env`. Thread counts, logging severity, graph optimization, and
+  execution providers remain session-specific.
 - **Compatibility aliases.** `WorldModelPipeline` and `LegacyWorldModel` must
   keep pointing at `Pipeline` and `LatentDynamicsModel`.
 

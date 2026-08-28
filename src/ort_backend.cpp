@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Implements the ONNX Runtime ModelBackend: it creates sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.
+ * @agent-purpose: Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, reads graph signatures into ModelMetadata, and marshals Tensor values in and out of Ort::Value.
  * @agent-public-api: CreateOrtBackend, GetAvailableOrtProviders
- * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before any session is created. Requested execution providers are matched by NormalizeExecutionProviderName, and a provider the loaded ORT build does not offer is an error rather than a silent CPU fallback. DataType and ONNXTensorElementDataType map one-to-one; an unmapped ONNX element type throws ErrorCode::model_contract.
+ * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options, including log severity and execution providers. Requested execution providers are matched by NormalizeExecutionProviderName, and a provider the loaded ORT build does not offer is an error rather than a silent CPU fallback. DataType and ONNXTensorElementDataType map one-to-one; an unmapped ONNX element type throws ErrorCode::model_contract.
  * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions, and runs inference.
  */
 
@@ -411,13 +411,17 @@ void AppendProvider(
   }
 }
 
+Ort::Env& SharedOrtEnvironment() {
+  static Ort::Env environment(
+      ORT_LOGGING_LEVEL_WARNING,
+      "onnx-world-model");
+  return environment;
+}
+
 class OrtBackend final : public ModelBackend {
  public:
   OrtBackend(const std::filesystem::path& model_path, const RuntimeOptions& options)
-      : env_(
-            static_cast<OrtLoggingLevel>(options.log_severity),
-            "onnx-world-model"),
-        memory_info_(Ort::MemoryInfo::CreateCpu(
+      : memory_info_(Ort::MemoryInfo::CreateCpu(
             OrtArenaAllocator,
             OrtMemTypeDefault)) {
     if (options.intra_op_threads < 0 || options.inter_op_threads < 0) {
@@ -431,6 +435,7 @@ class OrtBackend final : public ModelBackend {
     if (options.inter_op_threads > 0) {
       session_options_.SetInterOpNumThreads(options.inter_op_threads);
     }
+    session_options_.SetLogSeverityLevel(options.log_severity);
     session_options_.SetGraphOptimizationLevel(
         ToOrtGraphOptimizationLevel(options.graph_optimization));
     const auto providers = ResolveProviders(options);
@@ -444,7 +449,10 @@ class OrtBackend final : public ModelBackend {
       session_options_.AddConfigEntry(
           "session.disable_cpu_ep_fallback", "1");
     }
-    session_ = Ort::Session(env_, model_path.c_str(), session_options_);
+    session_ = Ort::Session(
+        SharedOrtEnvironment(),
+        model_path.c_str(),
+        session_options_);
 
     Ort::AllocatorWithDefaultOptions allocator;
     metadata_.inputs.reserve(session_.GetInputCount());
@@ -506,7 +514,6 @@ class OrtBackend final : public ModelBackend {
   }
 
  private:
-  Ort::Env env_;
   Ort::SessionOptions session_options_;
   mutable Ort::Session session_{nullptr};
   Ort::MemoryInfo memory_info_;
