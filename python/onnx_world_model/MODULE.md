@@ -24,6 +24,14 @@ expects.
   `PipelineTransferPlan` as the frozen, inspection-only `Pipeline.transfer_plan`.
   `OnnxModel` and `LatentDynamicsModel` do not accept them, because they are
   single graphs rather than pipelines.
+- Expose the pipeline-only precision report as the immutable
+  `Pipeline.precision_report` tuple of frozen `ComponentPrecisionReport`
+  values, forwarded read-only by `WorldModel.precision_report`. Each entry
+  keeps the exporter's `declared_parameter_dtype` beside the loaded graph's
+  real port dtypes, the component's state ports, and the providers ONNX
+  Runtime selected. The `declared_` prefix is deliberate: that field is an
+  unverified producer claim, it is never compared with a port dtype, and no
+  field in the report says whether a component's weights are quantized.
 - Prepare model inputs from package configuration: chat templates, tokenizers,
   image and video patch packing, latent-token layout, and conditioning frames.
 - Offer the modality-oriented `WorldModel` API (`text`, `image`, `video`,
@@ -68,10 +76,10 @@ expects.
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, the `DeviceSpec`, `ComponentPlacementSpec`, `PipelineTransfer`, and `PipelineTransferPlan` placement values, device-output options, `OnnxModel` with its per-call `profile_prefix`, `Pipeline` with its admission-scheduling limits, its frozen `PipelineSchedulingStats` reading, its opt-in `enable_telemetry` with the frozen `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, `PipelineTraceRecord`, and `PipelineTelemetrySnapshot` reading and `reset_telemetry`, its `telemetry_trace_directory` and `max_trace_records` tracing options, its load-time `component_placement`, and its frozen `transfer_plan`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, the `DeviceSpec`, `ComponentPlacementSpec`, `PipelineTransfer`, and `PipelineTransferPlan` placement values, device-output options, `OnnxModel` with its per-call `profile_prefix`, `Pipeline` with its admission-scheduling limits, its frozen `PipelineSchedulingStats` reading, its opt-in `enable_telemetry` with the frozen `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, `PipelineTraceRecord`, and `PipelineTelemetrySnapshot` reading and `reset_telemetry`, its `telemetry_trace_directory` and `max_trace_records` tracing options, its load-time `component_placement`, its frozen `transfer_plan`, its frozen `PrecisionPort` and `ComponentPrecisionReport` values with the immutable `precision_report`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
-| `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
+| `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses, and the read-only `precision_report` pass-through. |
 
 `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases for
 `Pipeline` and `LatentDynamicsModel`. The modality `generate()` methods in
@@ -127,6 +135,10 @@ counts one single-threaded run produces, and `reset_telemetry`,
 `telemetry_trace_directory` and `max_trace_records` arguments, the frozen
 `PipelineTraceRecord` values a traced run publishes against real ONNX Runtime
 trace files, the retention cap, and the configuration errors,
+`tests/python/test_precision.py` covers the immutable
+`Pipeline.precision_report`, its frozen `PrecisionPort` and
+`ComponentPrecisionReport` values, the separation between the declared
+parameter dtype and the real port dtypes, and the `WorldModel` pass-through,
 `tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
 and `tests/python/test_guided_generation.py` and
 `tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that

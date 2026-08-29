@@ -47,7 +47,7 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `ModelRunOptions`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineTelemetryOptions`, `PipelineCallOutcome`, `PipelineTraceRecord`, `PipelineTelemetrySnapshot`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `ModelRunOptions`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineTelemetryOptions`, `PipelineCallOutcome`, `PipelineTraceRecord`, `PipelineTelemetrySnapshot`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PrecisionPort`, `ComponentPrecisionReport`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
 | Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, component placement and connection transfer planning, admission scheduling, opt-in telemetry collection and per-run trace recording, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
@@ -76,8 +76,10 @@ Within `src/` the runtime is layered:
 - `model` validates named tensors against graph signatures and collapses its
   three `Run` overloads onto one `ModelRunOptions` implementation.
 - `pipeline` parses `pipeline.json`, resolves and validates per-component
-  placement over the pipeline-wide `RuntimeOptions`, and classifies every
-  connection into the package's conservative `PipelineTransferPlan`;
+  placement over the pipeline-wide `RuntimeOptions`, classifies every
+  connection into the package's conservative `PipelineTransferPlan`, and
+  assembles the on-demand `ComponentPrecisionReport` list from the manifest and
+  the loaded session metadata;
   `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
   share.
@@ -418,7 +420,9 @@ Python:
   arguments that cap concurrent executions, the keyword-only
   `component_placement` and `allow_unpreferred_providers` constructor
   arguments that place each component's session, the read-only
-  `transfer_plan` those produce, and the keyword-only `enable_telemetry`,
+  `transfer_plan` those produce, the read-only `precision_report` that states
+  what the runtime can honestly observe about each component's precision, and
+  the keyword-only `enable_telemetry`,
   `telemetry_trace_directory`, and `max_trace_records` constructor arguments
   with the read-only `telemetry_snapshot` and `reset_telemetry()` that report
   and restart the runtime counters and this epoch's trace records.
@@ -446,7 +450,9 @@ C++:
   `Pipeline::Load` and `PipelinePackage::Load` take an optional
   `PipelinePlacementOptions` that places each component's session;
   `Pipeline::transfer_plan` and `PipelinePackage::transfer_plan` read the
-  resulting connection classification. `Pipeline`'s constructor and `Load`
+  resulting connection classification, and `Pipeline::precision_report` and
+  `PipelinePackage::precision_report` return the inspection-only, on-demand
+  `std::vector<ComponentPrecisionReport>`. `Pipeline`'s constructor and `Load`
   also take an optional `PipelineTelemetryOptions` that turns runtime
   measurement on, adds per-run ONNX Runtime node traces when its
   `trace_directory` is set, and bounds the kept records with
@@ -572,6 +578,28 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   to the host, and the plan is deliberately not rewritten to say so. Nothing
   executes from the plan. Warm-up, lazy loading, offload and eviction, and
   peer-to-peer transfers are explicitly out of scope.
+- **Precision is reported, never inferred and never enforced.** The precision
+  report is inspection only: it copies the manifest's declared
+  `parameter_dtype` verbatim, lists each loaded session's real port dtypes and
+  registered provider order, and names the state ports each component
+  carries. It adds no validation — the authoritative checks stay the
+  manifest-versus-live-graph port check and the connection and recurrent-state
+  type checks — and it introduces no precision policy. The declared parameter
+  type is *never* compared with a port type, because parameters are weight
+  storage while ports carry activations and control tensors, and it is never
+  restricted to a floating type, because `int8` is how a quantized-weight claim
+  is spelled today. Above all, the report cannot say whether a component is
+  quantized: this runtime reaches ONNX Runtime only through the `Session`
+  public API, which exposes graph inputs and outputs and not ordinary
+  initializers or nodes, and the current Mobius checkout emits no quantization
+  provenance in `pipeline.json`. Detecting MatMulNBits, QDQ, QLinear, or a
+  vendor format would require an ONNX parser here or an ORT graph or compile
+  API; declaring an INT4, UINT4, FP8, or FP4 parameter type would first require
+  the exporter to emit that vocabulary. Any future validation is an exporter
+  change first — a per-component `weight_quantization` record and a
+  `kv_cache_dtype` — and a runtime change second; numeric parity of a quantized
+  component stays in Mobius golden tests, and runtime CI validates package,
+  port, and provider execution rather than inventing tolerances.
 - **Value semantics.** `Tensor` copies are cheap and copy-on-write, so a shared
   CPU buffer is cloned before mutation. Device buffers expose immutable
   storage and an explicit synchronous CPU-copy operation.

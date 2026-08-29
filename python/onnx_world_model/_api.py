@@ -1,7 +1,7 @@
 # @agent-file
-# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, incremental stage run, cancellation, and latent-dynamics APIs.
-# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineCallOutcome, PipelineTraceRecord, PipelineTelemetrySnapshot, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `enable_telemetry` is opt-in observability of the same shape: it is forwarded unchanged to the native constructor, which rejects anything that is not a real bool, and `telemetry_snapshot` freezes one native dictionary into a `PipelineTelemetrySnapshot` of frozen component, stage, admission, and transfer values whose three mappings are read-only views. A disabled pipeline reads as `enabled=False`, epoch `0`, and empty mappings rather than raising; an enabled one always carries every manifest component, every manifest stage, and all six stage kinds. The reading is detached but deliberately not one atomic instant, `reset_telemetry` starts a new epoch rather than editing counters in place, and telemetry changes what is measured and never what is executed. `Pipeline`'s `telemetry_trace_directory` and `max_trace_records` are the per-run ONNX Runtime tracing layer on top of that: the directory is forwarded as a string and C++ owns every semantic rule -- a trace directory without `enable_telemetry` raises `WorldModelError`, and the directory is created and checked while the package loads rather than on the first run -- while `max_trace_records` is checked in the binding as a non-bool int greater than zero. `telemetry_trace_directory` and `max_trace_records` are read-only echoes of what was accepted, `PipelineTraceRecord` is frozen with a usable path as a `pathlib.Path`, a failed trace path as `None`, and its outcome as one of the four `PipelineCallOutcome` strings; `PipelineTelemetrySnapshot.traces` is a tuple in completion order whose process-wide `trace_id` recovers start order. Tracing is per call and never per session, a dropped record still has its file on disk, `reset_telemetry` clears records and deletes nothing, and a failed trace never changes the outcome of the call it belonged to. `OnnxModel.run` takes the same profiling as `profile_prefix` and still returns only the outputs. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
+# @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, the honest per-component precision report, incremental stage run, cancellation, and latent-dynamics APIs.
+# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, PrecisionPort, ComponentPrecisionReport, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineCallOutcome, PipelineTraceRecord, PipelineTelemetrySnapshot, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `enable_telemetry` is opt-in observability of the same shape: it is forwarded unchanged to the native constructor, which rejects anything that is not a real bool, and `telemetry_snapshot` freezes one native dictionary into a `PipelineTelemetrySnapshot` of frozen component, stage, admission, and transfer values whose three mappings are read-only views. A disabled pipeline reads as `enabled=False`, epoch `0`, and empty mappings rather than raising; an enabled one always carries every manifest component, every manifest stage, and all six stage kinds. The reading is detached but deliberately not one atomic instant, `reset_telemetry` starts a new epoch rather than editing counters in place, and telemetry changes what is measured and never what is executed. `Pipeline`'s `telemetry_trace_directory` and `max_trace_records` are the per-run ONNX Runtime tracing layer on top of that: the directory is forwarded as a string and C++ owns every semantic rule -- a trace directory without `enable_telemetry` raises `WorldModelError`, and the directory is created and checked while the package loads rather than on the first run -- while `max_trace_records` is checked in the binding as a non-bool int greater than zero. `telemetry_trace_directory` and `max_trace_records` are read-only echoes of what was accepted, `PipelineTraceRecord` is frozen with a usable path as a `pathlib.Path`, a failed trace path as `None`, and its outcome as one of the four `PipelineCallOutcome` strings; `PipelineTelemetrySnapshot.traces` is a tuple in completion order whose process-wide `trace_id` recovers start order. Tracing is per call and never per session, a dropped record still has its file on disk, `reset_telemetry` clears records and deletes nothing, and a failed trace never changes the outcome of the call it belonged to. `OnnxModel.run` takes the same profiling as `profile_prefix` and still returns only the outputs. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. `Pipeline.precision_report` is a second inspection read of the same shape: it freezes one native list into a tuple of frozen `ComponentPrecisionReport` values, one per manifest component in manifest order, and is captured once because the manifest and the loaded sessions never change. It is honest by construction and enforces nothing: `declared_parameter_dtype` is the manifest's `parameter_dtype` copied verbatim and never verified against weights, never restricted to a floating type, and never compared with a port dtype, because parameters are weight storage while ports carry activations and control tensors; the graph ports and providers are the loaded session's own; and no field says whether MatMulNBits, QDQ, QLinear, or vendor quantization is present, because the ONNX Runtime session API cannot see ordinary initializers or nodes. `WorldModel.precision_report` is a read-only pass-through to it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -120,6 +120,73 @@ class PipelineTransferPlan:
 
     transfers: tuple[PipelineTransfer, ...]
     device_outputs_enabled: bool
+
+
+@dataclass(frozen=True)
+class PrecisionPort:
+    """One graph port and the element type ONNX Runtime reports for it.
+
+    ``dtype`` is the type of the tensor that crosses the port -- an
+    activation, a token sequence, a mask, a timestep -- and never the type the
+    weights behind that port are stored in.
+    """
+
+    name: str
+    dtype: str
+
+
+@dataclass(frozen=True)
+class ComponentPrecisionReport:
+    """What the runtime can honestly say about one component's precision.
+
+    Every field is either copied verbatim from the manifest and labelled as
+    declared, or read from the loaded ONNX Runtime session. Nothing here is
+    inferred from one to check the other, and in particular:
+
+    * ``declared_parameter_dtype`` is the *producer's own claim* about
+      parameter storage, copied from the manifest's ``parameter_dtype``. It is
+      never verified against the weights: no file is parsed and no initializer
+      is read. The name carries ``declared_`` so it cannot be mistaken for a
+      measured weight type.
+    * This report **cannot tell whether the graph is quantized**. MatMulNBits,
+      a QDQ pair, QLinear operators, a vendor-specific blocked format, or
+      plain float weights all produce exactly the same report, because the
+      ONNX Runtime ``Session`` public API this runtime uses exposes graph
+      inputs and outputs only -- not ordinary initializers and not nodes.
+    * The declared parameter type is never compared with a port type.
+      Parameters are weight storage; ports carry activations and control
+      tensors. A component may legitimately declare ``"int8"`` parameters
+      while exposing ``"float32"`` activations and ``"int64"`` token inputs,
+      and that is not a finding.
+
+    What it does establish: the port names and types are the loaded graph's
+    own metadata, which the manifest signature check already matched against
+    the manifest's declared ports. ``execution_providers`` is the order
+    registered on the session, not a claim about which provider owns each
+    graph node.
+    """
+
+    component: str
+    #: The manifest's ``parameter_dtype`` for this component, or ``None`` when
+    #: it declared none. Producer-declared and unverified. A manifest with an
+    #: executable profile must declare one; a profile-less manifest need not.
+    #: An integer declaration such as ``"int8"`` is a normal quantized-weight
+    #: claim and is never rejected for not being a floating type.
+    declared_parameter_dtype: str | None
+    #: Every graph input of the loaded session, in graph order.
+    graph_inputs: tuple[PrecisionPort, ...]
+    #: Every graph output of the loaded session, in graph order.
+    graph_outputs: tuple[PrecisionPort, ...]
+    #: This component's input ports that a manifest state writes into, named
+    #: ``component.port`` and listed in manifest state order without repeats.
+    state_inputs: tuple[PrecisionPort, ...]
+    #: This component's output ports a manifest state reads from, named and
+    #: ordered the same way.
+    state_outputs: tuple[PrecisionPort, ...]
+    #: Providers registered on the session after availability filtering, most
+    #: preferred first. A provider may claim no nodes; a custom backend that
+    #: reports none leaves this empty.
+    execution_providers: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -317,8 +384,8 @@ class PipelineTraceRecord:
     """
 
     epoch: int
-    #: Monotonic across epochs, so ordering by it is start order while the
-    #: ``traces`` tuple itself is completion order.
+    #: Process-wide and monotonic, so sorting records by it recovers call
+    #: start order.
     trace_id: int
     component: str
     path: Path | None
@@ -350,11 +417,11 @@ class PipelineTelemetrySnapshot:
 
     ``traces`` is empty unless the pipeline was given a
     ``telemetry_trace_directory``. It holds this epoch's kept
-    :class:`PipelineTraceRecord` values in the order their calls finished,
-    capped at ``max_trace_records``; ``dropped_traces`` counts records past
-    that cap, whose files were still written but are not scanned, and
-    ``failed_traces`` counts kept records whose trace file could not be
-    identified.
+    :class:`PipelineTraceRecord` values in unspecified order under concurrent
+    discovery, capped at ``max_trace_records``; sort by ``trace_id`` for start
+    order. ``dropped_traces`` counts calls past that cap, whose files were
+    still written but are not scanned, and ``failed_traces`` counts kept
+    records whose trace file could not be identified.
     """
 
     enabled: bool
@@ -573,6 +640,31 @@ def _transfer_plan(payload: Mapping[str, Any]) -> PipelineTransferPlan:
             for entry in payload["transfers"]
         ),
         device_outputs_enabled=bool(payload["device_outputs_enabled"]),
+    )
+
+
+def _precision_report(
+    payload: Sequence[Mapping[str, Any]],
+) -> tuple[ComponentPrecisionReport, ...]:
+    """Freezes the native precision report into its typed, immutable value."""
+
+    def ports(entries: Sequence[Mapping[str, Any]]) -> tuple[PrecisionPort, ...]:
+        return tuple(
+            PrecisionPort(name=entry["name"], dtype=entry["dtype"])
+            for entry in entries
+        )
+
+    return tuple(
+        ComponentPrecisionReport(
+            component=entry["component"],
+            declared_parameter_dtype=entry["declared_parameter_dtype"],
+            graph_inputs=ports(entry["graph_inputs"]),
+            graph_outputs=ports(entry["graph_outputs"]),
+            state_inputs=ports(entry["state_inputs"]),
+            state_outputs=ports(entry["state_outputs"]),
+            execution_providers=tuple(entry["execution_providers"]),
+        )
+        for entry in payload
     )
 
 
@@ -1049,6 +1141,10 @@ class Pipeline:
         self._telemetry_trace_directory = trace_directory
         self._max_trace_records = max_trace_records
         self._transfer_plan = _transfer_plan(self._core.transfer_plan)
+        # Frozen once, for the same reason the transfer plan is: the package's
+        # manifest and its loaded sessions never change afterwards, so every
+        # read may return the very same immutable tuple.
+        self._precision_report = _precision_report(self._core.precision_report)
         self._manifest: dict[str, Any] = self._document["manifest"]
         components = {
             component["name"]: component for component in self._manifest["components"]
@@ -1145,6 +1241,26 @@ class Pipeline:
         and always returns the same immutable value.
         """
         return self._transfer_plan
+
+    @property
+    def precision_report(self) -> tuple[ComponentPrecisionReport, ...]:
+        """What this package honestly reports about each component's precision.
+
+        One frozen :class:`ComponentPrecisionReport` per manifest component, in
+        manifest order. Inspection only: it enforces nothing, and the
+        authoritative precision checks stay where they already are -- manifest
+        port types are validated against the live graph while the package
+        loads, and connection and recurrent-state types are validated by the
+        manifest checks.
+
+        Read :class:`ComponentPrecisionReport` before using it.
+        ``declared_parameter_dtype`` is an unverified producer claim, and
+        **nothing here says whether a component's weights are quantized**: the
+        ONNX Runtime session API this runtime uses cannot see ordinary
+        initializers or nodes, so MatMulNBits, QDQ, QLinear, and plain float
+        weights are indistinguishable from the outside.
+        """
+        return self._precision_report
 
     @property
     def max_concurrent_by_stage_kind(self) -> Mapping[str, int]:

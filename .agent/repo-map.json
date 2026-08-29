@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-29T02:18:29.635Z",
+  "generatedAt": "2026-08-29T03:31:38.835Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "985d3b28d8605779c5607aa7cc350abd672c61c8755a70ba9c431f7d372a57a4",
+  "sourceFingerprint": "2ac15a8c335a8cfdb56afbb676c90072c490cf45e219537c268e1f70d43093f6",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -113,7 +113,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options -- counters and optional per-run ONNX Runtime node traces -- and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, device-boundary, and trace records, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options -- counters and optional per-run ONNX Runtime node traces -- and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, device-boundary, and trace records, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, the incremental StageRun that reports each step of a stage as a StageEvent, and the honest per-component precision report a package can be asked for.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -130,6 +130,8 @@
         "PipelineTransferKind",
         "PipelineTransfer",
         "PipelineTransferPlan",
+        "PrecisionPort",
+        "ComponentPrecisionReport",
         "PipelinePackage",
         "PipelineRunOptions",
         "PipelineSchedulingOptions",
@@ -184,6 +186,7 @@
         "CancellationToken",
         "CancelledError",
         "ComponentPlacementSpec",
+        "ComponentPrecisionReport",
         "ConditioningFramePreprocessor",
         "DeadlineExceededError",
         "DeviceSpec",
@@ -213,6 +216,7 @@
         "PipelineTransfer",
         "PipelineTransferPlan",
         "PipelineTransferStats",
+        "PrecisionPort",
         "PreparedConditioning",
         "PreparedReasonerInputs",
         "PreparedVideo",
@@ -243,7 +247,7 @@
     {
       "path": "python/onnx_world_model/_api.py",
       "kind": "source",
-      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, incremental stage run, cancellation, and latent-dynamics APIs.",
+      "purpose": "Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, the honest per-component precision report, incremental stage run, cancellation, and latent-dynamics APIs.",
       "publicSymbols": [
         "DeviceSpec",
         "TensorSpec",
@@ -251,6 +255,8 @@
         "TransferKind",
         "PipelineTransfer",
         "PipelineTransferPlan",
+        "PrecisionPort",
+        "ComponentPrecisionReport",
         "ModelMetadata",
         "PipelineInputSpec",
         "PipelineOutputSpec",
@@ -438,7 +444,7 @@
     {
       "path": "src/pipeline.cpp",
       "kind": "source",
-      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, applies per-component placement overrides, opens their ONNX sessions as a PipelinePackage, and classifies every manifest connection into that package's transfer plan.",
+      "purpose": "Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, applies per-component placement overrides, opens their ONNX sessions as a PipelinePackage, classifies every manifest connection into that package's transfer plan, and assembles the on-demand per-component precision report.",
       "publicSymbols": [
         "Endpoint::Parse",
         "Endpoint::qualified",
@@ -452,7 +458,8 @@
         "PipelinePackage::PipelinePackage",
         "PipelinePackage::Load",
         "PipelinePackage accessors",
-        "PipelinePackage::transfer_plan"
+        "PipelinePackage::transfer_plan",
+        "PipelinePackage::precision_report"
       ]
     },
     {
@@ -550,6 +557,7 @@
         "Pipeline::manifest",
         "Pipeline::execution_providers",
         "Pipeline::transfer_plan",
+        "Pipeline::precision_report",
         "Pipeline::CreateSession",
         "Pipeline::scheduling_stats",
         "Pipeline::telemetry_snapshot",
@@ -712,6 +720,14 @@
       ]
     },
     {
+      "path": "tests/cpp/pipeline_precision_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for the per-component precision report a PipelinePackage and a Pipeline answer with, covering manifest order, the declared parameter dtype it copies without checking, the live graph ports it lists, the state ports it associates, the providers it reports, and the detachment of every reading.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/pipeline_scheduler_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for shared stage-aware admission scheduling: the unlimited default, a global ceiling, a per-stage-kind ceiling that never blocks a different kind, cancellation and deadlines while queued -- including a queued StageRun::Step or StageRun::Finish that must still close its handle and release its session's active-run slot -- permit recovery after a backend failure, which calls are executions and which are not, whether two Pipeline values share or separate their ceiling, and the PipelineSchedulingStats reading that every queue assertion here synchronizes on.",
@@ -824,6 +840,12 @@
       "path": "tests/python/test_placement.py",
       "kind": "test",
       "purpose": "Tests the keyword-only component_placement and allow_unpreferred_providers arguments on Pipeline and WorldModel, the DeviceSpec a CPU port reports through ModelMetadata, and the frozen PipelineTransferPlan a loaded package exposes.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_precision.py",
+      "kind": "test",
+      "purpose": "Tests the Pipeline.precision_report property and its frozen PrecisionPort and ComponentPrecisionReport dataclasses against a package built in-process with onnx_ir, plus the read-only WorldModel pass-through.",
       "publicSymbols": []
     },
     {

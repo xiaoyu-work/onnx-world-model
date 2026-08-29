@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Defines the pybind11 `_native` extension module that exposes the C++ runtime to Python and converts between NumPy arrays and onnx_world_model::Tensor.
  * @agent-public-api: _native module, WorldModelError, CancelledError, DeadlineExceededError, CancellationToken, CancellationSource, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, Model, WorldModel, Pipeline, PipelineSession, PipelineSessionSnapshot, StageRun, Rollout
- * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call, every session or run method that takes the session lock -- run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, request_cancellation, done, and iteration -- and CancellationToken.wait and CancellationSource.wait, which block until another thread or the shared deadline watchdog claims a reason and would otherwise deadlock the interpreter. A C++ Error is translated by one custom translator that maps ErrorCode::cancelled to CancelledError and ErrorCode::deadline_exceeded to DeadlineExceededError, and every other code to their common base WorldModelError, so the code rather than the message decides the Python type and existing WorldModelError handlers still catch everything. A cancellation token crosses as its own argument rather than through the scalar options dictionary, because a token is not a bool, int, float, or str. Pipeline's two admission-scheduling arguments are converted while the GIL is held and are checked here only for shape -- a count must be a non-bool int that is not negative and a per-kind key must be a string -- while the stage-kind names themselves are validated in C++, so there is one list of legal kinds rather than two that can drift. Its component_placement argument is split the same way: this file checks that component and provider keys are strings, that a provider list is a sequence that is not itself a string, that option values are the same str, bool, int, or float the pipeline-wide provider_options accepts, and that a thread count is a non-bool, non-negative int, while C++ owns every semantic question -- whether the component exists, whether a provider repeats, and whether a component runs where its options claim. A tensor spec's device crosses as None or a {type, id} dictionary, and one transfer plan crosses as a plain dictionary of plain dictionaries, so the frozen DeviceSpec, PipelineTransfer, and PipelineTransferPlan values live in Python; reading the plan takes no lock because it was computed while the package loaded. PipelineSessionSnapshot, StageRun, and CancellationToken are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot(), PipelineSession.begin_stage(), and CancellationSource.token(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync, and one reading of the admission scheduler crosses the same way, so the frozen PipelineSchedulingStats also lives in Python; that read releases the GIL because it takes the scheduler mutex, and it returns a detached copy rather than a live view. One telemetry reading crosses as the same kind of plain nested dictionary, so the six frozen telemetry values live in Python too; that read and reset_telemetry both release the GIL, and the reading is a detached copy rather than a live view. Pipeline's enable_telemetry argument is a switch rather than a count, so it is checked here for shape exactly as strictly -- it must be a real bool, because `1` quietly meaning "on" would be worse than failing -- while every semantic question about what is collected stays in C++. Its two tracing arguments are split the same way: max_trace_records is checked here as a non-bool int greater than zero, because a cap of zero would write every file and keep no record, while telemetry_trace_directory crosses as a plain string and C++ owns every question about it -- whether tracing may be configured without telemetry and whether the path can be created and used. A trace record crosses inside that reading as a plain dictionary whose outcome is a string and whose path is a string, so the frozen PipelineTraceRecord and the choice to present a path as pathlib.Path both stay in Python. Model.run takes its profile prefix as a plain string for the same reason, and an empty one means no profiling, which keeps the historical call unchanged.
+ * @agent-invariants: NumPy dtype names map one-to-one onto DataType; float16 and bfloat16 cross the boundary as raw 2-byte views. Every wrapper forwards the device_outputs policy unchanged. NumPy conversion explicitly materializes device buffers to CPU while the GIL is released. The GIL is released around every call that can block, which is every blocking ONNX Runtime or provider-library call, every session or run method that takes the session lock -- run_stage, step_stage, begin_stage, outputs, state, release_stage, reset, snapshot, restore, fork, the named-checkpoint methods, and StageRun.step, finish, cancel, request_cancellation, done, and iteration -- and CancellationToken.wait and CancellationSource.wait, which block until another thread or the shared deadline watchdog claims a reason and would otherwise deadlock the interpreter. A C++ Error is translated by one custom translator that maps ErrorCode::cancelled to CancelledError and ErrorCode::deadline_exceeded to DeadlineExceededError, and every other code to their common base WorldModelError, so the code rather than the message decides the Python type and existing WorldModelError handlers still catch everything. A cancellation token crosses as its own argument rather than through the scalar options dictionary, because a token is not a bool, int, float, or str. Pipeline's two admission-scheduling arguments are converted while the GIL is held and are checked here only for shape -- a count must be a non-bool int that is not negative and a per-kind key must be a string -- while the stage-kind names themselves are validated in C++, so there is one list of legal kinds rather than two that can drift. Its component_placement argument is split the same way: this file checks that component and provider keys are strings, that a provider list is a sequence that is not itself a string, that option values are the same str, bool, int, or float the pipeline-wide provider_options accepts, and that a thread count is a non-bool, non-negative int, while C++ owns every semantic question -- whether the component exists, whether a provider repeats, and whether a component runs where its options claim. A tensor spec's device crosses as None or a {type, id} dictionary, and one transfer plan crosses as a plain dictionary of plain dictionaries, so the frozen DeviceSpec, PipelineTransfer, and PipelineTransferPlan values live in Python; reading the plan takes no lock because it was computed while the package loaded. The precision report crosses the same way, as a plain list of plain dictionaries whose dtypes are the same lowercase strings a tensor spec uses, so the frozen PrecisionPort and ComponentPrecisionReport values live in Python too; the declared parameter type keeps `declared_` in its key across the boundary and is passed through unchecked, because it is the producer's claim about weight storage and this binding neither verifies it nor relates it to a port type. PipelineSessionSnapshot, StageRun, and CancellationToken are exposed as opaque handles with no Python constructor, so they can only come from PipelineSession.snapshot(), PipelineSession.begin_stage(), and CancellationSource.token(); named checkpoints cross the boundary as plain strings and never expose a snapshot handle. A stage event crosses as a plain dictionary with a string kind, so the typed StageEvent lives in Python and the binding keeps no second value type in sync, and one reading of the admission scheduler crosses the same way, so the frozen PipelineSchedulingStats also lives in Python; that read releases the GIL because it takes the scheduler mutex, and it returns a detached copy rather than a live view. One telemetry reading crosses as the same kind of plain nested dictionary, so the six frozen telemetry values live in Python too; that read and reset_telemetry both release the GIL, and the reading is a detached copy rather than a live view. Pipeline's enable_telemetry argument is a switch rather than a count, so it is checked here for shape exactly as strictly -- it must be a real bool, because `1` quietly meaning "on" would be worse than failing -- while every semantic question about what is collected stays in C++. Its two tracing arguments are split the same way: max_trace_records is checked here as a non-bool int greater than zero, because a cap of zero would write every file and keep no record, while telemetry_trace_directory crosses as a plain string and C++ owns every question about it -- whether tracing may be configured without telemetry and whether the path can be created and used. A trace record crosses inside that reading as a plain dictionary whose outcome is a string and whose path is a string, so the frozen PipelineTraceRecord and the choice to present a path as pathlib.Path both stay in Python. Model.run takes its profile prefix as a plain string for the same reason, and an empty one means no profiling, which keeps the historical call unchanged.
  * @agent-side-effects: Registers a Python module and exception type at import time; the wrapped constructors load the ONNX Runtime shared library and read model files, explicit provider registration loads an EP library, and output conversion may transfer tensors to CPU.
  */
 
@@ -713,6 +713,44 @@ PipelinePlacementFromPython(
   return result;
 }
 
+// The precision report crosses the same way, and every dtype crosses as the
+// same lowercase string a TensorSpec already uses, so Python needs no second
+// dtype vocabulary. The declared parameter type keeps `declared_` in its key
+// all the way across the boundary, because a caller must never read it as a
+// measured weight type.
+[[nodiscard]] py::list PrecisionPortsToList(
+    const std::vector<onnx_world_model::PrecisionPort>& ports) {
+  py::list result;
+  for (const auto& port : ports) {
+    py::dict entry;
+    entry["name"] = port.name;
+    entry["dtype"] = std::string(onnx_world_model::ToString(port.data_type));
+    result.append(std::move(entry));
+  }
+  return result;
+}
+
+[[nodiscard]] py::list PrecisionReportToList(
+    const std::vector<onnx_world_model::ComponentPrecisionReport>& report) {
+  py::list result;
+  for (const auto& component : report) {
+    py::dict entry;
+    entry["component"] = component.component;
+    entry["declared_parameter_dtype"] =
+        component.declared_parameter_data_type.has_value()
+            ? py::object(py::str(std::string(onnx_world_model::ToString(
+                  *component.declared_parameter_data_type))))
+            : py::object(py::none());
+    entry["graph_inputs"] = PrecisionPortsToList(component.graph_inputs);
+    entry["graph_outputs"] = PrecisionPortsToList(component.graph_outputs);
+    entry["state_inputs"] = PrecisionPortsToList(component.state_inputs);
+    entry["state_outputs"] = PrecisionPortsToList(component.state_outputs);
+    entry["execution_providers"] = py::cast(component.execution_providers);
+    result.append(std::move(entry));
+  }
+  return result;
+}
+
 // Telemetry crosses the same way and for the same reason: five plain nested
 // dictionaries, so the frozen Python values stay in one place and this file
 // keeps no second copy of the schema in sync.
@@ -1163,6 +1201,15 @@ PYBIND11_MODULE(_native, module) {
           "transfer_plan",
           [](const Pipeline& pipeline) {
             return TransferPlanToDictionary(pipeline.transfer_plan());
+          })
+      // Inspection only as well, and read-only: it is rebuilt from the
+      // manifest and the already-loaded session metadata on every read, so it
+      // takes no lock, and the plain list it returns is a detached copy that
+      // no later read can change.
+      .def_property_readonly(
+          "precision_report",
+          [](const Pipeline& pipeline) {
+            return PrecisionReportToList(pipeline.precision_report());
           })
       // Crosses as a plain dictionary for the same reason a stage event does:
       // the typed, frozen value lives in Python and the binding keeps no

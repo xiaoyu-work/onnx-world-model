@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Implements the modality-oriented `WorldModel` generation API by mapping text, image, video, and action requests onto the manifest stages of one Mobius pipeline package.
 # @agent-public-api: WorldModel, TextGenerator, TextOutput, ImageGenerator, ImageOutput, VideoGenerator, VideoOutput, ActionGenerator, ActionOutput
-# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything, the two placement options -- `component_placement` and `allow_unpreferred_providers` -- which are load-time only and never warm, lazily load, offload, evict, or peer-to-peer transfer anything, and `enable_telemetry`, which turns on the pipeline's runtime counters and changes what is measured rather than what is executed, together with `telemetry_trace_directory` and `max_trace_records`, which add one per-call ONNX Runtime node trace per component call and require `enable_telemetry`. `WorldModel.telemetry_snapshot` and `WorldModel.reset_telemetry` are pass-throughs to that pipeline, and are deliberately distinct from the per-request wall-clock `timings` each generator returns: one measures the runtime, the other measures the request.
+# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything, the two placement options -- `component_placement` and `allow_unpreferred_providers` -- which are load-time only and never warm, lazily load, offload, evict, or peer-to-peer transfer anything, and `enable_telemetry`, which turns on the pipeline's runtime counters and changes what is measured rather than what is executed, together with `telemetry_trace_directory` and `max_trace_records`, which add one per-call ONNX Runtime node trace per component call and require `enable_telemetry`. `WorldModel.telemetry_snapshot` and `WorldModel.reset_telemetry` are pass-throughs to that pipeline, and are deliberately distinct from the per-request wall-clock `timings` each generator returns: one measures the runtime, the other measures the request. `WorldModel.precision_report` is a read-only pass-through of the same kind: it reports the manifest's unverified declared parameter dtype beside the loaded graph's real port dtypes and registered provider order, and it never claims a component's weights are quantized or that a provider claimed graph nodes.
 # @agent-side-effects: Loads a pipeline package and its ONNX components, runs ONNX Runtime inference, reads image and video files supplied by the caller, and records per-stage wall-clock timings.
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 
 from ._api import (
     ComponentPlacementSpec,
+    ComponentPrecisionReport,
     Pipeline,
     PipelineSession,
     PipelineTelemetrySnapshot,
@@ -150,6 +151,17 @@ class WorldModel:
     @property
     def execution_providers(self) -> Mapping[str, tuple[str, ...]]:
         return self._runtime.pipeline.execution_providers
+
+    @property
+    def precision_report(self) -> tuple[ComponentPrecisionReport, ...]:
+        """The underlying pipeline's per-component precision report.
+
+        Inspection only, and deliberately modest about what it knows: the
+        declared parameter dtype is the exporter's own unverified claim about
+        weight storage, and nothing in the report says whether a component is
+        actually quantized. See :class:`ComponentPrecisionReport`.
+        """
+        return self._runtime.pipeline.precision_report
 
     @property
     def telemetry_snapshot(self) -> PipelineTelemetrySnapshot:

@@ -1,6 +1,6 @@
 # @agent-file
 # @agent-purpose: Declares the public `onnx_world_model` package surface by re-exporting the generation, pipeline, and preprocessing symbols that users are expected to import.
-# @agent-public-api: ActionGenerator, ActionOutput, CancellationSource, CancellationToken, CancelledError, ComponentPlacementSpec, ConditioningFramePreprocessor, DeadlineExceededError, DeviceSpec, GeneratorPromptPacker, ImageGenerator, ImageOutput, ImagePreprocessor, LatentDynamicsModel, LegacyWorldModel, ModelMetadata, OnnxModel, PackedImage, PackedImagePreprocessor, PackedVideoPreprocessor, Pipeline, PipelineAdmissionStats, PipelineComponentStats, PipelineInputSpec, PipelineOutputSpec, PipelineSchedulingStats, PipelineSession, PipelineSessionSnapshot, PipelineStageSpec, PipelineStageStats, PipelineTelemetrySnapshot, PipelineTraceRecord, PipelineTransfer, PipelineTransferPlan, PipelineTransferStats, PreparedConditioning, PreparedReasonerInputs, PreparedVideo, PreparedWorldInputs, RawImage, RawVideo, Rollout, StageEvent, StageRun, StepResult, TensorSpec, TextGenerator, TextOutput, TextPreprocessor, VideoGenerator, VideoOutput, WorldModel, WorldModelError, WorldModelPipeline, WorldModelPreprocessor, available_execution_providers, pack_latent_tokens, register_execution_provider_library, supported_pipeline_capabilities, unpack_latent_tokens
+# @agent-public-api: ActionGenerator, ActionOutput, CancellationSource, CancellationToken, CancelledError, ComponentPlacementSpec, ComponentPrecisionReport, ConditioningFramePreprocessor, DeadlineExceededError, DeviceSpec, GeneratorPromptPacker, ImageGenerator, ImageOutput, ImagePreprocessor, LatentDynamicsModel, LegacyWorldModel, ModelMetadata, OnnxModel, PackedImage, PackedImagePreprocessor, PackedVideoPreprocessor, Pipeline, PipelineAdmissionStats, PipelineComponentStats, PipelineInputSpec, PipelineOutputSpec, PipelineSchedulingStats, PipelineSession, PipelineSessionSnapshot, PipelineStageSpec, PipelineStageStats, PipelineTelemetrySnapshot, PipelineTraceRecord, PipelineTransfer, PipelineTransferPlan, PipelineTransferStats, PrecisionPort, PreparedConditioning, PreparedReasonerInputs, PreparedVideo, PreparedWorldInputs, RawImage, RawVideo, Rollout, StageEvent, StageRun, StepResult, TensorSpec, TextGenerator, TextOutput, TextPreprocessor, VideoGenerator, VideoOutput, WorldModel, WorldModelError, WorldModelPipeline, WorldModelPreprocessor, available_execution_providers, pack_latent_tokens, register_execution_provider_library, supported_pipeline_capabilities, unpack_latent_tokens
 # @agent-invariants: Contains re-exports only and no logic; `__all__` must stay sorted and list exactly the imported names, because it is the documented public surface. Removing or renaming an entry is a breaking change for users. `CancelledError` and `DeadlineExceededError` derive from `WorldModelError`, so catching the base still catches a cancelled or timed-out call.
 # @agent-side-effects: Importing this package imports the compiled `_native` extension, which loads the ONNX Runtime shared library.
 
@@ -8,6 +8,7 @@ from onnx_world_model._api import (
     CancellationSource,
     CancellationToken,
     ComponentPlacementSpec,
+    ComponentPrecisionReport,
     DeviceSpec,
     LatentDynamicsModel,
     LegacyWorldModel,
@@ -28,6 +29,7 @@ from onnx_world_model._api import (
     PipelineTransfer,
     PipelineTransferPlan,
     PipelineTransferStats,
+    PrecisionPort,
     Rollout,
     StageEvent,
     StageRun,
@@ -80,6 +82,7 @@ __all__ = [
     "CancellationToken",
     "CancelledError",
     "ComponentPlacementSpec",
+    "ComponentPrecisionReport",
     "ConditioningFramePreprocessor",
     "DeadlineExceededError",
     "DeviceSpec",
@@ -109,6 +112,7 @@ __all__ = [
     "PipelineTransfer",
     "PipelineTransferPlan",
     "PipelineTransferStats",
+    "PrecisionPort",
     "PreparedConditioning",
     "PreparedReasonerInputs",
     "PreparedVideo",

@@ -23,6 +23,13 @@ latent-dynamics compatibility layer.
   into a conservative `PipelineTransferPlan`. That plan is inspection only:
   nothing executes from it, and warm-up, lazy loading, offload and eviction,
   and peer-to-peer transfers are deliberately not implemented.
+- Answer, on demand, what the runtime can honestly observe about each
+  component's numeric precision: the manifest's declared `parameter_dtype`
+  copied verbatim, the loaded session's real port dtypes in graph order, the
+  endpoint-qualified state ports that component carries, and the execution
+  providers registered on the session. That report parses no file, calls no extra
+  ONNX Runtime API, enforces nothing, and deliberately cannot say whether a
+  component's weights are quantized.
 - Execute pipeline stages, including generated inputs, transforms, diffusion
   schedulers, classifier-free guidance, autoregressive decoding, and recurrent
   state lifecycles, through one state machine that a caller can either drain
@@ -77,7 +84,7 @@ latent-dynamics compatibility layer.
 | `tensor.cpp` | Canonical tensor devices, owned CPU buffers, checked shape arithmetic, explicit CPU materialization, and copy-on-write mutation. |
 | `model.cpp` | `Model` facade with its one `ModelRunOptions` implementation the other two `Run` overloads delegate to, the default cancellable and default `ModelRunOptions` `ModelBackend::Run` overloads, provider-name normalization, tensor-versus-signature validation. |
 | `world_model.cpp` | `WorldModel` contract enforcement and `Rollout` recurrent state. |
-| `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, and the connection transfer plan. |
+| `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, the connection transfer plan, and the on-demand per-component precision report. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
 | `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the supported stage-kind list and its validation, the per-kind permit buckets, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, the per-stage-kind admission outcome each acquisition records into the telemetry collector, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
@@ -151,8 +158,9 @@ ctest --preset dev
 `tests/cpp/pipeline_stream_test.cpp`,
 `tests/cpp/pipeline_cancellation_test.cpp`,
 `tests/cpp/pipeline_scheduler_test.cpp`,
-`tests/cpp/pipeline_telemetry_test.cpp`, and
-`tests/cpp/pipeline_trace_test.cpp` cover this directory directly;
+`tests/cpp/pipeline_telemetry_test.cpp`,
+`tests/cpp/pipeline_trace_test.cpp`, and
+`tests/cpp/pipeline_precision_test.cpp` cover this directory directly;
 `tests/cpp/pipeline_test.cpp` is the primary coverage for manifest parsing and
 validation, `tests/cpp/cancellation_test.cpp` is the primary coverage for
 `cancellation.cpp`, `tests/cpp/pipeline_device_test.cpp` is the primary
@@ -169,10 +177,14 @@ that machine's cancellation and deadline boundaries,
 `pipeline_telemetry.cpp` and for what each recording site in
 `pipeline_session.cpp` and `pipeline_scheduler.cpp` counts, and
 `tests/cpp/pipeline_trace_test.cpp` is the primary coverage for its trace
-prefix, file discovery, record retention, and configuration validation.
+prefix, file discovery, record retention, and configuration validation, and
+`tests/cpp/pipeline_precision_test.cpp` is the primary coverage for the
+precision report `pipeline.cpp` assembles.
 `tests/python/` exercises the same code through the `_native` extension
 module; `tests/python/test_placement.py` is where the load-time placement
 overrides and their rejection cases are exercised end to end,
-`tests/python/test_telemetry.py` is where the telemetry surface is, and
+`tests/python/test_telemetry.py` is where the telemetry surface is,
+`tests/python/test_precision.py` is where the precision report is read back
+through Python, and
 `tests/python/test_trace.py` is where real ONNX Runtime trace files are
 produced and read back.

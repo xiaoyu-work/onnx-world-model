@@ -223,7 +223,7 @@ read-only views and `traces` is a tuple.
 | `stages` | `PipelineStageStats` per manifest stage name |
 | `admission_by_stage_kind` | `PipelineAdmissionStats` per stage kind |
 | `transfers` | one pipeline-wide `PipelineTransferStats` |
-| `traces` | this epoch's kept `PipelineTraceRecord` values, in completion order |
+| `traces` | this epoch's kept `PipelineTraceRecord` values; concurrent order is unspecified |
 | `dropped_traces` | records past `max_trace_records`, whose files were still written |
 | `failed_traces` | kept records whose trace file could not be identified; dropped calls are not scanned |
 
@@ -423,8 +423,9 @@ Each traced call publishes exactly one `PipelineTraceRecord`:
   and its outcome exactly as they were. A call that failed or was cancelled is
   still recorded, with its own outcome, because that is usually the
   interesting trace.
-- **Records are completion-ordered; `trace_id` is start order.** Sorting by
-  `trace_id` recovers the order calls began in.
+- **Concurrent record order is unspecified.** File discovery happens outside
+  the record mutex; sorting by process-wide `trace_id` recovers call start
+  order.
 - **The cap bounds memory, not profiling.** Once `max_trace_records` records
   are kept or reserved, later calls still profile and still write files but
   skip directory discovery; `dropped_traces` counts those calls. A profiling
@@ -690,6 +691,126 @@ The C++ equivalents are `Pipeline::transfer_plan()` and
 `PipelinePackage::transfer_plan()`, which return the same
 `PipelineTransferPlan` value, and `TensorSpec::device`, a
 `std::optional<TensorDevice>`.
+
+## Precision report
+
+`Pipeline.precision_report` answers one honest question: what does this
+runtime actually know about each component's numeric precision?
+
+```python
+for entry in pipeline.precision_report:
+    print(entry.component, entry.declared_parameter_dtype)   # 'float16' or None
+    for port in entry.graph_inputs:
+        print("  in ", port.name, port.dtype)
+    for port in entry.graph_outputs:
+        print("  out", port.name, port.dtype)
+    for port in entry.state_inputs + entry.state_outputs:
+        print("  state", port.name, port.dtype)
+    print("  providers", entry.execution_providers)
+```
+
+`ComponentPrecisionReport` and `PrecisionPort` are frozen dataclasses and the
+report is an immutable tuple with one entry per manifest component, in manifest
+order. The C++ equivalents are `Pipeline::precision_report()` and
+`PipelinePackage::precision_report()`, which return
+`std::vector<ComponentPrecisionReport>` with a
+`std::optional<DataType> declared_parameter_data_type`.
+
+| Field | Where it comes from | What it means |
+|---|---|---|
+| `declared_parameter_dtype` | The manifest's `parameter_dtype` | The exporter's **unverified claim** about parameter storage |
+| `graph_inputs`, `graph_outputs` | The loaded ONNX Runtime session | The real port types of the graph, in graph order |
+| `state_inputs`, `state_outputs` | Manifest states, typed from the session | The `component.port` endpoints that carry `PipelineState` |
+| `execution_providers` | Runtime session configuration | Providers registered after availability filtering; not per-node assignment |
+
+- **Reading it changes nothing.** The report is computed on demand from the
+  manifest and the already-loaded session metadata. It opens no file, calls no
+  extra ONNX Runtime API, takes no lock, and returns a detached value.
+- **It enforces nothing.** The authoritative precision checks are the ones that
+  already exist: manifest port types are validated against the live graph while
+  the package loads, and connection and recurrent-state types are validated by
+  the manifest checks. This report adds no rule and rejects no package.
+- **Ports are activations, parameters are weights.** The declared parameter
+  dtype is never compared with a port dtype, because they describe different
+  things. A component that declares `int8` parameters while exposing `float32`
+  activations and `int64` token ids is normal, not a finding.
+- **A non-floating declaration is legal.** `parameter_dtype` is not restricted
+  to floating types; `int8` is exactly how a quantized-weight claim is spelled
+  today.
+- **State ports are qualified.** They are named `component.port`, listed in
+  manifest state order, and de-duplicated on first occurrence, so two states
+  that share a carrier port report it once.
+- **An empty provider list means empty.** A custom in-process backend that
+  reports no providers is reported with none, never credited with CPU.
+- **Provider order is not graph partition data.** A registered provider can
+  claim zero nodes and still appear in `execution_providers`; the loaded
+  Session API does not expose final per-node assignment through this report.
+
+### Where `parameter_dtype` comes from
+
+`parameter_dtype` is per component and optional in the schema, with one
+exception: a manifest that declares an **executable profile** must declare a
+parameter dtype for every component, exactly as it must declare a semantic name
+for every input and execution-provider hints for every component. A
+profile-less manifest may omit it, and the report then says `None` rather than
+guessing a default.
+
+### What this report cannot tell you
+
+**It cannot tell you whether a component is quantized.** MatMulNBits, a QDQ
+pair, QLinear operators, a vendor-specific blocked format, and plain float
+weights all produce exactly the same report. Two limits cause this, and both
+are real today:
+
+1. **ONNX Runtime session visibility.** This runtime reaches ONNX Runtime only
+   through the `Session` public API, which exposes graph inputs and outputs.
+   It does not expose ordinary initializers or nodes, so no weight tensor and
+   no quantized operator is observable from a loaded session. Inspecting them
+   would require either an ONNX model parser in this repository or an ORT graph
+   or compile API that exposes initializers — a dependency and a scope decision
+   that has not been taken.
+2. **No exported provenance.** The current Mobius checkout emits no tracked
+   quantization provenance in `pipeline.json`. There is no field that records a
+   quantization scheme, a bit width, a group size, symmetry, or calibration, so
+   there is nothing for the runtime to read, and inventing one here would be a
+   claim rather than a report.
+
+Two further gaps are worth naming, so they are not mistaken for findings:
+
+- **The dtype vocabulary is the classic one.** Manifest dtypes parse to
+  `FLOAT`, `FLOAT16`, `BFLOAT16`, `DOUBLE`, `INT64`, `INT32`, `INT16`, `INT8`,
+  `UINT64`, `UINT32`, `UINT16`, `UINT8`, and `BOOL`. There is no `INT4`,
+  `UINT4`, `FP8`, or `FP4` spelling, so a package using one of those formats
+  cannot declare it at all today, and `parameter_dtype` will name the container
+  type instead.
+- **KV-cache precision is not declared.** A state's precision is whatever its
+  carrier ports report; the manifest has no `kv_cache_dtype`, so nothing states
+  the intended cache precision independently of the ports.
+
+### Follow-up: a coordination contract, not runtime fields
+
+The next step is an exporter change first and a runtime change second. It is
+recorded here as a contract so that neither side invents the other's data:
+
+1. **Mobius emits provenance.** `pipeline.json` gains a per-component
+   `weight_quantization` record — scheme, bit width, group size, symmetry, and
+   calibration provenance — and a `kv_cache_dtype` for the states it exports.
+   Until that exists there is nothing to validate against.
+2. **Then the runtime validates declarations.** With provenance in the
+   manifest, the loader can check the declaration against the exported record
+   and check state port dtypes against the declared cache precision, and this
+   report can carry those fields instead of only the declaration.
+3. **Initializer verification is a separate decision.** Confirming that the
+   weights on disk match any declaration requires an ONNX parser in this
+   repository or an ONNX Runtime graph or compile API that exposes
+   initializers. It is not implied by step 2 and is not planned here.
+
+**Numeric parity is the exporter's test, not the runtime's.** Whether a
+quantized vision tower still produces acceptable pixels belongs in Mobius
+golden tests, which own the reference outputs and the calibration data. Runtime
+CI validates that a package loads, that its ports and providers are what the
+manifest says, and that stages execute; when Mobius exports tolerances and
+provenance, runtime CI can consume them, but it must not invent them.
 
 ## Input contract
 
@@ -1273,6 +1394,17 @@ for (const PipelineTransfer& transfer : pipeline.transfer_plan().transfers) {
   }
 }
 
+for (const ComponentPrecisionReport& entry : pipeline.precision_report()) {
+  // Declared by the exporter and never verified against the weights; nullopt
+  // when the manifest declared none.
+  const std::optional<DataType> declared = entry.declared_parameter_data_type;
+  // Read from the loaded session, and deliberately never compared with
+  // `declared`: ports carry activations, parameters are weight storage.
+  for (const PrecisionPort& port : entry.graph_inputs) {
+    (void)port.data_type;
+  }
+}
+
 PipelineSession session = pipeline.CreateSession();
 
 NamedTensors outputs = session.RunStage(
@@ -1394,6 +1526,12 @@ an accurate plan.
   *parsing*, trace file lifetime management, execution-provider peak memory,
   exact host-to-device byte counts, and any aggregation, percentile, or export
   above cumulative counters and raw trace files are **not** included.
+- Inspection-only precision reporting: the exporter's declared
+  `parameter_dtype` per component, the real port dtypes and registered providers
+  of each loaded session, and the state ports each component carries. Detecting
+  or verifying quantization is **not** included — initializers and nodes are
+  invisible through the ONNX Runtime session API, and the manifest carries no
+  quantization provenance — and neither is any precision enforcement policy.
 - Explicit cancellation and deadlines on stage execution and generic model
   execution, enforced at execution boundaries, by one shared process-wide
   deadline watchdog, and inside an ONNX Runtime call at graph-node

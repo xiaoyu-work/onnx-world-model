@@ -31,7 +31,7 @@ types.
 | `tensor.hpp` | `DataType`, canonical `TensorDevice` identities, the ORT-independent `TensorBuffer` contract, and the device-aware copy-on-write `Tensor`. |
 | `backend.hpp` | `TensorSpec` with its optional runtime `device`, `ModelMetadata`, `ValidateTensor`, `StepInput`, `StepOutput`, `Backend`. |
 | `model.hpp` | `RuntimeOptions`, device-output policy, provider discovery and library registration, `NamedTensors`, `ModelRunOptions` with its cancellation token and optional ONNX Runtime profile-file prefix, `ModelBackend` with its default cancellable and default `ModelRunOptions` `Run` overloads, and `Model`. |
-| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `ComponentPlacement` and `PipelinePlacementOptions`, the `PipelineTransferKind`, `PipelineTransfer`, and `PipelineTransferPlan` classification of every connection, `PipelinePackage`, `Pipeline` with its shared `PipelineSchedulingOptions` admission limits and its `PipelineSchedulingStats` reading of them, its opt-in `PipelineTelemetryOptions` -- counters plus the optional `trace_directory` and `max_trace_records` that add per-run ONNX Runtime node traces -- and the `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, `PipelineCallOutcome`, `PipelineTraceRecord`, and `PipelineTelemetrySnapshot` reading of those counters and records, `PipelineSession` with its incremental `BeginStage` and named-checkpoint methods, `PipelineSessionSnapshot`, `StageEventKind`, `StageEvent`, `StageRun`, `PipelineRunOptions`. |
+| `pipeline.hpp` | Manifest value types, `PipelineManifest`, `ComponentPlacement` and `PipelinePlacementOptions`, the `PipelineTransferKind`, `PipelineTransfer`, and `PipelineTransferPlan` classification of every connection, the `PrecisionPort` and `ComponentPrecisionReport` inspection values behind `PipelinePackage::precision_report` and `Pipeline::precision_report`, `PipelinePackage`, `Pipeline` with its shared `PipelineSchedulingOptions` admission limits and its `PipelineSchedulingStats` reading of them, its opt-in `PipelineTelemetryOptions` -- counters plus the optional `trace_directory` and `max_trace_records` that add per-run ONNX Runtime node traces -- and the `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, `PipelineCallOutcome`, `PipelineTraceRecord`, and `PipelineTelemetrySnapshot` reading of those counters and records, `PipelineSession` with its incremental `BeginStage` and named-checkpoint methods, `PipelineSessionSnapshot`, `StageEventKind`, `StageEvent`, `StageRun`, `PipelineRunOptions`. |
 | `world_model.hpp` | `WorldModel` and `Rollout`, the fixed three-input/four-output latent-dynamics API. |
 | `onnx_world_model.hpp` | Umbrella header that includes all of the above. |
 
@@ -95,7 +95,7 @@ and both telemetry structs therefore change layout, so the library carries
 `SOVERSION 0.8` and a consumer built against 0.7 must be recompiled. Every one
 of those parameters is defaulted and every new virtual has a default
 implementation, so source that already compiled keeps compiling and keeps its
-unlimited, unplaced, unmeasured, untraced behavior.
+unlimited, unplaced, unmeasured, untraced behavior. Version 0.9.0 adds the `PrecisionPort` and `ComponentPrecisionReport` value types and the `PipelinePackage::precision_report` and `Pipeline::precision_report` member functions that return them by value; no existing type changes layout and no member is added to either class, because the report is computed on demand from the manifest and the loaded session metadata, but a declaration was added to installed headers, so the library carries `SOVERSION 0.9`. The report is inspection only: it adds no precision policy, never verifies a declared parameter dtype against weights, and cannot observe quantized operators or initializers through the ONNX Runtime session API.
 
 ## Tests
 
@@ -114,8 +114,9 @@ covers `model.hpp` and `backend.hpp`,
 `tests/cpp/pipeline_stream_test.cpp`,
 `tests/cpp/pipeline_cancellation_test.cpp`,
 `tests/cpp/pipeline_scheduler_test.cpp`,
-`tests/cpp/pipeline_telemetry_test.cpp`, and
-`tests/cpp/pipeline_trace_test.cpp` cover `pipeline.hpp`;
+`tests/cpp/pipeline_telemetry_test.cpp`,
+`tests/cpp/pipeline_trace_test.cpp`, and
+`tests/cpp/pipeline_precision_test.cpp` cover `pipeline.hpp`;
 `tests/cpp/pipeline_device_test.cpp` is the primary coverage for
 `PipelineTransferPlan` and for the API shape that keeps
 `PipelinePlacementOptions` off the already-built-package constructor,
@@ -123,6 +124,9 @@ covers `model.hpp` and `backend.hpp`,
 `PipelineTelemetrySnapshot` and for what its counters mean, and
 `tests/cpp/pipeline_trace_test.cpp` is the primary coverage for
 `ModelRunOptions::profile_file_prefix`, `PipelineTraceRecord`, and the trace
-fields of `PipelineTelemetryOptions` and `PipelineTelemetrySnapshot`.
+fields of `PipelineTelemetryOptions` and `PipelineTelemetrySnapshot`, and
+`tests/cpp/pipeline_precision_test.cpp` is the primary coverage for
+`PrecisionPort`, `ComponentPrecisionReport`, and the two `precision_report`
+accessors.
 `tests/python/` reaches the same declarations through the `_native` extension
 module.

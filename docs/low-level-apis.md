@@ -182,6 +182,18 @@ For package-level tensor and stage execution — including the admission
 scheduling that caps concurrent executions, the `scheduling_stats` reading of
 it, the opt-in `enable_telemetry` and the `telemetry_snapshot` reading of it,
 the `telemetry_trace_directory` that adds one ONNX Runtime node trace per
-component call, the per-component `component_placement` overrides, and the
-`transfer_plan` they produce — see the
+component call, the per-component `component_placement` overrides, the
+`transfer_plan` they produce, and the `precision_report` that states what the
+runtime can honestly observe about numeric precision — see the
 [Pipeline API](pipeline-api.md).
+
+### Precision is not observable from a single graph
+
+There is deliberately no precision inspection on `OnnxModel`. Its
+`metadata.inputs` and `metadata.outputs` already report the real port dtypes,
+and that is the whole of what a loaded ONNX Runtime session exposes: the
+`Session` public API this runtime uses does not expose ordinary initializers or
+nodes, so nothing here can see a weight tensor, a MatMulNBits block, a QDQ
+pair, or a QLinear operator. A declared parameter dtype exists only in a
+package manifest, which is why the precision report lives on `Pipeline` and
+`PipelinePackage` and is explicit about being an unverified producer claim.

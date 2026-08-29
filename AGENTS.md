@@ -76,7 +76,7 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 11 of 11 passing; `pytest` reports 218
+Expected baseline: `ctest` reports 12 of 12 passing; `pytest` reports 228
 passed and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
@@ -85,8 +85,9 @@ passed and 20 skipped. The skips are tests whose fixtures require the optional
 `tests/python/test_cancellation.py`,
 `tests/python/test_scheduling.py`,
 `tests/python/test_placement.py`,
-`tests/python/test_telemetry.py`, and
-`tests/python/test_trace.py`.
+`tests/python/test_telemetry.py`,
+`tests/python/test_trace.py`, and
+`tests/python/test_precision.py`.
 
 `pipeline_scheduler_test`, `pipeline_telemetry_test`, and
 `pipeline_trace_test` are the concurrent CTest executables. Run them
@@ -124,6 +125,13 @@ C++ changes require `cmake --build --preset dev` before `ctest`, and a
 - Unknown or unsupported semantics must fail loudly. Do not add a silent
   fallback for an unsupported capability, manifest field, stage kind, or
   execution provider.
+- Report only what the runtime can observe. A component's declared
+  `parameter_dtype` is a producer claim about weight storage: never compare it
+  with a graph port dtype, never restrict it to a floating type, and never
+  describe the precision report as detecting or verifying quantization. The
+  ONNX Runtime session API used here exposes graph inputs and outputs, not
+  initializers or nodes, and `pipeline.json` carries no quantization
+  provenance today.
 - All C++ failures throw `onnx_world_model::Error` with an `ErrorCode`; do not
   introduce a second exception type. The Python binding maps that code onto
   `CancelledError`, `DeadlineExceededError`, or their base `WorldModelError`,

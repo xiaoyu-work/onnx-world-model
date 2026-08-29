@@ -34,6 +34,13 @@ The loader supports Mobius pipeline schema 1.x and validates:
 Unknown or unsupported semantics fail during loading or execution instead of
 silently selecting a fallback.
 
+Validation covers what the runtime can actually execute. In particular, a
+component's declared `parameter_dtype` is a producer claim about weight storage
+that is reported and never verified: the ONNX Runtime session API this runtime
+uses cannot see initializers or nodes, so no quantized weight format is
+observable. See
+[Precision report](docs/pipeline-api.md#precision-report).
+
 Image-to-video conditioning and classifier-free guidance are described by
 additional stage options and metadata; see the manifest contract in the
 [Pipeline API](docs/pipeline-api.md).
@@ -309,4 +316,14 @@ Low-level tensor and stage execution is documented in the
   parsing, trace file lifetime management, execution-provider peak memory,
   exact host-to-device byte counts, and any aggregation, percentile, or export
   above cumulative counters and raw trace files are **not** included.
+- An inspection-only `precision_report`: per component, the exporter's declared
+  `parameter_dtype`, the real port dtypes of the loaded graph, the state ports
+  it carries, and the provider order registered on its session. That order is
+  not per-node assignment: a provider may claim no nodes. The report verifies
+  nothing and enforces nothing. Detecting or verifying quantization is **not**
+  included: initializers and nodes are invisible through the ONNX Runtime
+  session API, and the manifest carries no quantization provenance, so
+  MatMulNBits, QDQ, QLinear, and plain float weights are indistinguishable from
+  here. See
+  [Precision report](docs/pipeline-api.md#precision-report).
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

@@ -78,6 +78,16 @@ Runtime library and no real ONNX model.
   clears records and leaves every file, and the configuration errors a
   `Pipeline` refuses to be built with. Every file it writes lives in one
   scratch directory it creates and removes itself.
+- Cover the per-component precision report in its own executable: manifest
+  component order, a declared `FLOAT16` and a declared `INT8` parameter dtype
+  both reported unchanged -- which is what proves a non-floating declaration is
+  not rejected -- a profile-less component with no declaration reporting
+  `nullopt`, mixed graph port dtypes listed exactly and never reconciled with
+  the declaration, the state ports two states associate with one component in
+  manifest order with their shared carrier port listed once, the providers a
+  backend selected, the empty list a backend with no providers reports, and a
+  reading that can be edited without changing the package, the manifest, or
+  the next reading.
 
 ## Key Files
 
@@ -94,6 +104,7 @@ Runtime library and no real ONNX model.
 | `pipeline_scheduler_test.cpp` | `pipeline_scheduler_test` | `PipelineSchedulingOptions` through the public API only: the unlimited default admitting three sessions at once, a global ceiling of two that is reached but never exceeded and drains work-conservingly, a per-kind ceiling of one that serializes `single_pass` while an uncapped `state_transition` still enters, a queued execution cancelled or stopped by its deadline without reaching the backend and without leaving its queue position behind, a queued `StageRun::Step` cancelled and a queued `StageRun::Finish` stopped by its deadline each closing the handle and releasing the session's active-run slot so the same session immediately accepts a `Snapshot`, a fresh `BeginStage`, and a `RunStage`, a stale handle's `Cancel` not releasing a newer run's slot, a permit returned after a backend failure, `BeginStage` and an idle handle holding nothing while `Step`, `Finish`, and `StepStage` each hold one, a completed `Finish` returning its cached result without admission, the `PipelineSchedulingStats` reading -- all six stage kinds always present, zeros for an unlimited pipeline, the admitted and queued counts under a ceiling, and a drain back to zero -- which is also what every queued-request claim in the file synchronizes on, a copied and a forked session sharing the ceiling while two separately constructed `Pipeline`s do not, unknown, empty, and wrong-case stage-kind keys rejected with `invalid_argument`, and a limit of zero meaning unlimited. |
 | `pipeline_telemetry_test.cpp` | `pipeline_telemetry_test` | `PipelineTelemetryOptions` and `Pipeline::telemetry_snapshot` through the public API only: a disabled pipeline reading as `enabled=false`, epoch `0`, empty maps, and zero transfers even after running a stage, and resetting one changing nothing; an enabled pipeline starting at epoch `1` already carrying every manifest component, every manifest stage, and all six stage kinds at zero; one component call's exact input and output byte totals and its positive duration; `failed_calls`, `cancelled_calls`, and `deadline_exceeded_calls` chosen by the `ErrorCode` a stub backend throws, with the matching stage bucket, the presented bytes still counted, and no step or completion; one `RunStage` of a one-pass stage as one execution, one step, and one completion and of a three-step iterative stage as one execution, three steps, and one completion; four `Step` calls as four executions with three steps and one completion; one `Step` plus a draining `Finish` as two executions; a `Finish` on a completed run changing nothing; two direct `StepStage` calls as two executions and two steps with no completion; no admission counters at all for an unlimited kind whose executions are still measured; an immediate grant admitted with a zero wait and not queued; a gated second execution counted as one queued acquisition, two admissions, and a positive wait; a queued cancellation and a queued deadline each counted as their own outcome, with a positive wait and no stage execution because they never got a permit; exactly one device-to-host copy with its exact byte count for a cast connection, with host and device-resident presentation totals; a reset advancing the epoch, zeroing every counter, keeping the maps populated, and continuing to collect; a `Pipeline` copy and a forked session sharing the collector while a separately constructed `Pipeline` does not; a moved-from `Pipeline` reporting the disabled reading; and a returned reading never updating itself. |
 | `pipeline_trace_test.cpp` | `pipeline_trace_test` | `ModelRunOptions::profile_file_prefix`, `PipelineTelemetryOptions::trace_directory` and `max_trace_records`, and `PipelineTelemetrySnapshot::traces` through the public API only, with stub backends that record the prefix they were handed and write `<prefix>_stub.json` themselves: an empty prefix and no records for a counters-only pipeline and for one without telemetry; a prefix inside the configured directory whose file name starts with the sanitized component -- `vision encoder+1` becoming `vision_encoder_1` -- for a traced one; two calls never sharing a prefix and four concurrent calls, all outstanding at once behind a gate, producing four distinct prefixes, four records, and four files; one record per component call carrying epoch `1`, an increasing `trace_id`, `success`, an absolute existing path, a positive size, and a positive duration; a scripted `runtime_execution`, `cancelled`, and `deadline_exceeded` failure each recorded with its own outcome and its trace still found; an already cancelled run never calling the component, recording nothing, and writing no file; no file, two files, and a zero-byte file each counted once in `failed_traces` and recorded with an empty path, a zero size, and the call's own successful outcome unchanged; a cap of two keeping the first two records, counting one `dropped_traces`, and still leaving three files on disk; a reset advancing the epoch, clearing records and both counters, deleting no file, and continuing into the new epoch with a still-increasing `trace_id`; and `invalid_argument` for a trace directory without telemetry, for a zero cap, and for a directory that is really a file, with a rejected configuration creating nothing and an accepted one creating a nested directory. |
+| `pipeline_precision_test.cpp` | `pipeline_precision_test` | `PrecisionPort`, `ComponentPrecisionReport`, and the `PipelinePackage::precision_report` and `Pipeline::precision_report` accessors through the public API only, with `StubBackend`s that report an explicit `ModelMetadata` and never run: one entry per manifest component in manifest order; a declared `FLOAT16` and a declared `INT8` parameter dtype each reported unchanged, which is what proves an integer declaration is not rejected; `nullopt` for a profile-less component that declares none; graph inputs and outputs listed in graph order with the live types -- `int64` token ids and `float32` logits beside a `float16` declaration -- and asserted to be reported independently of that declaration rather than reconciled with it; empty state lists for a stateless component; two states over one component reporting `carrier.state_a` and `carrier.state_b` in manifest order with the shared `carrier.next` output listed once; providers reported in the order the backend selected them and per component; an empty provider list for a backend that reports none; and an edited reading changing neither a later reading nor the manifest's own declared dtype. |
 
 Each file is a self-contained `main()` with local `Check` and `CheckThrows`
 helpers (and `CheckThrowsMessage` where a message is asserted, or
@@ -109,7 +120,9 @@ one filesystem contract in this directory: it creates
 `pipeline_trace_test_scratch` beside the working directory CTest runs it in,
 removes any stale copy first so file counts cannot lie, writes every trace file
 under it, and removes the whole tree on the way out whether the checks passed
-or failed. There is no
+or failed. `pipeline_precision_test.cpp` wraps its own checks in a `try` for
+the same reason, so a manifest it got wrong is reported rather than aborting.
+There is no
 third-party test framework; a new test is a new check inside an existing
 `main()`, or a new executable added to the
 `foreach(test_name IN ITEMS ...)` list in the root `CMakeLists.txt`.
@@ -169,7 +182,8 @@ third-party test framework; a new test is a new check inside an existing
 - `cancellation_test.cpp`, `pipeline_device_test.cpp`,
   `pipeline_snapshot_test.cpp`, `pipeline_stream_test.cpp`,
   `pipeline_cancellation_test.cpp`, `pipeline_scheduler_test.cpp`,
-  `pipeline_telemetry_test.cpp`, and `pipeline_trace_test.cpp` take no
+  `pipeline_telemetry_test.cpp`, `pipeline_trace_test.cpp`, and
+  `pipeline_precision_test.cpp` take no
   arguments; every one of them builds each `PipelinePackage` in
   memory from an embedded manifest string, and only `pipeline_trace_test.cpp`
   touches the filesystem at all.

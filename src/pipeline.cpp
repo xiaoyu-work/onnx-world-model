@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, applies per-component placement overrides, opens their ONNX sessions as a PipelinePackage, and classifies every manifest connection into that package's transfer plan.
- * @agent-public-api: Endpoint::Parse, Endpoint::qualified, PipelineManifest::Parse, PipelineManifest::Load, PipelineManifest::SupportedCapabilities, PipelineManifest accessors, PipelineManifest::Component, PipelineManifest::Input, PipelineManifest::Output, PipelinePackage::PipelinePackage, PipelinePackage::Load, PipelinePackage accessors, PipelinePackage::transfer_plan
- * @agent-invariants: Only Mobius pipeline schema major version 1 is accepted, and unknown JSON fields are rejected rather than ignored. Every declared path stays inside the package root, and each component ONNX signature must agree with the manifest; that signature check ignores TensorSpec::device, which is runtime placement rather than part of the graph contract. Parsing populates the manifest and then hands it to detail::ValidateManifest, so a PipelineManifest that exists has already passed semantic validation. ValidatePlacementOptions runs immediately after the manifest is parsed and before any component model file is opened, so an empty or unknown component name, a repeated provider, repeated provider options for one provider, and a negative thread count all throw ErrorCode::invalid_argument before a single session is built; whether a provider is available and supported stays OrtBackend's decision alone. ResolveComponentRuntimeOptions layers a component's placement over the global RuntimeOptions: scalar overrides replace the global value, the provider order is the component's own list, else the global order, else the manifest preferences, the manifest preferences filter that choice unless allow_unpreferred_providers is set and the component supplied its own list, an explicitly named CPU provider is kept as the fallback, global provider options are filtered to the selected providers while component options for an unselected provider throw, and component options merge over global ones per key. BuildTransferPlan runs once in the PipelinePackage constructor after every component signature is accepted and emits exactly one PipelineTransfer per manifest connection in manifest order, recurrent edges included; classification is conservative, so an unknown endpoint device wins over everything, any transform other than a reshape whose declared source and target shapes are identical is host_transform, and direct is claimed only for identical known devices with nothing in between. Pipeline is defined in pipeline_session.cpp, not here; it owns component sessions through a shared_ptr so copies share one set of ONNX sessions and one admission scheduler.
+ * @agent-purpose: Parses pipeline.json into a PipelineManifest and loads a Mobius package: it resolves component files inside the package root, applies per-component placement overrides, opens their ONNX sessions as a PipelinePackage, classifies every manifest connection into that package's transfer plan, and assembles the on-demand per-component precision report.
+ * @agent-public-api: Endpoint::Parse, Endpoint::qualified, PipelineManifest::Parse, PipelineManifest::Load, PipelineManifest::SupportedCapabilities, PipelineManifest accessors, PipelineManifest::Component, PipelineManifest::Input, PipelineManifest::Output, PipelinePackage::PipelinePackage, PipelinePackage::Load, PipelinePackage accessors, PipelinePackage::transfer_plan, PipelinePackage::precision_report
+ * @agent-invariants: Only Mobius pipeline schema major version 1 is accepted, and unknown JSON fields are rejected rather than ignored. Every declared path stays inside the package root, and each component ONNX signature must agree with the manifest; that signature check ignores TensorSpec::device, which is runtime placement rather than part of the graph contract. Parsing populates the manifest and then hands it to detail::ValidateManifest, so a PipelineManifest that exists has already passed semantic validation. ValidatePlacementOptions runs immediately after the manifest is parsed and before any component model file is opened, so an empty or unknown component name, a repeated provider, repeated provider options for one provider, and a negative thread count all throw ErrorCode::invalid_argument before a single session is built; whether a provider is available and supported stays OrtBackend's decision alone. ResolveComponentRuntimeOptions layers a component's placement over the global RuntimeOptions: scalar overrides replace the global value, the provider order is the component's own list, else the global order, else the manifest preferences, the manifest preferences filter that choice unless allow_unpreferred_providers is set and the component supplied its own list, an explicitly named CPU provider is kept as the fallback, global provider options are filtered to the selected providers while component options for an unselected provider throw, and component options merge over global ones per key. BuildTransferPlan runs once in the PipelinePackage constructor after every component signature is accepted and emits exactly one PipelineTransfer per manifest connection in manifest order, recurrent edges included; classification is conservative, so an unknown endpoint device wins over everything, any transform other than a reshape whose declared source and target shapes are identical is host_transform, and direct is claimed only for identical known devices with nothing in between. PipelinePackage::precision_report builds nothing while loading and stores nothing: it walks the manifest components in order, copies each declared parameter_dtype without checking it against anything, lists the loaded session's own input and output ports in graph order, adds the endpoint-qualified subset of them that a manifest state writes into or reads from -- in manifest state order, first occurrence only -- and reports the providers the backend selected, empty included. It parses no file, touches no ONNX Runtime API, enforces no rule, and can say nothing about whether a component's weights are quantized. Pipeline is defined in pipeline_session.cpp, not here; it owns component sessions through a shared_ptr so copies share one set of ONNX sessions and one admission scheduler.
  * @agent-side-effects: Reads pipeline.json, component ONNX files, and declared assets from disk; loads the ONNX Runtime shared library and creates one ORT session per component.
  */
 
@@ -1349,6 +1349,79 @@ PipelinePackage::execution_providers() const {
 
 const PipelineTransferPlan& PipelinePackage::transfer_plan() const noexcept {
   return transfer_plan_;
+}
+
+namespace {
+
+// A state may name the same endpoint more than once -- two states can share a
+// carrier port -- and the report answers "which of this component's ports take
+// part in state", not "how many declarations mention them", so the first
+// occurrence wins and manifest order is preserved.
+void AppendPrecisionPort(
+    std::vector<PrecisionPort>& ports,
+    std::string name,
+    DataType data_type) {
+  const auto found = std::find_if(
+      ports.begin(),
+      ports.end(),
+      [&name](const PrecisionPort& port) { return port.name == name; });
+  if (found != ports.end()) {
+    return;
+  }
+  ports.push_back({.name = std::move(name), .data_type = data_type});
+}
+
+}  // namespace
+
+std::vector<ComponentPrecisionReport> PipelinePackage::precision_report()
+    const {
+  std::vector<ComponentPrecisionReport> report;
+  report.reserve(manifest_.components().size());
+  for (const auto& component : manifest_.components()) {
+    // Every session was matched against its manifest signature while this
+    // package was built, so the metadata read here is the live graph's and
+    // every endpoint a validated manifest names is present in it.
+    const ModelMetadata& metadata = Component(component.name).metadata();
+    ComponentPrecisionReport entry;
+    entry.component = component.name;
+    // Copied, never checked: this is the producer's claim about parameter
+    // storage and nothing in this function compares it with a port or a
+    // weight.
+    entry.declared_parameter_data_type = component.parameter_data_type;
+    entry.graph_inputs.reserve(metadata.inputs.size());
+    for (const auto& spec : metadata.inputs) {
+      entry.graph_inputs.push_back({
+          .name = spec.name,
+          .data_type = spec.data_type,
+      });
+    }
+    entry.graph_outputs.reserve(metadata.outputs.size());
+    for (const auto& spec : metadata.outputs) {
+      entry.graph_outputs.push_back({
+          .name = spec.name,
+          .data_type = spec.data_type,
+      });
+    }
+    for (const auto& state : manifest_.states()) {
+      if (state.input.component == component.name) {
+        AppendPrecisionPort(
+            entry.state_inputs,
+            state.input.qualified(),
+            metadata.Input(state.input.port).data_type);
+      }
+      if (state.output.component == component.name) {
+        AppendPrecisionPort(
+            entry.state_outputs,
+            state.output.qualified(),
+            metadata.Output(state.output.port).data_type);
+      }
+    }
+    // Whatever provider order the backend registered on its session, including
+    // nothing at all for an in-process backend that reports no providers.
+    entry.execution_providers = metadata.execution_providers;
+    report.push_back(std::move(entry));
+  }
+  return report;
 }
 
 }  // namespace onnx_world_model
