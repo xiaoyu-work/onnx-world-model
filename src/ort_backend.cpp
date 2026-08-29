@@ -2,8 +2,8 @@
  * @agent-file
  * @agent-purpose: Implements the ONNX Runtime ModelBackend: it shares one process-wide Ort::Env, creates component sessions, applies RuntimeOptions and execution providers, and uses I/O binding to retain ORT-owned output tensors on their assigned devices.
  * @agent-public-api: CreateOrtBackend, GetAvailableOrtProviders
- * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options. The per-port memory plan is read once in the constructor with GetMemoryInfoForInputs and GetMemoryInfoForOutputs, checked against the input and output counts, cached as non-owning Ort::ConstMemoryInfo views that stay valid for the session's lifetime, and published on each metadata TensorSpec::device, so Run reuses that plan instead of querying it again and a caller can see where ONNX Runtime actually placed every port. Opt-in I/O binding places each output in the device memory assigned by ORT graph partitioning; the resulting TensorBuffer owns the Ort::Value and a flattened set of session, binding, and aliased-input lifetime roots. ORT-backed inputs bind without copying only when their original dtype and shape match the enclosing Tensor view and their device matches the destination input plan; incompatible, foreign, or reshaped device buffers are synchronously materialized and retained on CPU for the complete Run call. Requested provider lists fail when no available provider can satisfy them instead of silently selecting CPU. The cancellable Run override owns one fresh Ort::RunOptions per call and never reuses or un-terminates it, registers its SetTerminate callback after that object so the registration is destroyed first, and decides that an Ort::Exception was a cancellation from the token rather than from ONNX Runtime's message text. That callback is what the shared deadline watchdog reaches, so a deadline interrupts an in-flight Run at the next graph node without any boundary being polled; a single long-running kernel still finishes first, because ORT checks its terminate flag between nodes and not inside one.
- * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions and output buffers, may transfer foreign device inputs to CPU, and runs inference.
+ * @agent-invariants: This is the only translation unit besides dynamic_library.cpp that includes ONNX Runtime headers; ORT is initialized through InitializeOrtApi before the process-wide Ort::Env or any session is created. Every component session shares that environment while retaining its own session options. The per-port memory plan is read once in the constructor with GetMemoryInfoForInputs and GetMemoryInfoForOutputs, checked against the input and output counts, cached as non-owning Ort::ConstMemoryInfo views that stay valid for the session's lifetime, and published on each metadata TensorSpec::device, so Run reuses that plan instead of querying it again and a caller can see where ONNX Runtime actually placed every port. Opt-in I/O binding places each output in the device memory assigned by ORT graph partitioning; the resulting TensorBuffer owns the Ort::Value and a flattened set of session, binding, and aliased-input lifetime roots. ORT-backed inputs bind without copying only when their original dtype and shape match the enclosing Tensor view and their device matches the destination input plan; incompatible, foreign, or reshaped device buffers are synchronously materialized and retained on CPU for the complete Run call. Requested provider lists fail when no available provider can satisfy them instead of silently selecting CPU. The ModelRunOptions Run override is the one implementation -- the other two build the options they imply and delegate to it -- and it owns one fresh Ort::RunOptions per call that it never reuses and never un-terminates, registers its SetTerminate callback after that object so the registration is destroyed first, and decides that an Ort::Exception was a cancellation from the token rather than from ONNX Runtime's message text. That callback is what the shared deadline watchdog reaches, so a deadline interrupts an in-flight Run at the next graph node without any boundary being polled; a single long-running kernel still finishes first, because ORT checks its terminate flag between nodes and not inside one. Profiling is per run and never per session: a non-empty ModelRunOptions::profile_file_prefix calls Ort::RunOptions::EnableProfiling on that same per-call object with the path's native characters, so no session option is touched, no session is rebuilt, and a concurrent call on the same session that asked for no trace still gets none. ONNX Runtime names the file itself, appending its own local timestamp and .json to the prefix, and this backend never looks for, opens, or parses it.
+ * @agent-side-effects: Loads the ONNX Runtime shared library, reads model files from disk, allocates ORT sessions and output buffers, may transfer foreign device inputs to CPU, runs inference, and -- for a call given a profile-file prefix -- makes ONNX Runtime write one trace file beside that prefix.
  */
 
 #include "ort_backend.hpp"
@@ -728,12 +728,19 @@ class OrtBackend final : public ModelBackend {
   }
 
   [[nodiscard]] NamedTensors Run(const NamedTensors& inputs) const override {
-    return Run(inputs, CancellationToken{});
+    return Run(inputs, ModelRunOptions{});
   }
 
   [[nodiscard]] NamedTensors Run(
       const NamedTensors& inputs,
       const CancellationToken& cancellation) const override {
+    return Run(inputs, ModelRunOptions{.cancellation = cancellation});
+  }
+
+  [[nodiscard]] NamedTensors Run(
+      const NamedTensors& inputs,
+      const ModelRunOptions& options) const override {
+    const CancellationToken& cancellation = options.cancellation;
     cancellation.ThrowIfCancellationRequested();
     try {
       auto binding = std::make_shared<Ort::IoBinding>(*session_);
@@ -785,6 +792,15 @@ class OrtBackend final : public ModelBackend {
       // terminate flag between graph nodes, so a single long kernel still
       // runs to completion before the call unwinds.
       Ort::RunOptions run_options;
+      if (!options.profile_file_prefix.empty()) {
+        // Per run, not per session: this enables profiling for this call
+        // alone, so nothing is rebuilt, no other call on this session is
+        // affected, and a session that was never asked to profile still is
+        // not. The path crosses in the platform's native character type --
+        // wchar_t on Windows -- because narrowing it first would corrupt a
+        // non-ASCII directory before ONNX Runtime ever saw it.
+        run_options.EnableProfiling(options.profile_file_prefix.c_str());
+      }
       const detail::CancellationRegistration termination(
           cancellation,
           [&run_options](CancellationReason) { run_options.SetTerminate(); });

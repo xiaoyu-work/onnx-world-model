@@ -2,10 +2,10 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares runtime session and device-output configuration, execution-provider helpers and registration, and Model, the generic named-tensor ONNX graph session used by every higher-level API.
- * @agent-public-api: GraphOptimizationLevel, RuntimeOptions, NormalizeExecutionProviderName, AvailableExecutionProviders, RegisterExecutionProviderLibrary, NamedTensors, ModelBackend, ModelBackendPtr, Model
- * @agent-invariants: Model rejects a null backend; Model::Run validates every input and output tensor against metadata, so unknown or missing names throw instead of reaching ONNX Runtime. Device outputs are opt-in and require the corresponding provider library to be registered with the process-wide ORT environment before materialization. Provider names are compared only after NormalizeExecutionProviderName folds case, separators, and the ExecutionProvider suffix. The cancellable ModelBackend::Run overload is virtual with a default that checks the token before and after the existing one-argument Run, so a backend written before cancellation existed keeps compiling and still honors boundary cancellation; only a backend that can interrupt work in flight, such as the ONNX Runtime one, overrides it.
- * @agent-side-effects: none in this header; the declared load, provider-query, and provider-registration functions load shared libraries or model files.
+ * @agent-purpose: Declares runtime session and device-output configuration, execution-provider helpers and registration, per-run options carrying cancellation and an optional ONNX Runtime profile-file prefix, and Model, the generic named-tensor ONNX graph session used by every higher-level API.
+ * @agent-public-api: GraphOptimizationLevel, RuntimeOptions, NormalizeExecutionProviderName, AvailableExecutionProviders, RegisterExecutionProviderLibrary, NamedTensors, ModelRunOptions, ModelBackend, ModelBackendPtr, Model
+ * @agent-invariants: Model rejects a null backend; Model::Run validates every input and output tensor against metadata, so unknown or missing names throw instead of reaching ONNX Runtime. Device outputs are opt-in and require the corresponding provider library to be registered with the process-wide ORT environment before materialization. Provider names are compared only after NormalizeExecutionProviderName folds case, separators, and the ExecutionProvider suffix. ModelRunOptions is the one per-call surface: it carries the cancellation token and an optional profile-file prefix, and the three Run overloads collapse onto it, so a caller that supplies neither behaves exactly as before. The ModelRunOptions ModelBackend::Run overload is virtual with a default that drops the prefix and forwards to the cancellable overload, whose own default checks the token before and after the one-argument Run, so a backend written before either existed keeps compiling; only a backend that can interrupt work in flight or profile it, such as the ONNX Runtime one, overrides them. Profiling is per run and never per session: a non-empty prefix enables profiling on that call's own Ort::RunOptions, so no session is rebuilt and a concurrent unprofiled call on the same session is unaffected. ONNX Runtime -- not this runtime -- names the file, appending its own local timestamp and the .json suffix to the prefix, so a caller discovers the file by prefix rather than by predicting a name.
+ * @agent-side-effects: none in this header; the declared load, provider-query, and provider-registration functions load shared libraries or model files. A Run given a profile-file prefix makes ONNX Runtime write a trace file next to that prefix.
  */
 
 #include <filesystem>
@@ -52,6 +52,23 @@ void RegisterExecutionProviderLibrary(
 
 using NamedTensors = std::unordered_map<std::string, Tensor>;
 
+//: Everything one Model::Run call may be given beyond its inputs. It exists so
+//: a per-call concern is added here rather than as another Run overload, and
+//: a default-constructed value is exactly the historical behavior: no
+//: cancellation and no profiling.
+struct ModelRunOptions {
+  //: Checked at this call's boundaries, and honored inside ONNX Runtime by a
+  //: backend that can interrupt itself.
+  CancellationToken cancellation;
+  //: Where ONNX Runtime should write this call's node-level trace, or empty
+  //: -- the default -- to run without profiling. It is a prefix rather than a
+  //: file name: ONNX Runtime appends its own local timestamp and `.json`, so
+  //: the caller finds the file by scanning for that prefix instead of
+  //: predicting the name. Profiling is enabled on this call's own run options,
+  //: so it never rebuilds the session and never affects a concurrent call.
+  std::filesystem::path profile_file_prefix;
+};
+
 class ModelBackend {
  public:
   virtual ~ModelBackend() = default;
@@ -67,6 +84,14 @@ class ModelBackend {
   [[nodiscard]] virtual NamedTensors Run(
       const NamedTensors& inputs,
       const CancellationToken& cancellation) const;
+  //: Runs the graph under everything in `options`. The default implementation
+  //: forwards to the cancellable overload and drops the profile-file prefix,
+  //: because a backend that cannot profile must not pretend it did; the
+  //: caller learns that no file appeared. A backend that can profile a single
+  //: call overrides this.
+  [[nodiscard]] virtual NamedTensors Run(
+      const NamedTensors& inputs,
+      const ModelRunOptions& options) const;
 };
 
 using ModelBackendPtr = std::shared_ptr<ModelBackend>;
@@ -88,6 +113,14 @@ class Model {
   [[nodiscard]] NamedTensors Run(
       const NamedTensors& inputs,
       const CancellationToken& cancellation) const;
+  //: The one implementation the other two delegate to. Validation, the
+  //: cancellation boundaries, and the returned outputs are identical whatever
+  //: overload was called; a non-empty ModelRunOptions::profile_file_prefix
+  //: additionally asks the backend to write this call's ONNX Runtime trace,
+  //: which never changes the outputs and never fails the call by itself.
+  [[nodiscard]] NamedTensors Run(
+      const NamedTensors& inputs,
+      const ModelRunOptions& options) const;
 
  private:
   ModelBackendPtr backend_;

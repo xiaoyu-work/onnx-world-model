@@ -1,9 +1,9 @@
 /**
  * @agent-file
- * @agent-purpose: Declares the internal opt-in telemetry collector a Pipeline shares with its admission scheduler and with every session it creates -- the immutable per-epoch counter slab, the relaxed-atomic counter helpers, the RAII component and stage recorders, the admission and device-transfer recording hooks, and the epoch reset that publishes a fresh slab.
- * @agent-public-api: onnx_world_model::detail::PipelineTelemetryPtr, onnx_world_model::detail::TelemetryCounter, onnx_world_model::detail::AddCounter, onnx_world_model::detail::RaiseCounterMaximum, onnx_world_model::detail::TelemetryComponentEntry, onnx_world_model::detail::TelemetryStageEntry, onnx_world_model::detail::TelemetryAdmissionEntry, onnx_world_model::detail::TelemetryTransferEntry, onnx_world_model::detail::TelemetrySlab, onnx_world_model::detail::PipelineTelemetry, onnx_world_model::detail::MakePipelineTelemetry, onnx_world_model::detail::SnapshotPipelineTelemetry, onnx_world_model::detail::ResetPipelineTelemetry, onnx_world_model::detail::TelemetryAdmissionOutcome, onnx_world_model::detail::RecordAdmissionQueued, onnx_world_model::detail::RecordAdmissionOutcome, onnx_world_model::detail::RecordDeviceToHostCopy, onnx_world_model::detail::RecordStageStep, onnx_world_model::detail::RecordStageCompletion, onnx_world_model::detail::TelemetryComponentScope, onnx_world_model::detail::TelemetryStageScope, onnx_world_model::detail::RecordStageExecution
- * @agent-invariants: Internal header that is not installed, so only the opaque PipelineTelemetry pointer appears in the public Pipeline. Telemetry is opt-in: MakePipelineTelemetry returns null when it is disabled, every entry point here accepts a null collector, and a null collector makes each recording site one branch with no lock, allocation, atomic, or clock read. An enabled collector owns one std::atomic<std::shared_ptr<TelemetrySlab>>. A slab is pre-populated when it is created -- one entry per manifest component, one per manifest stage, one per SupportedStageKinds() name -- and is never inserted into or rehashed afterwards, so a recording thread only ever finds an entry or finds nothing. Every counter is a relaxed atomic and every maximum is a relaxed compare-exchange loop, so recording is wait-free apart from the standard library's internal atomic-shared_ptr lock, and the collector never takes the scheduler, session, or cancellation lock and never calls back into runtime code. Each recorder loads the slab once and holds that shared_ptr for its whole operation, so an operation that straddles a reset finishes into the slab it started in. Reset serializes only its cold build-and-publish path, stamps a fresh pre-populated slab with the next monotonic epoch, and publishes it atomically; recording never takes that reset mutex, and in-flight work intentionally lands in the previous epoch. Snapshot loads one slab and copies its counters individually, so each field is a valid recent value while the reading as a whole is not one atomic moment -- making it one would require a lock on the execution path, which this design refuses. A null or disabled collector snapshots as enabled=false, epoch 0, and empty maps rather than throwing. Outcomes are classified by ErrorCode, never by message, and the four outcome counters of a component call and of a stage execution are mutually exclusive; a recorder whose scope ends without an explicit outcome records a failure, so an unwind can never lose one.
- * @agent-side-effects: none beyond mutating its own counters; recording performs no I/O, no allocation on the hot path, and no device work.
+ * @agent-purpose: Declares the internal opt-in telemetry collector a Pipeline shares with its admission scheduler and with every session it creates -- the immutable per-epoch counter slab, the relaxed-atomic counter helpers, the per-epoch trace-record state, the RAII component and stage recorders, the admission and device-transfer recording hooks, the trace-configuration validation the loader runs before any model file is opened, and the epoch reset that publishes a fresh slab.
+ * @agent-public-api: onnx_world_model::detail::PipelineTelemetryPtr, onnx_world_model::detail::TelemetryCounter, onnx_world_model::detail::AddCounter, onnx_world_model::detail::RaiseCounterMaximum, onnx_world_model::detail::TelemetryComponentEntry, onnx_world_model::detail::TelemetryStageEntry, onnx_world_model::detail::TelemetryAdmissionEntry, onnx_world_model::detail::TelemetryTransferEntry, onnx_world_model::detail::TelemetryTraceState, onnx_world_model::detail::TelemetrySlab, onnx_world_model::detail::PipelineTelemetry, onnx_world_model::detail::ValidatePipelineTelemetryOptions, onnx_world_model::detail::MakePipelineTelemetry, onnx_world_model::detail::SnapshotPipelineTelemetry, onnx_world_model::detail::ResetPipelineTelemetry, onnx_world_model::detail::TelemetryAdmissionOutcome, onnx_world_model::detail::RecordAdmissionQueued, onnx_world_model::detail::RecordAdmissionOutcome, onnx_world_model::detail::RecordDeviceToHostCopy, onnx_world_model::detail::RecordStageStep, onnx_world_model::detail::RecordStageCompletion, onnx_world_model::detail::TelemetryComponentScope, onnx_world_model::detail::TelemetryStageScope, onnx_world_model::detail::RecordStageExecution
+ * @agent-invariants: Internal header that is not installed, so only the opaque PipelineTelemetry pointer appears in the public Pipeline. Telemetry is opt-in: MakePipelineTelemetry returns null when it is disabled, every entry point here accepts a null collector, and a null collector makes each recording site one branch with no lock, allocation, atomic, or clock read. An enabled collector owns one std::atomic<std::shared_ptr<TelemetrySlab>>. A slab is pre-populated when it is created -- one entry per manifest component, one per manifest stage, one per SupportedStageKinds() name -- and is never inserted into or rehashed afterwards, so a recording thread only ever finds an entry or finds nothing. Every counter is a relaxed atomic and every maximum is a relaxed compare-exchange loop, so counter recording is wait-free apart from the standard library's internal atomic-shared_ptr lock, and the collector never takes the scheduler, session, or cancellation lock and never calls back into runtime code. Each recorder loads the slab once and holds that shared_ptr for its whole operation, so an operation that straddles a reset finishes into the slab it started in. Reset serializes only its cold build-and-publish path, stamps a fresh pre-populated slab with the next monotonic epoch, and publishes it atomically; recording never takes that reset mutex, and in-flight work intentionally lands in the previous epoch. Snapshot loads one slab and copies its counters individually, so each field is a valid recent value while the reading as a whole is not one atomic moment -- making it one would require a lock on the execution path, which this design refuses. A null or disabled collector snapshots as enabled=false, epoch 0, and empty maps rather than throwing. Outcomes are classified by ErrorCode, never by message, and the four outcome counters of a component call and of a stage execution are mutually exclusive; a recorder whose scope ends without an explicit outcome records a failure, so an unwind can never lose one. Tracing is the one deliberately non-free path and is a second opt-in on top of enabled: it exists only when a trace directory was configured, ValidatePipelineTelemetryOptions has already accepted and created that directory before any component model file was opened, and only then does TelemetryComponentScope allocate a process-wide monotonic trace identifier, build a prefix namespaced to this process lifetime, and publish exactly one record. TelemetryTraceState::mutex reserves record capacity before filesystem discovery and publishes records in completion order afterwards, so tracing calls may discover files concurrently without exceeding max_trace_records; a full record set increments dropped without scanning the directory. A trace that cannot be identified increments TelemetryTraceState::failed without changing the model call's own outcome.
+ * @agent-side-effects: none beyond mutating its own counters for the counter paths; a traced component call additionally reads its configured trace directory to find the file ONNX Runtime wrote and allocates one record for it, and validation may create that directory.
  */
 
 #pragma once
@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -116,6 +117,29 @@ struct TelemetryTransferEntry {
   TelemetryCounter component_input_bytes_host{0};
 };
 
+//: One epoch's trace records. Unlike every counter here, a record is a value
+//: with a string and a path in it, so publishing one takes a mutex and
+//: allocates. That is the deliberate price of tracing and is paid only by a
+//: pipeline that configured a trace directory; the counter-only paths above
+//: never touch this.
+struct TelemetryTraceState {
+  //: Guards `records` alone. It is never held while running a model, taking
+  //: the scheduler or session lock, or touching the filesystem.
+  std::mutex mutex;
+  //: Kept records in completion order, capped at max_trace_records.
+  std::vector<PipelineTraceRecord> records;
+  //: Calls that reserved one of the remaining record slots and are currently
+  //: discovering their file. Protected by `mutex`; reservations let file
+  //: discovery run concurrently without exceeding the cap.
+  std::size_t pending_records{0};
+  //: Records this epoch produced past the cap. Their files exist; only the
+  //: in-memory record was dropped.
+  TelemetryCounter dropped{0};
+  //: Reserved records whose trace file could not be identified. Calls
+  //: dropped before discovery at the retention cap are not counted here.
+  TelemetryCounter failed{0};
+};
+
 //: One epoch's counters. Its maps are filled once, when it is built, and are
 //: never inserted into again, so a recording thread performs a lookup and
 //: never a rehash. Non-copyable because its counters are atomics; it is only
@@ -127,6 +151,8 @@ struct TelemetrySlab {
   //: One entry per SupportedStageKinds() name, in that order.
   std::array<TelemetryAdmissionEntry, 6> admission;
   TelemetryTransferEntry transfers;
+  //: Empty and untouched unless a trace directory was configured.
+  TelemetryTraceState traces;
 };
 
 //: The shared collector. One is created per Pipeline construction when
@@ -136,8 +162,11 @@ struct TelemetrySlab {
 class PipelineTelemetry {
  public:
   //: Pre-populates the first epoch from the manifest, so every component and
-  //: stage that can ever be recorded already has an entry.
-  explicit PipelineTelemetry(const PipelineManifest& manifest);
+  //: stage that can ever be recorded already has an entry, and copies the
+  //: already-validated trace configuration.
+  PipelineTelemetry(
+      const PipelineTelemetryOptions& options,
+      const PipelineManifest& manifest);
 
   PipelineTelemetry(const PipelineTelemetry&) = delete;
   PipelineTelemetry& operator=(const PipelineTelemetry&) = delete;
@@ -146,14 +175,30 @@ class PipelineTelemetry {
   //: it never returns null.
   [[nodiscard]] std::shared_ptr<TelemetrySlab> slab() const noexcept;
 
+  //: Whether component calls should ask ONNX Runtime for a per-run trace.
+  //: False is the default and keeps every earlier cost and invariant.
+  [[nodiscard]] bool tracing() const noexcept;
+  //: The validated directory every trace prefix is built inside. Empty when
+  //: tracing is off.
+  [[nodiscard]] const std::filesystem::path& trace_directory() const noexcept;
+  //: How many records one epoch keeps.
+  [[nodiscard]] std::size_t max_trace_records() const noexcept;
+  //: The next trace identifier. It is monotonic for the life of this
+  //: collector and deliberately not per epoch, so a reset can never hand out
+  //: an identifier -- or a file prefix -- that an in-flight call is still
+  //: using.
+  [[nodiscard]] std::uint64_t AllocateTraceId() noexcept;
+
   //: Publishes a fresh zeroed slab stamped with the next epoch. Work already
   //: in flight keeps recording into the slab it loaded, which is the previous
-  //: epoch, so a reset is a new beginning rather than a barrier.
+  //: epoch, so a reset is a new beginning rather than a barrier. Trace
+  //: records go with that epoch; the files they name are never deleted.
   void Reset();
 
   //: One reading. Copies each counter individually from one slab, so no field
   //: comes from a different epoch than any other, while the set as a whole is
-  //: not a single instant.
+  //: not a single instant. Trace records are copied under the trace mutex
+  //: alone.
   [[nodiscard]] PipelineTelemetrySnapshot Snapshot() const;
 
  private:
@@ -164,10 +209,23 @@ class PipelineTelemetry {
   //: reset never has to reach back into the package.
   std::vector<std::string> component_names_;
   std::vector<std::string> stage_names_;
+  //: Validated and created before this collector existed, so nothing here
+  //: has to check the filesystem again.
+  std::filesystem::path trace_directory_;
+  std::size_t max_trace_records_{0};
   std::mutex reset_mutex_;
   std::uint64_t next_epoch_{1};
   std::atomic<std::shared_ptr<TelemetrySlab>> slab_;
 };
+
+//: Checks the telemetry configuration and prepares its trace directory, or
+//: throws ErrorCode::invalid_argument. A trace directory requires telemetry
+//: to be enabled and a non-zero record cap, and the directory is created if
+//: it does not exist; a path that exists as something other than a directory,
+//: or that cannot be created, fails here. It is idempotent, so the loader can
+//: call it before any component model file is opened and the collector can
+//: call it again while it is being built.
+void ValidatePipelineTelemetryOptions(const PipelineTelemetryOptions& options);
 
 //: The collector for `options`, or null when telemetry is disabled. Null is
 //: the whole disabled implementation: every function below accepts it.
@@ -226,9 +284,12 @@ void RecordStageCompletion(
     std::string_view stage) noexcept;
 
 //: Measures one component's model call. Construction records what the call
-//: was handed -- byte totals and where those bytes lived -- and starts the
-//: clock; exactly one outcome is then recorded, and the destructor records a
-//: failure if the scope unwound without one, so an outcome is never lost.
+//: was handed -- byte totals and where those bytes lived -- allocates this
+//: call's trace identifier and prefix when tracing is configured, and starts
+//: the clock; exactly one outcome is then recorded, and the destructor
+//: records a failure if the scope unwound without one, so an outcome is never
+//: lost. When tracing is on, that same single finalization discovers the
+//: trace file and publishes exactly one PipelineTraceRecord.
 class TelemetryComponentScope {
  public:
   TelemetryComponentScope(
@@ -240,6 +301,12 @@ class TelemetryComponentScope {
   TelemetryComponentScope(const TelemetryComponentScope&) = delete;
   TelemetryComponentScope& operator=(const TelemetryComponentScope&) = delete;
 
+  //: The prefix ONNX Runtime should write this call's trace under, or an
+  //: empty path when this pipeline collects counters only. It is unique per
+  //: call across epochs, sessions, and threads, so it is handed straight to
+  //: ModelRunOptions::profile_file_prefix.
+  [[nodiscard]] const std::filesystem::path& profile_prefix() const noexcept;
+
   //: Records a successful call and the bytes it returned.
   void RecordSuccess(const NamedTensors& outputs) noexcept;
   //: Classifies the exception currently being handled by its ErrorCode. Must
@@ -247,12 +314,26 @@ class TelemetryComponentScope {
   void RecordCurrentException() noexcept;
 
  private:
-  void RecordOutcome(TelemetryCounter& bucket) noexcept;
+  void RecordOutcome(
+      TelemetryCounter& bucket,
+      PipelineCallOutcome outcome) noexcept;
+  //: Finds this call's trace file and publishes its record. Never throws,
+  //: never touches the model's result, and counts a failure rather than
+  //: retrying when the file cannot be identified.
+  void FinalizeTrace(
+      PipelineCallOutcome outcome,
+      std::uint64_t duration_ns) noexcept;
 
   std::shared_ptr<TelemetrySlab> slab_;
   TelemetryComponentEntry* entry_{nullptr};
   std::chrono::steady_clock::time_point started_{};
   bool pending_{false};
+  //: Empty unless this call is traced, which is what profile_prefix()
+  //: reports and what FinalizeTrace scans for.
+  std::filesystem::path profile_prefix_;
+  std::string component_;
+  std::uint64_t trace_id_{0};
+  std::size_t max_trace_records_{0};
 };
 
 //: Measures one stage execution -- one admission lease scope. Construction

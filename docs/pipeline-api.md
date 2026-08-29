@@ -171,7 +171,9 @@ Telemetry is opt-in and observability only: it changes what is measured and
 never what is executed, in what order, or with what result. It is off by
 default, and off means the pipeline holds no collector at all rather than one
 that ignores everything, so an unmeasured pipeline pays one pointer test per
-instrumentation site.
+instrumentation site. Counters are described here; the optional per-run ONNX
+Runtime node traces layered on top of them are in
+[ONNX Runtime node traces](#onnx-runtime-node-traces).
 
 ```python
 from onnx_world_model import Pipeline
@@ -211,7 +213,7 @@ took, while `telemetry_snapshot` is what the runtime underneath did.
 ### What a reading contains
 
 `PipelineTelemetrySnapshot` is a frozen dataclass; its three mappings are
-read-only views.
+read-only views and `traces` is a tuple.
 
 | Field | Meaning |
 |---|---|
@@ -221,6 +223,9 @@ read-only views.
 | `stages` | `PipelineStageStats` per manifest stage name |
 | `admission_by_stage_kind` | `PipelineAdmissionStats` per stage kind |
 | `transfers` | one pipeline-wide `PipelineTransferStats` |
+| `traces` | this epoch's kept `PipelineTraceRecord` values, in completion order |
+| `dropped_traces` | records past `max_trace_records`, whose files were still written |
+| `failed_traces` | kept records whose trace file could not be identified; dropped calls are not scanned |
 
 `PipelineComponentStats` — one call is one invocation of that component's
 session from inside a stage execution:
@@ -316,11 +321,14 @@ session from inside a stage execution:
 
 ### What telemetry does not report
 
-- **ONNX Runtime per-node traces.** Only ONNX Runtime produces them, and
-  exporting them is not part of this milestone.
-- **Execution-provider peak or current memory.** Only the provider knows it.
+- **Node timings inside a trace.** A trace file is discovered and pointed at,
+  never parsed: see [ONNX Runtime node traces](#onnx-runtime-node-traces)
+  below. Parsing one on the execution path would cost more than the work it
+  measures.
+- **Execution-provider peak or current memory.** Only the provider knows it,
+  and this milestone deliberately defers it rather than estimating it.
 - **Host-to-device bytes.** Uploads happen inside ONNX Runtime when it binds an
-  input, so this runtime cannot measure them and refuses to guess.
+  input, so this runtime cannot measure them exactly and refuses to guess.
   `component_input_bytes_device_resident` and `component_input_bytes_host` are
   presentation, not transfer: they say where each component's inputs already
   lived, and a tensor presented twice is counted twice.
@@ -328,9 +336,10 @@ session from inside a stage execution:
   counts what the session materializes itself. When ONNX Runtime stages a
   foreign device buffer to the host while binding an input, that copy happens
   inside the backend and is not counted here.
-- **Aggregation.** There is no sampling, no window, no percentile, no metrics
-  export, and no per-request trace. A snapshot is a set of cumulative counters
-  for one epoch; anything above that belongs to the caller.
+- **Aggregation.** There is no sampling, no window, no percentile, and no
+  metrics export. A snapshot is a set of cumulative counters for one epoch
+  plus a bounded list of trace records; anything above that belongs to the
+  caller.
 
 The C++ equivalent is `Pipeline::telemetry_snapshot()` and
 `Pipeline::ResetTelemetry()`:
@@ -348,6 +357,121 @@ if (stage.steps > 0) {
   // Nanoseconds per decoded token, this epoch.
 }
 pipeline.ResetTelemetry();
+```
+
+## ONNX Runtime node traces
+
+Node-level traces are a second, narrower opt-in on top of telemetry. With a
+`telemetry_trace_directory` set, every component call additionally asks ONNX
+Runtime to profile *that one call* and write its trace there. Profiling is per
+run, never per session: nothing is rebuilt, a session that is also serving an
+untraced call is unaffected, and no `SessionOptions` are changed.
+
+```python
+from onnx_world_model import Pipeline
+
+pipeline = Pipeline(
+    "output/cosmos3-edge",
+    enable_telemetry=True,            # required: tracing is layered on top
+    telemetry_trace_directory="traces",
+    max_trace_records=256,            # in-memory records, not files
+)
+session = pipeline.create_session()
+session.run_stage("reasoner_prompt", {"input_ids": input_ids})
+
+for record in pipeline.telemetry_snapshot.traces:
+    print(record.component, record.outcome, record.size_bytes, record.path)
+```
+
+`WorldModel` forwards both arguments unchanged.
+
+Each traced call publishes exactly one `PipelineTraceRecord`:
+
+| Field | Meaning |
+|---|---|
+| `epoch` | the collection epoch this call recorded into |
+| `trace_id` | process-wide identifier, monotonic across collectors and epochs, in start order |
+| `component` | the manifest component whose call this was |
+| `path` | the trace file as a `pathlib.Path`, or `None` when `profiling_failed` |
+| `outcome` | `success`, `failure`, `cancelled`, or `deadline_exceeded` |
+| `duration_ns` | wall-clock nanoseconds of the component call |
+| `size_bytes` | size of that file, `0` when `profiling_failed` |
+| `profiling_failed` | whether no usable trace file could be identified |
+
+### How tracing behaves
+
+- **Configuration is checked while the pipeline loads.** A trace directory
+  without `enable_telemetry` raises `WorldModelError`, a `max_trace_records`
+  that is not an `int` greater than zero is rejected, and a path that exists
+  as something other than a directory fails there too. A directory that does
+  not exist yet is created. None of this can become a per-run failure.
+- **Each call gets a unique prefix** containing its component, epoch, a
+  process-lifetime nonce, process-wide trace ID, and pid inside the configured
+  directory. The component name is reduced to ASCII letters, digits, dot,
+  underscore, and hyphen. Independent pipelines sharing a directory,
+  concurrent calls, epochs, and process lifetimes therefore never collide.
+- **ONNX Runtime names the file, not this runtime.** It appends its own local
+  timestamp and `.json` to the prefix, so the file is found by listing the
+  directory for that prefix rather than by predicting a name.
+- **A trace is discovered, never parsed.** The runtime records the path and
+  the size and stops there; reading node timings is the caller's job, because
+  parsing a trace on the execution path would cost more than the work it
+  measures.
+- **Profiling never changes the call.** Zero matching files, several matching
+  files, an empty file, or a filesystem error is a *profiling* failure: it
+  increments `failed_traces`, records an empty C++ path (`None` in Python), and leaves the model call
+  and its outcome exactly as they were. A call that failed or was cancelled is
+  still recorded, with its own outcome, because that is usually the
+  interesting trace.
+- **Records are completion-ordered; `trace_id` is start order.** Sorting by
+  `trace_id` recovers the order calls began in.
+- **The cap bounds memory, not profiling.** Once `max_trace_records` records
+  are kept or reserved, later calls still profile and still write files but
+  skip directory discovery; `dropped_traces` counts those calls. A profiling
+  failure among dropped calls is intentionally unknown and is not included in
+  `failed_traces`.
+- **`reset_telemetry()` clears records and deletes nothing.** Trace files stay
+  exactly where ONNX Runtime wrote them; this runtime never removes one, so
+  disk usage is the caller's to manage.
+- **An early ONNX Runtime failure can leave an empty file.** ONNX Runtime
+  creates the file when the run starts, so a run that fails before writing any
+  event leaves a zero-byte file, which is reported as a profiling failure.
+- **ONNX Runtime's own limits still apply.** A profiled session stops
+  recording after roughly one million events, and a provider that internally
+  replays a graph — a CUDA graph capture retry, for instance — can put more
+  than one execution of the same node in one file. Both are ONNX Runtime
+  behaviours; this runtime reports the file it was given.
+
+The same surface exists on the generic model API, where the prefix is supplied
+per call and the result is still just the outputs:
+
+```python
+from onnx_world_model import OnnxModel
+
+model = OnnxModel("model.onnx")
+outputs = model.run(inputs, profile_prefix="traces/encoder")
+# traces/encoder_2026-01-31_12-00-00_123.json
+```
+
+The C++ surface is the same two options and the same per-call prefix:
+
+```cpp
+PipelineTelemetryOptions telemetry;
+telemetry.enabled = true;
+telemetry.trace_directory = "traces";
+telemetry.max_trace_records = 256;
+Pipeline pipeline = Pipeline::Load("output/cosmos3-edge", {}, {}, {}, telemetry);
+
+for (const PipelineTraceRecord& record : pipeline.telemetry_snapshot().traces) {
+  if (!record.profiling_failed) {
+    // record.path is the file ONNX Runtime wrote for one component call.
+  }
+}
+
+// The generic model API takes the same prefix per call.
+Model model = Model::Load("model.onnx");
+NamedTensors outputs = model.Run(
+    inputs, ModelRunOptions{.profile_file_prefix = "traces/encoder"});
 ```
 
 ## Execution providers
@@ -1137,7 +1261,11 @@ Pipeline pipeline = Pipeline::Load(
                  }},
             },
     },
-    PipelineTelemetryOptions{.enabled = true});
+    PipelineTelemetryOptions{
+        .enabled = true,
+        .trace_directory = "traces",
+        .max_trace_records = 256,
+    });
 
 for (const PipelineTransfer& transfer : pipeline.transfer_plan().transfers) {
   if (transfer.kind != PipelineTransferKind::direct) {
@@ -1259,10 +1387,13 @@ an accurate plan.
 - Opt-in runtime telemetry: per-component call, byte, and duration counters,
   per-stage execution, step, and completion counters, per-stage-kind admission
   wait outcomes, and the device-to-host materializations the runtime performed,
-  read as an immutable snapshot under a reset-able epoch. ONNX Runtime
-  per-node trace export, execution-provider peak memory, exact host-to-device
-  byte counts, and any aggregation, percentile, export, or per-request tracing
-  above cumulative counters are **not** included.
+  read as an immutable snapshot under a reset-able epoch.
+- Opt-in per-run ONNX Runtime node traces on top of that telemetry: one trace
+  file per component call under a unique prefix, and one bounded, in-memory
+  record per call naming that file, its size, and how the call ended. Trace
+  *parsing*, trace file lifetime management, execution-provider peak memory,
+  exact host-to-device byte counts, and any aggregation, percentile, or export
+  above cumulative counters and raw trace files are **not** included.
 - Explicit cancellation and deadlines on stage execution and generic model
   execution, enforced at execution boundaries, by one shared process-wide
   deadline watchdog, and inside an ONNX Runtime call at graph-node

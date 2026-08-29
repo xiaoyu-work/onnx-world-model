@@ -112,10 +112,18 @@ C++ API ───────────────┤                  │
   code, so a cancellation and a deadline are their own counters rather than
   failures. `reset_telemetry()` starts a new epoch. It is off by default, and
   off means no collector at all rather than one that ignores everything.
-  ONNX Runtime per-node traces, provider peak memory, and exact
-  host-to-device byte counts are not included, because only ONNX Runtime holds
-  that data; component input residency reports where each component's inputs
-  already lived and is not an upload count.
+  Provider peak memory and exact host-to-device byte counts are not included,
+  because only ONNX Runtime holds that data; component input residency reports
+  where each component's inputs already lived and is not an upload count.
+- Per-run ONNX Runtime node traces are a second opt-in on top of telemetry.
+  Add `telemetry_trace_directory="traces"` and each component call also asks
+  ONNX Runtime to profile *that call* — never the session — into a file under
+  a prefix unique to the call, while `telemetry_snapshot.traces` reports one
+  `PipelineTraceRecord` per call naming the file, its size, and how the call
+  ended. `OnnxModel.run(..., profile_prefix=...)` is the same thing for a
+  single generic model call. Traces are discovered and pointed at, never
+  parsed, records are capped by `max_trace_records` while the files keep being
+  written, and no trace file is ever deleted by this runtime.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in
@@ -149,11 +157,16 @@ adds the cancellation surface — a `CancellationToken` member on
 `StageRun::RequestCancellation` — version 0.5 changes the `Pipeline`
 layout by giving it a shared admission scheduler and a defaulted
 `PipelineSchedulingOptions` parameter on its constructor and on
-`Pipeline::Load`, and version 0.7 changes that layout again by adding a shared
+`Pipeline::Load`, version 0.7 changes that layout again by adding a shared
 telemetry collector with a defaulted `PipelineTelemetryOptions` parameter on
-both. C++ applications built against an earlier version must be
-recompiled when upgrading; source that already compiled keeps compiling,
-because every new parameter is defaulted.
+both, and version 0.8 adds `ModelRunOptions` — the single per-call options
+value the three `Model::Run` overloads collapse onto, carrying cancellation
+and an optional ONNX Runtime profile-file prefix — together with a new
+defaulted `ModelBackend::Run` overload and the trace fields on
+`PipelineTelemetryOptions` and `PipelineTelemetrySnapshot`. C++ applications
+built against an earlier version must be recompiled when upgrading; source
+that already compiled keeps compiling, because every new parameter is
+defaulted and every new virtual has a default implementation.
 
 ## Install
 
@@ -289,8 +302,11 @@ Low-level tensor and stage execution is documented in the
 - Opt-in runtime telemetry: per-component call, byte, and duration counters,
   per-stage execution, step, and completion counters, per-stage-kind admission
   wait outcomes, and the device-to-host materializations the runtime performed,
-  reported as an immutable snapshot under a reset-able epoch. ONNX Runtime
-  per-node trace export, execution-provider peak memory, exact host-to-device
-  byte counts, and any aggregation, percentile, export, or per-request tracing
-  above cumulative counters are **not** included.
+  reported as an immutable snapshot under a reset-able epoch.
+- Opt-in per-run ONNX Runtime node traces layered on that telemetry: one trace
+  file per component call under a unique prefix, plus one bounded in-memory
+  record per call naming the file, its size, and the call's outcome. Trace
+  parsing, trace file lifetime management, execution-provider peak memory,
+  exact host-to-device byte counts, and any aggregation, percentile, or export
+  above cumulative counters and raw trace files are **not** included.
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

@@ -76,7 +76,7 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 10 of 10 passing; `pytest` reports 203
+Expected baseline: `ctest` reports 11 of 11 passing; `pytest` reports 218
 passed and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
@@ -84,18 +84,28 @@ passed and 20 skipped. The skips are tests whose fixtures require the optional
 `tests/python/test_pipeline_stream.py`,
 `tests/python/test_cancellation.py`,
 `tests/python/test_scheduling.py`,
-`tests/python/test_placement.py`, and
-`tests/python/test_telemetry.py`.
+`tests/python/test_placement.py`,
+`tests/python/test_telemetry.py`, and
+`tests/python/test_trace.py`.
 
-`pipeline_scheduler_test` and `pipeline_telemetry_test` are the concurrent
-CTest executables. Run them repeatedly after changing
-`src/pipeline_scheduler.cpp`, `src/pipeline_telemetry.cpp`,
-`src/cancellation.cpp`, or any call site that takes an admission lease or
-records telemetry:
+`pipeline_scheduler_test`, `pipeline_telemetry_test`, and
+`pipeline_trace_test` are the concurrent CTest executables. Run them
+repeatedly after changing `src/pipeline_scheduler.cpp`,
+`src/pipeline_telemetry.cpp`, `src/cancellation.cpp`, or any call site that
+takes an admission lease or records telemetry:
 
 ```console
 ctest --preset dev -R pipeline_scheduler_test --repeat until-fail:20
 ctest --preset dev -R pipeline_telemetry_test --repeat until-fail:20
+ctest --preset dev -R pipeline_trace_test --repeat until-fail:20
+```
+
+Run the tracing tests after changing the profile-file prefix, trace discovery,
+record retention, or `src/ort_backend.cpp`'s per-run profiling:
+
+```console
+ctest --preset dev -R pipeline_trace_test
+.venv\Scripts\python.exe -m pytest tests/python/test_trace.py -q
 ```
 
 Run the placement tests repeatedly after changing component placement, the

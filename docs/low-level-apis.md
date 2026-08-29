@@ -51,6 +51,33 @@ compiling and still stops at those boundaries. A backend that can block with no
 boundary of its own can park on `CancellationToken::WaitForCancellation()`
 instead of polling.
 
+### Per-call node profiling
+
+`run()` also accepts a keyword-only `profile_prefix`, which turns on ONNX
+Runtime's node-level profiling for that one call:
+
+```python
+outputs = model.run(inputs, profile_prefix="traces/encoder")
+# traces/encoder_2026-01-31_12-00-00_123.json
+```
+
+It is a *prefix*, not a file name: ONNX Runtime appends its own local
+timestamp and `.json`, so the file is found by listing that directory for the
+prefix rather than by predicting a name. Profiling is enabled on the call's own
+run options, so the session is never rebuilt and a concurrent call that asked
+for no trace still gets none. The return value is the outputs and nothing else,
+and a trace that fails to appear never fails the call.
+
+In C++ the three `Model::Run` overloads collapse onto one:
+`Model::Run(inputs, ModelRunOptions{.cancellation = token,
+.profile_file_prefix = prefix})`. `ModelBackend` declares that overload
+virtually too, with a default implementation that drops the prefix and
+forwards to the cancellable overload, so a backend that cannot profile keeps
+compiling and simply produces no file. The prefix reaches ONNX Runtime in the
+platform's native path characters, so a non-ASCII directory is not narrowed on
+the way. Pipelines wire the same mechanism up automatically: see
+[ONNX Runtime node traces](pipeline-api.md#onnx-runtime-node-traces).
+
 ## Device-aware C++ tensors
 
 The installed C++ `Tensor` API can wrap an immutable `TensorBuffer` supplied by
@@ -139,18 +166,22 @@ rollout.reset(batch_size=1)
 
 This fixed API does not accept a cancellation token in this milestone; use
 `Pipeline` and `PipelineSession` when a call must be interruptible. It also
-takes no concurrency limits, no placement, and no telemetry:
+takes no concurrency limits, no placement, no telemetry, and no profiling:
 `max_concurrent_executions`, `max_concurrent_by_stage_kind`,
-`component_placement`, `allow_unpreferred_providers`, and `enable_telemetry`
-are pipeline-only options, so `OnnxModel` and `LatentDynamicsModel` do not
-accept them. A `Model::Run` a caller makes directly is not a pipeline
-component call and is never counted by pipeline telemetry.
+`component_placement`, `allow_unpreferred_providers`, `enable_telemetry`,
+`telemetry_trace_directory`, and `max_trace_records` are pipeline-only
+options, so `OnnxModel` and `LatentDynamicsModel` do not accept them —
+`OnnxModel.run` takes its own per-call `profile_prefix` instead. A
+`Model::Run` a caller makes directly is not a pipeline component call, so it
+is never counted by pipeline telemetry and never produces a
+`PipelineTraceRecord`.
 
 ## Pipeline
 
 For package-level tensor and stage execution — including the admission
 scheduling that caps concurrent executions, the `scheduling_stats` reading of
 it, the opt-in `enable_telemetry` and the `telemetry_snapshot` reading of it,
-the per-component `component_placement` overrides, and the `transfer_plan`
-they produce — see the
+the `telemetry_trace_directory` that adds one ONNX Runtime node trace per
+component call, the per-component `component_placement` overrides, and the
+`transfer_plan` they produce — see the
 [Pipeline API](pipeline-api.md).

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   onnx_world_model
-  VERSION 0.7.0
+  VERSION 0.8.0
   DESCRIPTION "Runtime engine for Mobius-exported ONNX world models"
   LANGUAGES CXX
 )
@@ -52,7 +52,7 @@ set_target_properties(
   PROPERTIES
     CXX_EXTENSIONS OFF
     POSITION_INDEPENDENT_CODE ON
-    SOVERSION 0.7
+    SOVERSION 0.8
     VERSION ${PROJECT_VERSION}
 )
 target_compile_definitions(
@@ -113,6 +113,7 @@ if(ONNX_WORLD_MODEL_BUILD_TESTS)
       pipeline_cancellation
       pipeline_scheduler
       pipeline_telemetry
+      pipeline_trace
   )
     add_executable(${test_name}_test tests/cpp/${test_name}_test.cpp)
     target_link_libraries(${test_name}_test PRIVATE onnx_world_model)

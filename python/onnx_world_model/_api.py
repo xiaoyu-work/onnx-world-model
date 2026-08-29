@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, incremental stage run, cancellation, and latent-dynamics APIs.
-# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineTelemetrySnapshot, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `enable_telemetry` is opt-in observability of the same shape: it is forwarded unchanged to the native constructor, which rejects anything that is not a real bool, and `telemetry_snapshot` freezes one native dictionary into a `PipelineTelemetrySnapshot` of frozen component, stage, admission, and transfer values whose three mappings are read-only views. A disabled pipeline reads as `enabled=False`, epoch `0`, and empty mappings rather than raising; an enabled one always carries every manifest component, every manifest stage, and all six stage kinds. The reading is detached but deliberately not one atomic instant, `reset_telemetry` starts a new epoch rather than editing counters in place, and telemetry changes what is measured and never what is executed. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
+# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineCallOutcome, PipelineTraceRecord, PipelineTelemetrySnapshot, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `enable_telemetry` is opt-in observability of the same shape: it is forwarded unchanged to the native constructor, which rejects anything that is not a real bool, and `telemetry_snapshot` freezes one native dictionary into a `PipelineTelemetrySnapshot` of frozen component, stage, admission, and transfer values whose three mappings are read-only views. A disabled pipeline reads as `enabled=False`, epoch `0`, and empty mappings rather than raising; an enabled one always carries every manifest component, every manifest stage, and all six stage kinds. The reading is detached but deliberately not one atomic instant, `reset_telemetry` starts a new epoch rather than editing counters in place, and telemetry changes what is measured and never what is executed. `Pipeline`'s `telemetry_trace_directory` and `max_trace_records` are the per-run ONNX Runtime tracing layer on top of that: the directory is forwarded as a string and C++ owns every semantic rule -- a trace directory without `enable_telemetry` raises `WorldModelError`, and the directory is created and checked while the package loads rather than on the first run -- while `max_trace_records` is checked in the binding as a non-bool int greater than zero. `telemetry_trace_directory` and `max_trace_records` are read-only echoes of what was accepted, `PipelineTraceRecord` is frozen with a usable path as a `pathlib.Path`, a failed trace path as `None`, and its outcome as one of the four `PipelineCallOutcome` strings; `PipelineTelemetrySnapshot.traces` is a tuple in completion order whose process-wide `trace_id` recovers start order. Tracing is per call and never per session, a dropped record still has its file on disk, `reset_telemetry` clears records and deletes nothing, and a failed trace never changes the outcome of the call it belonged to. `OnnxModel.run` takes the same profiling as `profile_prefix` and still returns only the outputs. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -293,6 +293,41 @@ class PipelineTransferStats:
     component_input_bytes_host: int
 
 
+PipelineCallOutcome = Literal[
+    "success", "failure", "cancelled", "deadline_exceeded"
+]
+
+
+@dataclass(frozen=True)
+class PipelineTraceRecord:
+    """One component call that ONNX Runtime was asked to trace.
+
+    A record exists only for a pipeline built with ``enable_telemetry`` *and*
+    a ``telemetry_trace_directory``, and exactly one is produced per component
+    call, whatever the outcome. It points at the trace file and never carries
+    parsed trace content: reading a trace is the caller's job, because parsing
+    one on the execution path would cost more than the work being measured.
+
+    ``path`` is the file ONNX Runtime wrote, absolute when it could be
+    resolved. It is ``None`` exactly when ``profiling_failed`` is ``True``, which
+    means no usable trace file could be identified -- none appeared, several
+    matched, it was empty, or the filesystem refused to answer. That is a fact
+    about the trace and never about the call: ``outcome`` still reports how
+    the model call itself ended.
+    """
+
+    epoch: int
+    #: Monotonic across epochs, so ordering by it is start order while the
+    #: ``traces`` tuple itself is completion order.
+    trace_id: int
+    component: str
+    path: Path | None
+    outcome: PipelineCallOutcome
+    duration_ns: int
+    size_bytes: int
+    profiling_failed: bool
+
+
 @dataclass(frozen=True)
 class PipelineTelemetrySnapshot:
     """One immutable reading of a pipeline's telemetry counters.
@@ -312,6 +347,14 @@ class PipelineTelemetrySnapshot:
     :meth:`Pipeline.reset_telemetry`. Work already running when the reset
     happened finishes into the previous epoch and is intentionally absent
     here.
+
+    ``traces`` is empty unless the pipeline was given a
+    ``telemetry_trace_directory``. It holds this epoch's kept
+    :class:`PipelineTraceRecord` values in the order their calls finished,
+    capped at ``max_trace_records``; ``dropped_traces`` counts records past
+    that cap, whose files were still written but are not scanned, and
+    ``failed_traces`` counts kept records whose trace file could not be
+    identified.
     """
 
     enabled: bool
@@ -320,6 +363,9 @@ class PipelineTelemetrySnapshot:
     stages: Mapping[str, PipelineStageStats]
     admission_by_stage_kind: Mapping[str, PipelineAdmissionStats]
     transfers: PipelineTransferStats
+    traces: tuple[PipelineTraceRecord, ...] = ()
+    dropped_traces: int = 0
+    failed_traces: int = 0
 
 
 @dataclass(frozen=True)
@@ -756,18 +802,28 @@ class OnnxModel:
         *,
         cancellation: CancellationToken | None = None,
         timeout: float | None = None,
+        profile_prefix: str | os.PathLike[str] | None = None,
     ) -> dict[str, NDArray[Any]]:
-        """Run the graph, optionally under a token or a per-call timeout.
+        """Run the graph, optionally under a token, a timeout, or profiling.
 
         ``cancellation`` and ``timeout`` are mutually exclusive. Cancellation is
         checked before the backend call and after the outputs are validated;
         ONNX Runtime itself can only stop between graph nodes, so a single long
         kernel still finishes before the call unwinds.
+
+        ``profile_prefix`` turns on ONNX Runtime's node-level profiling for
+        this call alone -- the session is not rebuilt and another call on the
+        same model is unaffected -- and is a *prefix*, not a file name: ONNX
+        Runtime appends its own local timestamp and ``.json``, so the caller
+        finds the file by listing the directory for that prefix. The returned
+        value is the outputs and nothing else; profiling never changes them
+        and a trace that fails to appear never fails the call.
         """
         token, _source = _cancellation_token(cancellation, timeout)
         return self._core.run(
             {name: np.asarray(value) for name, value in inputs.items()},
             token,
+            "" if profile_prefix is None else os.fspath(profile_prefix),
         )
 
 
@@ -824,6 +880,21 @@ def _admission_stats(payload: Mapping[str, Any]) -> PipelineAdmissionStats:
     )
 
 
+def _trace_record(payload: Mapping[str, Any]) -> PipelineTraceRecord:
+    """Freezes one native trace record, using ``None`` for a missing file."""
+    path = str(payload["path"])
+    return PipelineTraceRecord(
+        epoch=int(payload["epoch"]),
+        trace_id=int(payload["trace_id"]),
+        component=str(payload["component"]),
+        path=None if not path else Path(path),
+        outcome=payload["outcome"],
+        duration_ns=int(payload["duration_ns"]),
+        size_bytes=int(payload["size_bytes"]),
+        profiling_failed=bool(payload["profiling_failed"]),
+    )
+
+
 def _telemetry_snapshot(payload: Mapping[str, Any]) -> PipelineTelemetrySnapshot:
     """Freezes one native telemetry reading into its typed value."""
     transfers = payload["transfers"]
@@ -858,6 +929,9 @@ def _telemetry_snapshot(payload: Mapping[str, Any]) -> PipelineTelemetrySnapshot
                 transfers["component_input_bytes_host"]
             ),
         ),
+        traces=tuple(_trace_record(record) for record in payload["traces"]),
+        dropped_traces=int(payload["dropped_traces"]),
+        failed_traces=int(payload["failed_traces"]),
     )
 
 
@@ -897,6 +971,18 @@ class Pipeline:
     collector at all rather than a collector that ignores everything, so the
     default costs one pointer test per instrumentation site. It changes what
     is measured and never what is executed.
+
+    ``telemetry_trace_directory`` is a second, narrower opt-in on top of that:
+    with it set, every component call additionally asks ONNX Runtime for a
+    node-level trace of that one call, written into this directory under a
+    prefix unique to the call. It requires ``enable_telemetry`` and raises
+    :class:`WorldModelError` without it, the directory is created and checked
+    while the pipeline loads rather than on the first run, and tracing is
+    deliberately not free: a traced call writes a file and publishes one
+    record. ``max_trace_records`` bounds how many records one epoch keeps in
+    memory; reaching it never stops profiling, because the files are still
+    written and only the record is dropped. This runtime never deletes a trace
+    file.
     """
 
     def __init__(
@@ -918,6 +1004,8 @@ class Pipeline:
         ) = None,
         allow_unpreferred_providers: bool = False,
         enable_telemetry: bool = False,
+        telemetry_trace_directory: str | os.PathLike[str] | None = None,
+        max_trace_records: int = 256,
     ) -> None:
         package = Path(package_path)
         with (package / "pipeline.json").open(encoding="utf-8") as file:
@@ -928,6 +1016,11 @@ class Pipeline:
         provider_names, options = _provider_arguments(providers, provider_options)
         stage_kind_limits = dict(max_concurrent_by_stage_kind or {})
         placement = _placement_arguments(component_placement)
+        trace_directory = (
+            None
+            if telemetry_trace_directory is None
+            else Path(telemetry_trace_directory)
+        )
         self._core = _native.Pipeline(
             os.fspath(package),
             os.fspath(library_path),
@@ -943,6 +1036,8 @@ class Pipeline:
             placement,
             allow_unpreferred_providers,
             enable_telemetry,
+            "" if trace_directory is None else os.fspath(trace_directory),
+            max_trace_records,
         )
         # Recorded only after the native constructor accepted them, so these
         # report the limits actually in force rather than what was requested.
@@ -951,6 +1046,8 @@ class Pipeline:
             stage_kind_limits
         )
         self._telemetry_enabled = enable_telemetry
+        self._telemetry_trace_directory = trace_directory
+        self._max_trace_records = max_trace_records
         self._transfer_plan = _transfer_plan(self._core.transfer_plan)
         self._manifest: dict[str, Any] = self._document["manifest"]
         components = {
@@ -1068,6 +1165,25 @@ class Pipeline:
     def telemetry_enabled(self) -> bool:
         """Whether this pipeline collects telemetry at all."""
         return self._telemetry_enabled
+
+    @property
+    def telemetry_trace_directory(self) -> Path | None:
+        """Where per-call ONNX Runtime traces are written, or ``None``.
+
+        ``None`` -- the default -- means this pipeline collects counters only
+        and asks ONNX Runtime for no trace at all.
+        """
+        return self._telemetry_trace_directory
+
+    @property
+    def max_trace_records(self) -> int:
+        """How many trace records one telemetry epoch keeps in memory.
+
+        Reaching this cap never stops profiling: the files are still written
+        and ``PipelineTelemetrySnapshot.dropped_traces`` counts the records
+        that were not kept.
+        """
+        return self._max_trace_records
 
     @property
     def telemetry_snapshot(self) -> PipelineTelemetrySnapshot:

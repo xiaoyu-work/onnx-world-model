@@ -1,9 +1,9 @@
 /**
  * @agent-file
- * @agent-purpose: Implements execution-provider normalization and library registration, tensor-versus-signature validation, ModelMetadata lookups, and the validating Model facade.
+ * @agent-purpose: Implements execution-provider normalization and library registration, tensor-versus-signature validation, ModelMetadata lookups, and the validating Model facade with its three Run overloads.
  * @agent-public-api: NormalizeExecutionProviderName, AvailableExecutionProviders, RegisterExecutionProviderLibrary, ValidateTensor, ModelMetadata::Input, ModelMetadata::Output, ModelBackend::Run, Model::Model, Model::Load, Model::metadata, Model::Run
- * @agent-invariants: Model::Run rejects missing, unexpected, or mismatched tensors on both the input and the output side before and after the backend call; a negative spec dimension accepts any concrete extent; NormalizeExecutionProviderName strips non-alphanumeric characters and the ExecutionProvider suffix, then folds the directml, trtrtx, nvtensorrtx, and tensortrt aliases; a null backend throws ErrorCode::invalid_argument. The cancellable Model::Run overload checks its token before the backend call and after output validation, and ModelBackend's default cancellable overload does the same around the one-argument Run, so a backend that cannot interrupt itself still stops at those two boundaries.
- * @agent-side-effects: Model::Load and AvailableExecutionProviders load the ONNX Runtime shared library; RegisterExecutionProviderLibrary also loads an EP library into the process; Model::Load reads model files.
+ * @agent-invariants: Model::Run rejects missing, unexpected, or mismatched tensors on both the input and the output side before and after the backend call; a negative spec dimension accepts any concrete extent; NormalizeExecutionProviderName strips non-alphanumeric characters and the ExecutionProvider suffix, then folds the directml, trtrtx, nvtensorrtx, and tensortrt aliases; a null backend throws ErrorCode::invalid_argument. The ModelRunOptions overload is the one Model::Run implementation: the one-argument and cancellable overloads build the options they imply and delegate to it, so validation and the two cancellation boundaries -- before the backend call and after output validation -- cannot drift between them. ModelBackend's default cancellable overload checks the token around the one-argument Run, and its default ModelRunOptions overload drops the profile-file prefix and forwards to that cancellable one, so a backend that cannot interrupt or profile itself still stops at those two boundaries and simply produces no trace file.
+ * @agent-side-effects: Model::Load and AvailableExecutionProviders load the ONNX Runtime shared library; RegisterExecutionProviderLibrary also loads an EP library into the process; Model::Load reads model files. A Run whose options carry a profile-file prefix makes the ONNX Runtime backend write a trace file for that call.
  */
 
 #include "onnx_world_model/model.hpp"
@@ -149,6 +149,17 @@ NamedTensors ModelBackend::Run(
   return outputs;
 }
 
+// The same reasoning one layer up: a backend that cannot profile a single call
+// keeps its existing behavior and simply drops the prefix. Silently doing
+// nothing is correct here and only here, because the caller finds out by
+// finding no trace file and records that as a profiling failure rather than
+// as a successful trace it never got.
+NamedTensors ModelBackend::Run(
+    const NamedTensors& inputs,
+    const ModelRunOptions& options) const {
+  return Run(inputs, options.cancellation);
+}
+
 Model::Model(ModelBackendPtr backend) : backend_(std::move(backend)) {
   if (backend_ == nullptr) {
     throw Error(ErrorCode::invalid_argument, "Backend cannot be null");
@@ -166,20 +177,26 @@ const ModelMetadata& Model::metadata() const noexcept {
 }
 
 NamedTensors Model::Run(const NamedTensors& inputs) const {
-  ValidateNames(inputs, metadata().inputs, "input");
-  NamedTensors outputs = backend_->Run(inputs);
-  ValidateNames(outputs, metadata().outputs, "output");
-  return outputs;
+  return Run(inputs, ModelRunOptions{});
 }
 
 NamedTensors Model::Run(
     const NamedTensors& inputs,
     const CancellationToken& cancellation) const {
-  cancellation.ThrowIfCancellationRequested();
+  return Run(inputs, ModelRunOptions{.cancellation = cancellation});
+}
+
+// The one implementation. The other two overloads build the options they
+// imply and land here, so validation, the cancellation boundaries, and the
+// outputs cannot drift between the three ways of calling a model.
+NamedTensors Model::Run(
+    const NamedTensors& inputs,
+    const ModelRunOptions& options) const {
+  options.cancellation.ThrowIfCancellationRequested();
   ValidateNames(inputs, metadata().inputs, "input");
-  NamedTensors outputs = backend_->Run(inputs, cancellation);
+  NamedTensors outputs = backend_->Run(inputs, options);
   ValidateNames(outputs, metadata().outputs, "output");
-  cancellation.ThrowIfCancellationRequested();
+  options.cancellation.ThrowIfCancellationRequested();
   return outputs;
 }
 

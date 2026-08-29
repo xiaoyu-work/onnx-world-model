@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-29T00:47:25.720Z",
+  "generatedAt": "2026-08-29T02:18:29.635Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "482067d30b0a476a65b1e8172c6555f7a835fbf65602ef7acfb2117b01d60667",
+  "sourceFingerprint": "985d3b28d8605779c5607aa7cc350abd672c61c8755a70ba9c431f7d372a57a4",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -90,7 +90,7 @@
     {
       "path": "include/onnx_world_model/model.hpp",
       "kind": "source",
-      "purpose": "Declares runtime session and device-output configuration, execution-provider helpers and registration, and Model, the generic named-tensor ONNX graph session used by every higher-level API.",
+      "purpose": "Declares runtime session and device-output configuration, execution-provider helpers and registration, per-run options carrying cancellation and an optional ONNX Runtime profile-file prefix, and Model, the generic named-tensor ONNX graph session used by every higher-level API.",
       "publicSymbols": [
         "GraphOptimizationLevel",
         "RuntimeOptions",
@@ -98,6 +98,7 @@
         "AvailableExecutionProviders",
         "RegisterExecutionProviderLibrary",
         "NamedTensors",
+        "ModelRunOptions",
         "ModelBackend",
         "ModelBackendPtr",
         "Model"
@@ -112,7 +113,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, and device-boundary counters, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options -- counters and optional per-run ONNX Runtime node traces -- and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, device-boundary, and trace records, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -134,6 +135,8 @@
         "PipelineSchedulingOptions",
         "PipelineSchedulingStats",
         "PipelineTelemetryOptions",
+        "PipelineCallOutcome",
+        "PipelineTraceRecord",
         "PipelineComponentStats",
         "PipelineStageStats",
         "PipelineAdmissionStats",
@@ -206,6 +209,7 @@
         "PipelineStageSpec",
         "PipelineStageStats",
         "PipelineTelemetrySnapshot",
+        "PipelineTraceRecord",
         "PipelineTransfer",
         "PipelineTransferPlan",
         "PipelineTransferStats",
@@ -256,6 +260,8 @@
         "PipelineStageStats",
         "PipelineAdmissionStats",
         "PipelineTransferStats",
+        "PipelineCallOutcome",
+        "PipelineTraceRecord",
         "PipelineTelemetrySnapshot",
         "StepResult",
         "StageEventKind",
@@ -395,7 +401,7 @@
     {
       "path": "src/model.cpp",
       "kind": "source",
-      "purpose": "Implements execution-provider normalization and library registration, tensor-versus-signature validation, ModelMetadata lookups, and the validating Model facade.",
+      "purpose": "Implements execution-provider normalization and library registration, tensor-versus-signature validation, ModelMetadata lookups, and the validating Model facade with its three Run overloads.",
       "publicSymbols": [
         "NormalizeExecutionProviderName",
         "AvailableExecutionProviders",
@@ -577,10 +583,15 @@
     {
       "path": "src/pipeline_telemetry.cpp",
       "kind": "source",
-      "purpose": "Implements the opt-in telemetry collector behind PipelineTelemetryOptions: the pre-populated per-epoch counter slab, the atomic slab publication that makes ResetTelemetry a new epoch rather than a barrier, the component and stage recorders that classify an outcome by ErrorCode, the admission and device-transfer hooks, and the immutable PipelineTelemetrySnapshot that Pipeline::telemetry_snapshot() reports.",
+      "purpose": "Implements the opt-in telemetry collector behind PipelineTelemetryOptions: the pre-populated per-epoch counter slab, the atomic slab publication that makes ResetTelemetry a new epoch rather than a barrier, the component and stage recorders that classify an outcome by ErrorCode, the admission and device-transfer hooks, the per-run ONNX Runtime trace prefix, its file discovery and record retention, and the immutable PipelineTelemetrySnapshot that Pipeline::telemetry_snapshot() reports.",
       "publicSymbols": [
+        "detail::ValidatePipelineTelemetryOptions",
         "detail::PipelineTelemetry::PipelineTelemetry",
         "detail::PipelineTelemetry::slab",
+        "detail::PipelineTelemetry::tracing",
+        "detail::PipelineTelemetry::trace_directory",
+        "detail::PipelineTelemetry::max_trace_records",
+        "detail::PipelineTelemetry::AllocateTraceId",
         "detail::PipelineTelemetry::Reset",
         "detail::PipelineTelemetry::Snapshot",
         "detail::MakePipelineTelemetry",
@@ -593,6 +604,7 @@
         "detail::RecordStageCompletion",
         "detail::TelemetryComponentScope constructor",
         "destructor",
+        "profile_prefix",
         "RecordSuccess and RecordCurrentException",
         "detail::TelemetryStageScope constructor",
         "destructor",
@@ -602,7 +614,7 @@
     {
       "path": "src/pipeline_telemetry.hpp",
       "kind": "source",
-      "purpose": "Declares the internal opt-in telemetry collector a Pipeline shares with its admission scheduler and with every session it creates -- the immutable per-epoch counter slab, the relaxed-atomic counter helpers, the RAII component and stage recorders, the admission and device-transfer recording hooks, and the epoch reset that publishes a fresh slab.",
+      "purpose": "Declares the internal opt-in telemetry collector a Pipeline shares with its admission scheduler and with every session it creates -- the immutable per-epoch counter slab, the relaxed-atomic counter helpers, the per-epoch trace-record state, the RAII component and stage recorders, the admission and device-transfer recording hooks, the trace-configuration validation the loader runs before any model file is opened, and the epoch reset that publishes a fresh slab.",
       "publicSymbols": [
         "onnx_world_model::detail::PipelineTelemetryPtr",
         "onnx_world_model::detail::TelemetryCounter",
@@ -612,8 +624,10 @@
         "onnx_world_model::detail::TelemetryStageEntry",
         "onnx_world_model::detail::TelemetryAdmissionEntry",
         "onnx_world_model::detail::TelemetryTransferEntry",
+        "onnx_world_model::detail::TelemetryTraceState",
         "onnx_world_model::detail::TelemetrySlab",
         "onnx_world_model::detail::PipelineTelemetry",
+        "onnx_world_model::detail::ValidatePipelineTelemetryOptions",
         "onnx_world_model::detail::MakePipelineTelemetry",
         "onnx_world_model::detail::SnapshotPipelineTelemetry",
         "onnx_world_model::detail::ResetPipelineTelemetry",
@@ -738,6 +752,14 @@
       ]
     },
     {
+      "path": "tests/cpp/pipeline_trace_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for per-run ONNX Runtime trace profiling driven by pipeline telemetry: the profile-file prefix a component call is handed, its uniqueness across concurrent calls, the one trace record each call publishes with its outcome and file, the profiling failures that leave a record with no path, the retention cap and its dropped counter, the epoch reset that clears records while leaving files on disk, and the configuration validation that rejects an unusable trace directory while a Pipeline is being built.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/tensor_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for Tensor: checked layout arithmetic, CPU and device-buffer construction, explicit CPU materialization, typed access, zero initialization, and copy-on-write semantics.",
@@ -820,6 +842,12 @@
       "path": "tests/python/test_telemetry.py",
       "kind": "test",
       "purpose": "Tests the keyword-only enable_telemetry argument on Pipeline and WorldModel, the Pipeline.telemetry_snapshot reading and its frozen dataclasses and read-only mappings, the counts one single-threaded run produces for components, stages, admission, and device transfers, and the reset_telemetry epoch.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_trace.py",
+      "kind": "test",
+      "purpose": "Tests the OnnxModel.run profile_prefix argument against a real ONNX Runtime graph and the Pipeline telemetry_trace_directory and max_trace_records arguments, the PipelineTraceRecord values a traced run publishes, the retention cap, the epoch reset, and the configuration errors.",
       "publicSymbols": []
     },
     {

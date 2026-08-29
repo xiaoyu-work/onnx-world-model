@@ -48,10 +48,17 @@ latent-dynamics compatibility layer.
   materializations the session performs, and reports them as an immutable
   `PipelineTelemetrySnapshot` under a reset-able epoch. Telemetry changes what
   is measured and never what is executed; with it disabled the `Pipeline`
-  holds no collector and every recording site is one null-pointer test. ONNX
-  Runtime per-node traces, provider peak memory, and exact host-to-device byte
-  counts are deliberately not implemented, because only ONNX Runtime holds
-  that data.
+  holds no collector and every recording site is one null-pointer test.
+  Provider peak memory and exact host-to-device byte counts are deliberately
+  not implemented, because only ONNX Runtime holds that data.
+- Trace ONNX Runtime nodes per run when a caller opts in a second time, by
+  configuring a trace directory: each component call is handed a unique
+  profile-file prefix, ONNX Runtime writes that one call's trace, and the
+  collector records one bounded `PipelineTraceRecord` naming the file, its
+  size, and the call's outcome. Profiling is per run and never per session, a
+  trace is discovered by prefix and never parsed here, a trace that cannot be
+  found is counted as a profiling failure and never changes the call, and no
+  trace file is ever deleted.
 - Keep `Pipeline` immutable and shareable while `PipelineSession` owns one
   request's mutable state, and let a session capture that state as an
   immutable in-memory `PipelineSessionSnapshot` it can restore or fork from, or
@@ -66,15 +73,15 @@ latent-dynamics compatibility layer.
 |---|---|
 | `cancellation.hpp/.cpp` | The cancellation state machine behind `CancellationToken` and `CancellationSource`: first-reason-wins claiming, deadline claiming from both a poll and the one process-wide `detail::DeadlineService` watchdog, the blocking `WaitForCancellation`, the race-free callback registry, the `detail::CancellationAccess` seam, and the RAII `detail::CancellationRegistration`. |
 | `dynamic_library.hpp/.cpp` | RAII shared-library handle; binds the `OrtApi` table once per process. |
-| `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, reads each session's per-port memory plan once and publishes it as `TensorSpec::device`, retains I/O-bound outputs in ORT-owned device buffers, and terminates an in-flight `Session::Run` through a per-call `Ort::RunOptions`. |
+| `ort_backend.hpp/.cpp` | The only ORT-facing translation unit pair: shares the process-wide ORT environment, builds sessions, applies providers, reads each session's per-port memory plan once and publishes it as `TensorSpec::device`, retains I/O-bound outputs in ORT-owned device buffers, and terminates an in-flight `Session::Run` through a per-call `Ort::RunOptions` that it also enables per-run profiling on when the call supplied a profile-file prefix. |
 | `tensor.cpp` | Canonical tensor devices, owned CPU buffers, checked shape arithmetic, explicit CPU materialization, and copy-on-write mutation. |
-| `model.cpp` | `Model` facade, the default cancellable `ModelBackend::Run` overload, provider-name normalization, tensor-versus-signature validation. |
+| `model.cpp` | `Model` facade with its one `ModelRunOptions` implementation the other two `Run` overloads delegate to, the default cancellable and default `ModelRunOptions` `ModelBackend::Run` overloads, provider-name normalization, tensor-versus-signature validation. |
 | `world_model.cpp` | `WorldModel` contract enforcement and `Rollout` recurrent state. |
 | `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, and the connection transfer plan. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
 | `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the supported stage-kind list and its validation, the per-kind permit buckets, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, the per-stage-kind admission outcome each acquisition records into the telemetry collector, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
-| `pipeline_telemetry.hpp/.cpp` | The opt-in telemetry collector behind `PipelineTelemetryOptions`: the immutable per-epoch counter slab pre-populated from the manifest, the relaxed-atomic counters and their compare-exchange maxima, the RAII component and stage recorders that classify an outcome by `ErrorCode`, the admission and device-transfer hooks, the atomic slab publication that makes `Pipeline::ResetTelemetry` a new epoch rather than a barrier, and `detail::SnapshotPipelineTelemetry`, the reading `Pipeline::telemetry_snapshot` returns. |
+| `pipeline_telemetry.hpp/.cpp` | The opt-in telemetry collector behind `PipelineTelemetryOptions`: the immutable per-epoch counter slab pre-populated from the manifest, the relaxed-atomic counters and their compare-exchange maxima, the RAII component and stage recorders that classify an outcome by `ErrorCode`, the admission and device-transfer hooks, `detail::ValidatePipelineTelemetryOptions` and the trace directory it creates on the cold path, the sanitized unique per-call trace prefix and the `noexcept` discovery that turns the file ONNX Runtime wrote into one capped `PipelineTraceRecord`, the atomic slab publication that makes `Pipeline::ResetTelemetry` a new epoch rather than a barrier, and `detail::SnapshotPipelineTelemetry`, the reading `Pipeline::telemetry_snapshot` returns. |
 | `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the `StageRun::Impl` state machine that both `RunStage` and `BeginStage` execute through, its cancellation source and the link into a caller's token, the admission leases every execution takes before the session lock, the telemetry recorders those executions and their component calls are measured by, the snapshot, restore, fork, and named-checkpoint operations over that bundle, the single `MaterializeHost` device-versus-host materialization boundary, and `Pipeline` itself. |
 
 `cancellation.hpp`, `dynamic_library.hpp`, `ort_backend.hpp`,
@@ -112,7 +119,12 @@ allocates nothing under the lock and cannot block it.
 `pipeline_telemetry.cpp` sits below both: it records and never reads back, it
 uses `SupportedStageKinds()` from `pipeline_scheduler.hpp` for its admission
 keys while `pipeline_scheduler.hpp` includes only `pipeline_telemetry.hpp`, so
-the dependency stays one-way, and it touches nothing but its own atomics.
+the dependency stays one-way, and its counter paths touch nothing but their own
+atomics. Its one exception is tracing, which is explicit about being different:
+it takes a trace mutex that guards only its record vector, allocates one record
+per traced call, and reads the configured trace directory to find the file ONNX
+Runtime wrote. That work still happens under no other lock, calls back into no
+other file, and cannot fail the call it measures.
 
 The one lock order this directory must preserve is
 `CancellationState`'s callback mutex, then the scheduler mutex, then the
@@ -120,8 +132,9 @@ session mutex, then ONNX Runtime. A cancellation registration is therefore
 never created or destroyed while the scheduler mutex is held, and every
 execution takes its admission lease before it takes the session lock.
 Telemetry is outside that order entirely: it takes none of those locks, calls
-back into none of those files, and only ever updates relaxed atomics or loads
-an atomic `shared_ptr`, so it can neither deadlock nor reorder anything.
+back into none of those files, and only ever updates relaxed atomics, loads an
+atomic `shared_ptr`, or takes its own trace mutex, so it can neither deadlock
+nor reorder anything.
 
 ## Tests
 
@@ -137,8 +150,9 @@ ctest --preset dev
 `tests/cpp/pipeline_snapshot_test.cpp`,
 `tests/cpp/pipeline_stream_test.cpp`,
 `tests/cpp/pipeline_cancellation_test.cpp`,
-`tests/cpp/pipeline_scheduler_test.cpp`, and
-`tests/cpp/pipeline_telemetry_test.cpp` cover this directory directly;
+`tests/cpp/pipeline_scheduler_test.cpp`,
+`tests/cpp/pipeline_telemetry_test.cpp`, and
+`tests/cpp/pipeline_trace_test.cpp` cover this directory directly;
 `tests/cpp/pipeline_test.cpp` is the primary coverage for manifest parsing and
 validation, `tests/cpp/cancellation_test.cpp` is the primary coverage for
 `cancellation.cpp`, `tests/cpp/pipeline_device_test.cpp` is the primary
@@ -153,8 +167,12 @@ that machine's cancellation and deadline boundaries,
 `pipeline_scheduler.cpp` and for which calls take an admission lease, and
 `tests/cpp/pipeline_telemetry_test.cpp` is the primary coverage for
 `pipeline_telemetry.cpp` and for what each recording site in
-`pipeline_session.cpp` and `pipeline_scheduler.cpp` counts.
+`pipeline_session.cpp` and `pipeline_scheduler.cpp` counts, and
+`tests/cpp/pipeline_trace_test.cpp` is the primary coverage for its trace
+prefix, file discovery, record retention, and configuration validation.
 `tests/python/` exercises the same code through the `_native` extension
 module; `tests/python/test_placement.py` is where the load-time placement
-overrides and their rejection cases are exercised end to end, and
-`tests/python/test_telemetry.py` is where the telemetry surface is.
+overrides and their rejection cases are exercised end to end,
+`tests/python/test_telemetry.py` is where the telemetry surface is, and
+`tests/python/test_trace.py` is where real ONNX Runtime trace files are
+produced and read back.

@@ -47,8 +47,8 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineTelemetryOptions`, `PipelineTelemetrySnapshot`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
-| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, component placement and connection transfer planning, admission scheduling, opt-in telemetry collection, staged execution. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `ModelRunOptions`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineTelemetryOptions`, `PipelineCallOutcome`, `PipelineTraceRecord`, `PipelineTelemetrySnapshot`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
+| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, component placement and connection transfer planning, admission scheduling, opt-in telemetry collection and per-run trace recording, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
 | C++ tests | `tests/cpp/` | Stub-backend tests registered with CTest. |
@@ -71,8 +71,10 @@ Within `src/` the runtime is layered:
   session's per-port memory plan once and publishes it as
   `TensorSpec::device`, uses I/O binding to wrap ORT-owned outputs in
   device-aware tensors, and terminates an
-  in-flight `Session::Run` through a per-call `Ort::RunOptions`.
-- `model` validates named tensors against graph signatures.
+  in-flight `Session::Run` through a per-call `Ort::RunOptions` that it also
+  enables profiling on when the call asked for a trace.
+- `model` validates named tensors against graph signatures and collapses its
+  three `Run` overloads onto one `ModelRunOptions` implementation.
 - `pipeline` parses `pipeline.json`, resolves and validates per-component
   placement over the pipeline-wide `RuntimeOptions`, and classifies every
   connection into the package's conservative `PipelineTransferPlan`;
@@ -88,10 +90,14 @@ Within `src/` the runtime is layered:
 - `pipeline_telemetry` is the shared, opt-in measurement collector: one
   immutable pre-populated counter slab per epoch, relaxed-atomic counters, the
   RAII component and stage recorders, the admission and device-transfer hooks,
-  and the atomic slab publication that makes a reset a new epoch rather than a
+  the trace-configuration validation the loader runs before any model file is
+  opened, the unique per-call profile-file prefix and the `noexcept` discovery
+  that turns the file ONNX Runtime wrote into one bounded record, and the
+  atomic slab publication that makes a reset a new epoch rather than a
   barrier. It records and never reads back, so it changes what is measured and
   never what is executed; with telemetry disabled a `Pipeline` holds no
-  collector at all.
+  collector at all, and without a trace directory it never touches the
+  filesystem.
 - `pipeline_session` executes stages, owns per-trajectory state, drives one
   stage at a time through the `StageRun` state machine, captures or
   restores that state as an in-memory snapshot, materializes every device
@@ -336,10 +342,38 @@ publishes a fresh slab under the next epoch rather than clearing counters in
 place, so an execution that is already running finishes into the epoch it
 started in and is intentionally absent from the new one. A disabled or
 moved-from `Pipeline` reads as `enabled == false`, epoch `0`, and empty maps
-rather than throwing. ONNX Runtime per-node traces, execution-provider peak
-memory, and exact host-to-device byte counts are deliberately out of scope:
-each needs data only ONNX Runtime holds, and this runtime reports nothing it
-cannot measure itself.
+rather than throwing. Execution-provider peak memory and exact host-to-device
+byte counts are deliberately out of scope: each needs data only ONNX Runtime
+holds, and this runtime reports nothing it cannot measure itself.
+
+Per-node timing is the one thing ONNX Runtime will hand over, and it is a
+second, narrower opt-in on top of telemetry rather than part of it.
+`PipelineTelemetryOptions::trace_directory` requires `enabled`, is validated
+and created while the `Pipeline` is built — before any component model file is
+opened — and turns every component call into a profiled one. Profiling is per
+run and never per session: the one component call site in `pipeline_session`
+hands `Model::Run` a `ModelRunOptions` whose `profile_file_prefix` is unique
+to that call, `ort_backend` enables profiling on that call's own
+`Ort::RunOptions`, and nothing about the session is rebuilt or shared. The
+prefix includes the sanitized component, epoch, a process-lifetime nonce,
+process-wide trace ID, and pid. Two collectors sharing a directory, two
+concurrent calls, two epochs, and two process lifetimes therefore cannot
+collide, and a component name reaches a file name only as ASCII letters,
+digits, dot, underscore, and hyphen.
+
+ONNX Runtime names the file itself, appending its own local timestamp and
+`.json`, so after the call returns or throws the collector scans that one
+directory for the prefix. Exactly one non-empty match is recorded as a
+`PipelineTraceRecord` with the call's outcome, duration, path, and size; zero
+matches, several matches, an empty file, and a filesystem error are all
+profiling failures that are counted, recorded with an empty C++ path (`None`
+in Python), and never allowed to change, retry, or fail the model call. A trace
+is never parsed on the execution path. Records are published in completion
+order under one mutex that guards nothing else, while `trace_id` recovers start
+order. Up to `max_trace_records` are inspected and kept; later calls skip
+discovery and increment `dropped_traces` while their files remain on disk.
+`ResetTelemetry` drops records with the rest of the epoch and deletes nothing:
+trace files on disk are the caller's to manage.
 
 Named checkpoints are control metadata held on the session beside that
 execution state rather than inside it. A snapshot therefore never carries a
@@ -384,9 +418,10 @@ Python:
   arguments that cap concurrent executions, the keyword-only
   `component_placement` and `allow_unpreferred_providers` constructor
   arguments that place each component's session, the read-only
-  `transfer_plan` those produce, and the keyword-only `enable_telemetry`
-  constructor argument with the read-only `telemetry_snapshot` and
-  `reset_telemetry()` that report and restart the runtime counters.
+  `transfer_plan` those produce, and the keyword-only `enable_telemetry`,
+  `telemetry_trace_directory`, and `max_trace_records` constructor arguments
+  with the read-only `telemetry_snapshot` and `reset_telemetry()` that report
+  and restart the runtime counters and this epoch's trace records.
 - `onnx_world_model.CancellationSource` and `CancellationToken` — explicit
   cancellation and deadlines, with `CancelledError` and
   `DeadlineExceededError` as the outcomes, both derived from
@@ -413,13 +448,16 @@ C++:
   `Pipeline::transfer_plan` and `PipelinePackage::transfer_plan` read the
   resulting connection classification. `Pipeline`'s constructor and `Load`
   also take an optional `PipelineTelemetryOptions` that turns runtime
-  measurement on, and `Pipeline::telemetry_snapshot` and
-  `Pipeline::ResetTelemetry` read and restart those counters.
+  measurement on, adds per-run ONNX Runtime node traces when its
+  `trace_directory` is set, and bounds the kept records with
+  `max_trace_records`; `Pipeline::telemetry_snapshot` and
+  `Pipeline::ResetTelemetry` read and restart those counters and records.
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
   in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
-- `onnx_world_model::Model::Load` and `Model::Run`, whose cancellable overload
-  takes a `CancellationToken`.
+- `onnx_world_model::Model::Load` and `Model::Run`, whose `ModelRunOptions`
+  overload carries the `CancellationToken` and the optional
+  `profile_file_prefix` that traces that one call.
 - `onnx_world_model::CancellationSource` and `CancellationToken`, whose
   `WaitForCancellation` blocks until a reason is claimed, plus
   `StageRun::RequestCancellation` for stopping work already running.
@@ -492,17 +530,27 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   Measurement changes what is observed and never what is executed, in what
   order, or with what result. Disabled is the default and means no collector
   at all, so an unmeasured pipeline pays one null test per site; enabled, the
-  collector only ever updates its own relaxed atomics, takes none of the
-  runtime's locks, calls back into none of its code, and can therefore neither
+  counter paths only ever update their own relaxed atomics, take none of the
+  runtime's locks, call back into none of its code, and can therefore neither
   deadlock nor perturb admission or execution. An outcome is classified by
   `ErrorCode`, never by message. A reading is a detached value whose fields are
   individually current rather than one atomic instant, and a reset publishes a
   new epoch rather than editing counters, so in-flight work lands in the epoch
   it started in. Byte totals the runtime measures itself are exact; anything it
   cannot measure is absent rather than estimated, which is why there is no
-  host-to-device byte counter, no ONNX Runtime per-node trace, and no
-  execution-provider peak memory. Component input residency is presentation,
-  not transfer, and must not be documented as a transfer count.
+  host-to-device byte counter and no execution-provider peak memory. Component
+  input residency is presentation, not transfer, and must not be documented as
+  a transfer count.
+- **Tracing is a second opt-in that admits its cost, and never parses.**
+  Per-run ONNX Runtime node traces require both `enabled` and a validated
+  `trace_directory`, so the counter-only configuration keeps every earlier
+  invariant. A traced call allocates a unique prefix, makes ONNX Runtime write
+  one file for that call alone — never for the session — and publishes one
+  record under a mutex that guards nothing else. Discovery is by prefix
+  because ONNX Runtime owns the file name, it is `noexcept`, and it can only
+  ever add a profiling failure: a trace that cannot be found never changes,
+  retries, or fails the model call it belonged to. Retention bounds memory
+  rather than profiling, and no trace file is ever deleted by this runtime.
 - **Placement is load-time, and the transfer plan only describes it.** Which
   execution providers, provider options, graph optimization level, and thread
   counts a component's session is built with is decided once, while that
@@ -589,11 +637,16 @@ not partially implemented anywhere:
 Runtime telemetry covers what this runtime performs itself: component calls,
 stage executions, steps and completions, admission wait outcomes, the
 device-to-host materializations a session makes, and the residency of the
-bytes each component was handed. The following are deliberately out of scope
-in this milestone and are not partially implemented anywhere:
+bytes each component was handed. Per-run ONNX Runtime node traces are covered
+too, as files this runtime asks ONNX Runtime to write and then points at. The
+following are deliberately out of scope in this milestone and are not
+partially implemented anywhere:
 
-- ONNX Runtime per-node profiling traces and their export, because only ORT
-  produces them;
+- parsing, summarizing, aggregating, or exporting the contents of a trace
+  file. A record carries the path, the size, the outcome, and the duration;
+  what is inside the file belongs to the caller and to ONNX Runtime;
+- managing trace files on disk. Nothing here rotates, compresses, prunes, or
+  deletes one, so the configured directory grows until the caller cleans it;
 - execution-provider peak or current memory, because only the provider knows
   it;
 - exact host-to-device byte counts, because uploads happen inside ORT when it
@@ -601,6 +654,14 @@ in this milestone and are not partially implemented anywhere:
   they were presented; it is not an upload count and must not be read as one.
   A device-to-host copy ORT makes below the session boundary, when it stages a
   foreign device buffer into a call, is likewise not counted;
-- sampling, aggregation windows, percentiles, export to a metrics system, and
-  per-request tracing. A snapshot is a set of cumulative counters for one
-  epoch, and everything above it belongs to the caller.
+- sampling, aggregation windows, percentiles, and export to a metrics system.
+  A snapshot is a set of cumulative counters for one epoch plus a bounded list
+  of trace records, and everything above it belongs to the caller.
+
+Two ONNX Runtime behaviours bound what a trace file can say, and this runtime
+reports the file rather than correcting it: a profiled session stops recording
+after roughly one million events, and a provider that internally replays a
+graph — a graph-capture retry, for instance — can record more than one
+execution of the same node in one file. A run that fails before ONNX Runtime
+writes any event leaves the empty file it created, which is reported as a
+profiling failure rather than as a trace.

@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Implements the modality-oriented `WorldModel` generation API by mapping text, image, video, and action requests onto the manifest stages of one Mobius pipeline package.
 # @agent-public-api: WorldModel, TextGenerator, TextOutput, ImageGenerator, ImageOutput, VideoGenerator, VideoOutput, ActionGenerator, ActionOutput
-# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything, the two placement options -- `component_placement` and `allow_unpreferred_providers` -- which are load-time only and never warm, lazily load, offload, evict, or peer-to-peer transfer anything, and `enable_telemetry`, which turns on the pipeline's runtime counters and changes what is measured rather than what is executed. `WorldModel.telemetry_snapshot` and `WorldModel.reset_telemetry` are pass-throughs to that pipeline, and are deliberately distinct from the per-request wall-clock `timings` each generator returns: one measures the runtime, the other measures the request.
+# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything, the two placement options -- `component_placement` and `allow_unpreferred_providers` -- which are load-time only and never warm, lazily load, offload, evict, or peer-to-peer transfer anything, and `enable_telemetry`, which turns on the pipeline's runtime counters and changes what is measured rather than what is executed, together with `telemetry_trace_directory` and `max_trace_records`, which add one per-call ONNX Runtime node trace per component call and require `enable_telemetry`. `WorldModel.telemetry_snapshot` and `WorldModel.reset_telemetry` are pass-throughs to that pipeline, and are deliberately distinct from the per-request wall-clock `timings` each generator returns: one measures the runtime, the other measures the request.
 # @agent-side-effects: Loads a pipeline package and its ONNX components, runs ONNX Runtime inference, reads image and video files supplied by the caller, and records per-stage wall-clock timings.
 
 from __future__ import annotations
@@ -78,6 +78,13 @@ class WorldModel:
     underneath this API -- component calls, stage executions, admission waits,
     and device materializations -- rather than the per-request wall-clock
     ``timings`` each generator already returns.
+
+    ``telemetry_trace_directory`` and ``max_trace_records`` are forwarded the
+    same way. With a trace directory set, each component call also asks ONNX
+    Runtime for a node-level trace of that call alone, written into that
+    directory; it requires ``enable_telemetry``, the records appear in
+    :attr:`telemetry_snapshot`, and the files themselves are never deleted by
+    this runtime.
     """
 
     def __init__(
@@ -99,6 +106,8 @@ class WorldModel:
         ) = None,
         allow_unpreferred_providers: bool = False,
         enable_telemetry: bool = False,
+        telemetry_trace_directory: str | os.PathLike[str] | None = None,
+        max_trace_records: int = 256,
     ) -> None:
         runtime = _GenerationRuntime(
             package_path,
@@ -115,6 +124,8 @@ class WorldModel:
             component_placement=component_placement,
             allow_unpreferred_providers=allow_unpreferred_providers,
             enable_telemetry=enable_telemetry,
+            telemetry_trace_directory=telemetry_trace_directory,
+            max_trace_records=max_trace_records,
         )
         self._runtime = runtime
         self.text = TextGenerator(runtime)

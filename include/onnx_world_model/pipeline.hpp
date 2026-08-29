@@ -2,9 +2,9 @@
 
 /**
  * @agent-file
- * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, and device-boundary counters, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
- * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, ComponentPlacement, PipelinePlacementOptions, PipelineTransferKind, PipelineTransfer, PipelineTransferPlan, PipelinePackage, PipelineRunOptions, PipelineSchedulingOptions, PipelineSchedulingStats, PipelineTelemetryOptions, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineTelemetrySnapshot, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
- * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. PipelinePlacementOptions is load-time only: it appears on PipelinePackage::Load and Pipeline::Load and deliberately not on Pipeline(PipelinePackage, scheduling), whose sessions are already built, and an empty or unknown component key throws ErrorCode::invalid_argument right after the manifest is parsed and before any component model file is opened. A component's providers are its own list when it has one, otherwise the global order, otherwise its manifest preferences; the manifest preferences filter that choice unless allow_unpreferred_providers is set and that component supplied its own list. Provider options merge global-then-component per provider and per key, and component options for a provider that component does not run on throw ErrorCode::invalid_argument instead of being dropped. PipelineTransferPlan holds exactly one PipelineTransfer per manifest connection, recurrent edges included, in manifest order; it is the configured physical plan and is never rewritten when device_outputs_enabled is false, and nothing in this milestone executes from it. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back. PipelineSchedulingOptions is admission scheduling only and never batching: a Pipeline's limits are fixed at construction, shared by every copy of that Pipeline and by every session and StageRun it produces, and an unknown or empty per-kind key is rejected with ErrorCode::invalid_argument at construction. Exactly four calls are one execution and take exactly one permit for their whole duration -- RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain -- while BeginStage, a completed Finish, an idle StageRun between Step calls, Cancel, RequestCancellation, and every query and state method take none.  PipelineSchedulingStats is a detached value, not a view: Pipeline::scheduling_stats() reads the shared controller under its own lock and returns counts that never change afterwards, both per-kind maps always carry all six executable stage kinds, and the counts are permits rather than executions, so an unlimited stage kind -- which is admitted without one -- is reported as zero. PipelineTelemetryOptions is opt-in observability layered above all of that and changes no execution: with it disabled a Pipeline holds no collector, so every recording site is one null test and the default preserves earlier behavior exactly, and with it enabled one collector is shared by every copy of that Pipeline, its scheduler, and every session, forked session, and StageRun. PipelineTelemetrySnapshot is a detached value like the scheduling reading, but it is deliberately not one atomic moment: each counter is copied individually, because the alternative is a lock on the execution path. An execution is one admission lease scope -- the same four calls that take one permit -- while `steps` and `completions` count stage progress instead, so one RunStage of an autoregressive stage is one execution with many steps and exactly one completion, and a direct StepStage counts one step and no completion because it emits no terminal event. Outcomes are classified by ErrorCode rather than by message, so a cancellation and a deadline are never reported as failures. Admission counters describe queue outcomes only, so an unlimited stage kind -- which takes no permit -- reports zeros while its executions are still measured; stage durations start after the permit is granted, so queue wait is reported once, by PipelineAdmissionStats. Device-to-host counters are exact for the materializations this runtime performs and are never claimed for host-to-device traffic, which happens inside ONNX Runtime; component input residency is a presentation measure that counts a tensor once per presentation. Pipeline::ResetTelemetry() publishes a fresh epoch rather than clearing counters in place, so an execution already running finishes into the previous epoch and is absent from the new one.
+ * @agent-purpose: Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options -- counters and optional per-run ONNX Runtime node traces -- and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, device-boundary, and trace records, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.
+ * @agent-public-api: Endpoint, PipelineComponent, PipelineConnection, PipelineInputKind, PipelineInput, PipelineOutput, PipelineStage, PipelineState, PipelineAsset, PipelineManifest, ComponentPlacement, PipelinePlacementOptions, PipelineTransferKind, PipelineTransfer, PipelineTransferPlan, PipelinePackage, PipelineRunOptions, PipelineSchedulingOptions, PipelineSchedulingStats, PipelineTelemetryOptions, PipelineCallOutcome, PipelineTraceRecord, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineTelemetrySnapshot, Pipeline, PipelineSessionSnapshot, StageEventKind, StageEvent, StageRun, PipelineSession
+ * @agent-invariants: Pipeline holds immutable component sessions through a shared_ptr and may be shared by callers, while PipelineSession is move-only and owns exactly one trajectory's mutable state; a manifest naming a capability outside PipelineManifest::SupportedCapabilities() is rejected during loading. PipelinePlacementOptions is load-time only: it appears on PipelinePackage::Load and Pipeline::Load and deliberately not on Pipeline(PipelinePackage, scheduling), whose sessions are already built, and an empty or unknown component key throws ErrorCode::invalid_argument right after the manifest is parsed and before any component model file is opened. A component's providers are its own list when it has one, otherwise the global order, otherwise its manifest preferences; the manifest preferences filter that choice unless allow_unpreferred_providers is set and that component supplied its own list. Provider options merge global-then-component per provider and per key, and component options for a provider that component does not run on throw ErrorCode::invalid_argument instead of being dropped. PipelineTransferPlan holds exactly one PipelineTransfer per manifest connection, recurrent edges included, in manifest order; it is the configured physical plan and is never rewritten when device_outputs_enabled is false, and nothing in this milestone executes from it. RunStage and StepStage preserve the storage of the tensors they are given and may return device-backed tensors, so a caller reading a result on the host calls Tensor::CopyToCpu() first. PipelineSessionSnapshot is an immutable copyable capture of one session's mutable execution state that only PipelineSession::Snapshot() can produce; it records the package it came from, so Restore and Fork accept it only for a session built on that same PipelinePackage instance and otherwise throw ErrorCode::state. Named checkpoints are in-memory transaction markers held beside that execution state, not inside it: a checkpoint name is never empty, Checkpoint captures the same fields Snapshot does, a snapshot never contains checkpoints, RestoreCheckpoint and DropCheckpoint throw ErrorCode::state for an unknown name instead of doing nothing, checkpoints outlive stage execution and Restore, Reset drops them all, and a forked session starts with an empty checkpoint namespace. BeginStage and RunStage share one StageRun state machine and produce identical results; RunStage drains it under one session-lock acquisition so ordinary concurrent calls retain whole-stage serialization. A StageRun is move-only, single-consumer, and synchronous -- Step() blocks until exactly one model or scheduler step finishes -- and it holds the session's only run slot until it completes, is cancelled, or is destroyed; while it holds that slot the session throws ErrorCode::state from BeginStage, RunStage, StepStage, Snapshot, Restore, Fork, Checkpoint, RestoreCheckpoint, DropCheckpoint, Reset, and ReleaseStage, while outputs(), state(), and HasCheckpoint() stay legal. PipelineRunOptions::cancellation carries an optional CancellationToken that every execution path checks at its own boundaries; StageRun::RequestCancellation signals an in-flight step without taking the session lock, while StageRun::Cancel takes it and only closes the handle, so the two are different operations and neither rolls anything back. PipelineSchedulingOptions is admission scheduling only and never batching: a Pipeline's limits are fixed at construction, shared by every copy of that Pipeline and by every session and StageRun it produces, and an unknown or empty per-kind key is rejected with ErrorCode::invalid_argument at construction. Exactly four calls are one execution and take exactly one permit for their whole duration -- RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain -- while BeginStage, a completed Finish, an idle StageRun between Step calls, Cancel, RequestCancellation, and every query and state method take none.  PipelineSchedulingStats is a detached value, not a view: Pipeline::scheduling_stats() reads the shared controller under its own lock and returns counts that never change afterwards, both per-kind maps always carry all six executable stage kinds, and the counts are permits rather than executions, so an unlimited stage kind -- which is admitted without one -- is reported as zero. PipelineTelemetryOptions is opt-in observability layered above all of that and changes no execution: with it disabled a Pipeline holds no collector, so every recording site is one null test and the default preserves earlier behavior exactly, and with it enabled one collector is shared by every copy of that Pipeline, its scheduler, and every session, forked session, and StageRun. PipelineTelemetrySnapshot is a detached value like the scheduling reading, but it is deliberately not one atomic moment: each counter is copied individually, because the alternative is a lock on the execution path. An execution is one admission lease scope -- the same four calls that take one permit -- while `steps` and `completions` count stage progress instead, so one RunStage of an autoregressive stage is one execution with many steps and exactly one completion, and a direct StepStage counts one step and no completion because it emits no terminal event. Outcomes are classified by ErrorCode rather than by message, so a cancellation and a deadline are never reported as failures. Admission counters describe queue outcomes only, so an unlimited stage kind -- which takes no permit -- reports zeros while its executions are still measured; stage durations start after the permit is granted, so queue wait is reported once, by PipelineAdmissionStats. Device-to-host counters are exact for the materializations this runtime performs and are never claimed for host-to-device traffic, which happens inside ONNX Runtime; component input residency is a presentation measure that counts a tensor once per presentation. Pipeline::ResetTelemetry() publishes a fresh epoch rather than clearing counters in place, so an execution already running finishes into the previous epoch and is absent from the new one. Per-run ONNX Runtime node tracing is a second, narrower opt-in on top of that: it needs both enabled=true and a non-empty PipelineTelemetryOptions::trace_directory, which is validated and created while the Pipeline is built and before any component model file is opened, so a bad path fails loading rather than the first run. Profiling is per call and never per session -- each traced component call enables profiling on its own Ort::RunOptions under a unique prefix of trace_directory/<sanitized-component>.e<epoch>.r<trace-id>.p<pid>, so no session is rebuilt and two concurrent calls can never collide. ONNX Runtime names the file by appending its own local timestamp and .json, so discovery scans the configured directory for that prefix; no match, several matches, an empty file, or a filesystem error is a profiling failure that is counted, recorded with an empty path, and never allowed to change, retry, or fail the model call. Trace records are kept in completion order up to max_trace_records and are ordered by trace_id in start order; records past the cap only increment dropped_traces, because the files are still written and retention bounds memory rather than profiling. ResetTelemetry drops in-memory records with the rest of the epoch and never deletes a file: trace files on disk are the caller's to manage.
  * @agent-side-effects: none in this header; the declared Load functions read pipeline.json, component ONNX files, and assets from disk.
  */
 
@@ -415,6 +415,72 @@ struct PipelineTelemetryOptions {
   //: copy of it. It cannot be changed afterwards; build a second Pipeline to
   //: run with a different setting.
   bool enabled{false};
+  //: Where ONNX Runtime writes one node-level trace file per component call,
+  //: or empty -- the default -- to collect counters only. A non-empty
+  //: directory requires `enabled`, is created if it does not exist, and must
+  //: be a directory this process can create files in; anything else throws
+  //: ErrorCode::invalid_argument while the Pipeline is being built, before
+  //: any component model file is opened.
+  //:
+  //: Tracing is deliberately not free like the counters are: a traced call
+  //: allocates a prefix, writes a file through ONNX Runtime, and takes one
+  //: mutex to publish its record. Leaving this empty keeps every earlier
+  //: cost and invariant exactly as it was.
+  std::filesystem::path trace_directory;
+  //: How many PipelineTraceRecord values one epoch keeps in memory. It must
+  //: be greater than zero when `trace_directory` is set. Reaching the cap
+  //: never stops profiling: ONNX Runtime keeps writing files and
+  //: PipelineTelemetrySnapshot::dropped_traces counts the records that were
+  //: not kept, because retention is a memory bound rather than a sampling
+  //: policy. This runtime never deletes a trace file.
+  std::size_t max_trace_records{256};
+};
+
+//: How one measured call ended. It is the same classification the component
+//: outcome counters use -- by ErrorCode, never by message -- exposed as a
+//: value so one trace record can report it.
+enum class PipelineCallOutcome {
+  success,
+  failure,
+  cancelled,
+  deadline_exceeded,
+};
+
+//: One component call that was asked to produce an ONNX Runtime trace.
+//:
+//: A record is created only while telemetry is enabled and a trace directory
+//: is configured, and exactly one is finalized per component call, whatever
+//: the outcome. It describes the call and points at the file; it never
+//: contains parsed trace content, because parsing on the execution path is
+//: exactly the cost tracing exists to measure.
+struct PipelineTraceRecord {
+  //: The telemetry epoch this call recorded into, matching
+  //: PipelineTelemetrySnapshot::epoch of the reading it appears in.
+  std::uint64_t epoch{0};
+  //: A pipeline-wide identifier that increases monotonically across epochs,
+  //: so two records never share one even after a reset, and ordering by it is
+  //: start order.
+  std::uint64_t trace_id{0};
+  //: The manifest component whose model call this was.
+  std::string component;
+  //: The trace file ONNX Runtime wrote, absolute when it could be resolved
+  //: safely. It is empty exactly when `profiling_failed` is true.
+  std::filesystem::path path;
+  //: How the call itself ended. A failed, cancelled, or deadline-exceeded
+  //: call is still recorded, because a trace of a call that did not finish is
+  //: usually the interesting one.
+  PipelineCallOutcome outcome{PipelineCallOutcome::success};
+  //: Wall-clock nanoseconds of the component call, measured exactly like
+  //: PipelineComponentStats::total_duration_ns.
+  std::uint64_t duration_ns{0};
+  //: Size of that file in bytes. It is 0 when `profiling_failed` is true.
+  std::uint64_t size_bytes{0};
+  //: True when no usable trace file was found for this call: none appeared,
+  //: more than one matched the prefix, the file was empty, or the filesystem
+  //: refused to answer. The call's own outcome is reported by `outcome` and
+  //: is unaffected -- a profiling failure never fails, retries, or alters the
+  //: work being measured.
+  bool profiling_failed{false};
 };
 
 //: What one manifest component's model calls did while telemetry was
@@ -574,10 +640,12 @@ struct PipelineTransferStats {
 //: executable stage kinds, so a caller reads a key directly instead of
 //: testing for it.
 //:
-//: What is deliberately not here: ONNX Runtime per-node traces, execution
-//: provider peak memory, and exact host-to-device byte counts. Each of those
-//: needs data only ONNX Runtime holds, and this milestone reports nothing it
-//: cannot measure itself.
+//: What is deliberately not here: execution provider peak memory and exact
+//: host-to-device byte counts. Each of those needs data only ONNX Runtime
+//: holds, and this runtime reports nothing it cannot measure itself. Node
+//: timings are not here either -- they are in the trace files `traces` points
+//: at, because parsing them on the execution path would cost more than the
+//: work being measured.
 struct PipelineTelemetrySnapshot {
   //: Whether this Pipeline collects telemetry at all.
   bool enabled{false};
@@ -597,6 +665,22 @@ struct PipelineTelemetrySnapshot {
       admission_by_stage_kind;
   //: Pipeline-wide device-boundary counters.
   PipelineTransferStats transfers;
+  //: This epoch's kept trace records, in the order their calls finished, so
+  //: consecutive entries describe consecutive completions rather than
+  //: consecutive starts; `PipelineTraceRecord::trace_id` recovers start
+  //: order. It is empty unless a trace directory was configured. At most
+  //: PipelineTelemetryOptions::max_trace_records entries are kept.
+  std::vector<PipelineTraceRecord> traces;
+  //: Trace records this epoch produced but did not keep, because the
+  //: retention cap was already full. Their files were still written: this is
+  //: a bound on memory, not on profiling.
+  std::uint64_t dropped_traces{0};
+  //: Kept records whose trace file could not be identified -- none appeared,
+  //: several matched, it was empty, or the filesystem refused to answer.
+  //: Calls dropped at the retention cap are not scanned and therefore cannot
+  //: be classified as profiling failures. This is never a count of failed
+  //: model calls.
+  std::uint64_t failed_traces{0};
 };
 
 class Pipeline {
@@ -648,7 +732,9 @@ class Pipeline {
   //: A Pipeline built with telemetry disabled reports `enabled == false`,
   //: epoch 0, and empty maps rather than throwing, and so does a moved-from
   //: Pipeline. Reading never blocks execution: it takes no session, scheduler,
-  //: or cancellation lock and touches only atomics.
+  //: or cancellation lock and touches only atomics -- and, when tracing is
+  //: configured, the collector's own trace mutex for as long as it takes to
+  //: copy this epoch's records.
   [[nodiscard]] PipelineTelemetrySnapshot telemetry_snapshot() const;
   //: Starts a new telemetry epoch: every counter this pipeline reports goes
   //: back to zero and PipelineTelemetrySnapshot::epoch advances by one.
@@ -658,6 +744,10 @@ class Pipeline {
   //: epoch and are intentionally absent from the new one. Resetting a
   //: Pipeline with telemetry disabled does nothing, which is also what a
   //: moved-from Pipeline does.
+  //:
+  //: It clears the in-memory trace records too, and deletes nothing on disk.
+  //: The trace files already written stay exactly where ONNX Runtime put
+  //: them; this runtime never removes one.
   void ResetTelemetry();
 
  private:

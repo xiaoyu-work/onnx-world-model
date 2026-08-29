@@ -1,14 +1,23 @@
 /**
  * @agent-file
- * @agent-purpose: Implements the opt-in telemetry collector behind PipelineTelemetryOptions: the pre-populated per-epoch counter slab, the atomic slab publication that makes ResetTelemetry a new epoch rather than a barrier, the component and stage recorders that classify an outcome by ErrorCode, the admission and device-transfer hooks, and the immutable PipelineTelemetrySnapshot that Pipeline::telemetry_snapshot() reports.
- * @agent-public-api: detail::PipelineTelemetry::PipelineTelemetry, detail::PipelineTelemetry::slab, detail::PipelineTelemetry::Reset, detail::PipelineTelemetry::Snapshot, detail::MakePipelineTelemetry, detail::SnapshotPipelineTelemetry, detail::ResetPipelineTelemetry, detail::RecordAdmissionQueued, detail::RecordAdmissionOutcome, detail::RecordDeviceToHostCopy, detail::RecordStageStep, detail::RecordStageCompletion, detail::TelemetryComponentScope constructor, destructor, RecordSuccess and RecordCurrentException, detail::TelemetryStageScope constructor, destructor, RecordSuccess and RecordCurrentException
- * @agent-invariants: Observability only: nothing here changes what the runtime executes, in what order, or with what result, and no recording path can throw into the code it measures -- every recorder is noexcept and a null collector makes each one a single branch. A slab is fully pre-populated when it is built, from the manifest's component and stage names plus SupportedStageKinds(), so a recording thread only ever looks an entry up; it never inserts, never rehashes, and never allocates. Counters are relaxed atomics and maxima are relaxed compare-exchange loops, so no reader may draw a happens-before conclusion from one. Reset serializes only its cold slab construction and publication so concurrent resets cannot publish epochs out of order; every recorder holds the slab it loaded for its whole operation without taking that mutex, so an execution that straddles a reset lands entirely in the epoch it started in and is absent from the new one. Snapshot loads one slab and copies each counter individually: fields are mutually consistent about their epoch and deliberately not one atomic instant, because the alternative is a lock on the execution path. Outcomes are classified by the ErrorCode of the exception being handled -- cancelled and deadline_exceeded are their own buckets and everything else is a failure -- never by its message, and RecordCurrentException rethrows into its own handler chain to read that code, so it must be called from inside a catch block. A recorder that is destroyed without an explicit outcome records a failure, so an unwind through a path with no catch cannot silently drop one. Byte totals come from Tensor::size_bytes(), and a tensor with no buffer contributes nothing rather than throwing; component input residency uses the same predicate Tensor::CopyToCpu() uses to decide it can alias -- canonical CPU device and host-accessible -- so "device-resident" here means exactly "would have to be copied to be read on the host". Admission recording takes an index into SupportedStageKinds(), and an out-of-range index records nothing because the snapshot has no key for it.
- * @agent-side-effects: none beyond mutating its own counters: no I/O, no device work, and no call back into scheduler, session, or cancellation code.
+ * @agent-purpose: Implements the opt-in telemetry collector behind PipelineTelemetryOptions: the pre-populated per-epoch counter slab, the atomic slab publication that makes ResetTelemetry a new epoch rather than a barrier, the component and stage recorders that classify an outcome by ErrorCode, the admission and device-transfer hooks, the per-run ONNX Runtime trace prefix, its file discovery and record retention, and the immutable PipelineTelemetrySnapshot that Pipeline::telemetry_snapshot() reports.
+ * @agent-public-api: detail::ValidatePipelineTelemetryOptions, detail::PipelineTelemetry::PipelineTelemetry, detail::PipelineTelemetry::slab, detail::PipelineTelemetry::tracing, detail::PipelineTelemetry::trace_directory, detail::PipelineTelemetry::max_trace_records, detail::PipelineTelemetry::AllocateTraceId, detail::PipelineTelemetry::Reset, detail::PipelineTelemetry::Snapshot, detail::MakePipelineTelemetry, detail::SnapshotPipelineTelemetry, detail::ResetPipelineTelemetry, detail::RecordAdmissionQueued, detail::RecordAdmissionOutcome, detail::RecordDeviceToHostCopy, detail::RecordStageStep, detail::RecordStageCompletion, detail::TelemetryComponentScope constructor, destructor, profile_prefix, RecordSuccess and RecordCurrentException, detail::TelemetryStageScope constructor, destructor, RecordSuccess and RecordCurrentException
+ * @agent-invariants: Observability only: nothing here changes what the runtime executes, in what order, or with what result, and no recording path can throw into the code it measures -- every recorder is noexcept and a null collector makes each one a single branch. A slab is fully pre-populated when it is built, from the manifest's component and stage names plus SupportedStageKinds(), so a recording thread only ever looks an entry up; it never inserts, never rehashes, and never allocates on a counter path. Counters are relaxed atomics and maxima are relaxed compare-exchange loops, so no reader may draw a happens-before conclusion from one. Reset serializes only its cold slab construction and publication so concurrent resets cannot publish epochs out of order; every recorder holds the slab it loaded for its whole operation without taking that mutex, so an execution that straddles a reset lands entirely in the epoch it started in and is absent from the new one. Snapshot loads one slab, copies each counter individually, and copies that epoch's trace records under TelemetryTraceState::mutex alone: fields are mutually consistent about their epoch and deliberately not one atomic instant, because the alternative is a lock on the execution path. Outcomes are classified by the ErrorCode of the exception being handled -- cancelled and deadline_exceeded are their own buckets and everything else is a failure -- never by its message, and OutcomeOf derives a record's PipelineCallOutcome from that same code, so a record can never disagree with the counter beside it. A recorder that is destroyed without an explicit outcome records a failure, so an unwind through a path with no catch cannot silently drop one. Byte totals come from Tensor::size_bytes(), and a tensor with no buffer contributes nothing rather than throwing; component input residency uses the same predicate Tensor::CopyToCpu() uses to decide it can alias. Admission recording takes an index into SupportedStageKinds(), and an out-of-range index records nothing because the snapshot has no key for it. Tracing is the one path that allocates and locks, and it runs only when a trace directory was configured: ValidatePipelineTelemetryOptions accepts and creates that directory on the cold path with std::error_code rather than exceptions, TraceFilePrefix builds trace_directory/<sanitized-component>.e<epoch>.r<trace-id>.p<pid> from a monotonic collector-wide identifier so no two calls -- in this process or another, in this epoch or the next -- can share a prefix, and a component name contributes only ASCII alphanumerics, dot, underscore, and hyphen with trailing dots and spaces removed, so it can never escape the directory or produce a name Windows would rewrite. DiscoverTraceFile scans only the configured directory, accepts exactly one file whose name starts with the prefix's file name plus the separator ONNX Runtime inserts and ends with .json, and treats zero matches, several matches, a filesystem error, and a zero-byte file as a profiling failure; every failure increments TelemetryTraceState::failed and is still published as a record with an empty path when the retention cap allows. Records are pushed in completion order and are capped at max_trace_records, with everything past the cap counted in TelemetryTraceState::dropped while its file stays on disk, because retention bounds memory and never profiling. The measured duration is read before discovery runs, so finding a file is never charged to the component call, and no trace file is ever opened, parsed, or deleted here.
+ * @agent-side-effects: none beyond mutating its own counters on the counter paths: no I/O, no device work, and no call back into scheduler, session, or cancellation code. Validation may create the configured trace directory, and a traced call reads that directory's entries and one file size to publish its record.
  */
 
 #include "pipeline_telemetry.hpp"
 
+#include <random>
+#include <system_error>
+
 #include "pipeline_scheduler.hpp"
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace onnx_world_model::detail {
 namespace {
@@ -16,6 +25,183 @@ namespace {
 //: The clock every duration here is measured with. Steady, because these are
 //: elapsed times rather than timestamps.
 using Clock = std::chrono::steady_clock;
+
+//: The characters a component name may contribute to a file name. Everything
+//: else is replaced, so a manifest name can never escape the configured trace
+//: directory, invent a path separator, or produce a name a platform refuses.
+[[nodiscard]] bool IsPortableNameCharacter(char character) noexcept {
+  const auto value = static_cast<unsigned char>(character);
+  if (value > 127) {
+    return false;
+  }
+  return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z') ||
+         (value >= 'a' && value <= 'z') || character == '.' ||
+         character == '_' || character == '-';
+}
+
+//: `component` reduced to a file-name fragment. Unsupported characters become
+//: underscores rather than being dropped, so two different components cannot
+//: collapse onto one fragment, and trailing dots and spaces are removed
+//: because Windows silently strips them from a file name.
+[[nodiscard]] std::string SanitizeComponentName(std::string_view component) {
+  std::string sanitized;
+  sanitized.reserve(component.size());
+  for (const char character : component) {
+    sanitized.push_back(
+        IsPortableNameCharacter(character) ? character : '_');
+  }
+  while (!sanitized.empty() &&
+         (sanitized.back() == '.' || sanitized.back() == ' ')) {
+    sanitized.pop_back();
+  }
+  if (sanitized.empty()) {
+    // Only reachable for a name made entirely of characters that cannot
+    // appear in a file name. The epoch, trace identifier, and process id that
+    // follow still make the prefix unique.
+    sanitized = "component";
+  }
+  return sanitized;
+}
+
+//: This process, as ONNX Runtime's file names never carry it. It is what
+//: keeps two processes tracing into one shared directory apart.
+[[nodiscard]] std::uint64_t CurrentProcessId() noexcept {
+#if defined(_WIN32)
+  return static_cast<std::uint64_t>(::_getpid());
+#else
+  return static_cast<std::uint64_t>(::getpid());
+#endif
+}
+
+//: A process-lifetime namespace. The wall-clock value keeps old files from a
+//: prior process (even one with a recycled pid) out of this process's prefix,
+//: and random entropy makes simultaneously started processes distinct.
+[[nodiscard]] const std::string& ProcessTraceNamespace() {
+  static const std::string value = [] {
+    const auto started =
+        std::chrono::system_clock::now().time_since_epoch().count();
+    std::uint64_t entropy = static_cast<std::uint64_t>(started);
+    try {
+      std::random_device random;
+      entropy ^= static_cast<std::uint64_t>(random()) << 32U;
+      entropy ^= static_cast<std::uint64_t>(random());
+    } catch (...) {
+      entropy ^= CurrentProcessId();
+    }
+    return std::to_string(started) + "-" + std::to_string(entropy);
+  }();
+  return value;
+}
+
+//: Shared by every collector in this process. A Pipeline's trace ids remain
+//: monotonic, but need not be contiguous when several Pipelines trace at once.
+[[nodiscard]] std::atomic<std::uint64_t>& NextProcessTraceId() {
+  static std::atomic<std::uint64_t> next{1};
+  return next;
+}
+
+//: The unique prefix one traced call hands to ONNX Runtime. The component
+//: names it, the process namespace and pid separate process lifetimes, and
+//: the epoch and process-wide trace identifier separate concurrent collectors
+//: and calls; ONNX Runtime then appends its own local timestamp and `.json`.
+[[nodiscard]] std::filesystem::path TraceFilePrefix(
+    const std::filesystem::path& directory,
+    std::string_view component,
+    std::uint64_t epoch,
+    std::uint64_t trace_id) {
+  std::string name = SanitizeComponentName(component);
+  name += ".e";
+  name += std::to_string(epoch);
+  name += ".n";
+  name += ProcessTraceNamespace();
+  name += ".r";
+  name += std::to_string(trace_id);
+  name += ".p";
+  name += std::to_string(CurrentProcessId());
+  return directory / name;
+}
+
+//: What one trace-file scan found. `failed` is the only field that matters
+//: when it is true: the record is published with no path and no size.
+struct TraceDiscovery {
+  std::filesystem::path path;
+  std::uint64_t size_bytes{0};
+  bool failed{true};
+};
+
+//: The absolute form of `path` when the filesystem will produce one, and
+//: `path` itself otherwise. A record that cannot be made absolute is still
+//: more useful than no record, so this never fails the discovery.
+[[nodiscard]] std::filesystem::path ResolvePath(
+    const std::filesystem::path& path) {
+  std::error_code code;
+  std::filesystem::path resolved = std::filesystem::weakly_canonical(path, code);
+  if (!code && !resolved.empty()) {
+    return resolved;
+  }
+  code.clear();
+  resolved = std::filesystem::absolute(path, code);
+  if (!code && !resolved.empty()) {
+    return resolved;
+  }
+  return path;
+}
+
+//: Finds the one file ONNX Runtime wrote for `prefix`. It scans only the
+//: directory the prefix names -- never a subdirectory and never the working
+//: directory -- and accepts exactly one match whose name begins with the
+//: prefix's file name followed by the separator ONNX Runtime inserts and ends
+//: with `.json`. Zero matches, several matches, a filesystem refusal, or an
+//: empty file is a profiling failure, which is a fact about the trace and
+//: never about the model call that produced it.
+[[nodiscard]] TraceDiscovery DiscoverTraceFile(
+    const std::filesystem::path& prefix) {
+  using StringType = std::filesystem::path::string_type;
+  // Built through std::filesystem::path so the literals are in the platform's
+  // native character type without this file naming that type.
+  static const StringType separator = std::filesystem::path("_").native();
+  static const StringType json_suffix = std::filesystem::path(".json").native();
+
+  const std::filesystem::path directory = prefix.parent_path();
+  const StringType expected = prefix.filename().native() + separator;
+
+  std::error_code code;
+  std::filesystem::directory_iterator entry(directory, code);
+  if (code) {
+    return {};
+  }
+  const std::filesystem::directory_iterator end;
+  TraceDiscovery discovery;
+  std::size_t matches = 0;
+  for (; entry != end; entry.increment(code)) {
+    if (code) {
+      return {};
+    }
+    const StringType name = entry->path().filename().native();
+    if (!name.starts_with(expected) || !name.ends_with(json_suffix)) {
+      continue;
+    }
+    ++matches;
+    if (matches > 1) {
+      // Two files under a prefix that is unique per call means the naming
+      // assumption no longer holds. Reporting a failure is honest; picking
+      // one would be a guess.
+      return {};
+    }
+    const auto size = std::filesystem::file_size(entry->path(), code);
+    if (code || size == 0) {
+      // ONNX Runtime creates the file when the run starts, so an empty file
+      // is a run that failed before it wrote anything -- a trace that exists
+      // but says nothing.
+      code.clear();
+      return {};
+    }
+    discovery.path = ResolvePath(entry->path());
+    discovery.size_bytes = static_cast<std::uint64_t>(size);
+    discovery.failed = false;
+  }
+  return matches == 1 ? discovery : TraceDiscovery{};
+}
 
 [[nodiscard]] std::uint64_t ElapsedNanoseconds(
     Clock::time_point started) noexcept {
@@ -75,9 +261,58 @@ void RecordDuration(
   }
 }
 
+//: The same classification as a value, for the one trace record a traced call
+//: publishes. It is derived from the ErrorCode exactly as the counters are,
+//: so a record can never disagree with the counter it was recorded beside.
+[[nodiscard]] PipelineCallOutcome OutcomeOf(ErrorCode code) noexcept {
+  switch (code) {
+    case ErrorCode::cancelled:
+      return PipelineCallOutcome::cancelled;
+    case ErrorCode::deadline_exceeded:
+      return PipelineCallOutcome::deadline_exceeded;
+    default:
+      return PipelineCallOutcome::failure;
+  }
+}
+
 }  // namespace
 
-PipelineTelemetry::PipelineTelemetry(const PipelineManifest& manifest) {
+void ValidatePipelineTelemetryOptions(const PipelineTelemetryOptions& options) {
+  if (options.trace_directory.empty()) {
+    // Counters only, which is the configuration every earlier release had and
+    // the one that touches no filesystem at all.
+    return;
+  }
+  if (!options.enabled) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Telemetry trace_directory requires telemetry to be enabled");
+  }
+  if (options.max_trace_records == 0) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Telemetry max_trace_records must be greater than zero when a trace "
+        "directory is configured");
+  }
+  // Created here, once, on the cold path: a component call must never have to
+  // create a directory, and a directory that cannot exist has to fail loading
+  // rather than every run.
+  std::error_code code;
+  std::filesystem::create_directories(options.trace_directory, code);
+  code.clear();
+  if (!std::filesystem::is_directory(options.trace_directory, code)) {
+    throw Error(
+        ErrorCode::invalid_argument,
+        "Telemetry trace_directory is not a usable directory: " +
+            options.trace_directory.string());
+  }
+}
+
+PipelineTelemetry::PipelineTelemetry(
+    const PipelineTelemetryOptions& options,
+    const PipelineManifest& manifest)
+    : trace_directory_(options.trace_directory),
+      max_trace_records_(options.max_trace_records) {
   component_names_.reserve(manifest.components().size());
   for (const PipelineComponent& component : manifest.components()) {
     component_names_.push_back(component.name);
@@ -110,6 +345,23 @@ std::shared_ptr<TelemetrySlab> PipelineTelemetry::BuildSlab(
 
 std::shared_ptr<TelemetrySlab> PipelineTelemetry::slab() const noexcept {
   return slab_.load(std::memory_order_acquire);
+}
+
+bool PipelineTelemetry::tracing() const noexcept {
+  return !trace_directory_.empty();
+}
+
+const std::filesystem::path& PipelineTelemetry::trace_directory()
+    const noexcept {
+  return trace_directory_;
+}
+
+std::size_t PipelineTelemetry::max_trace_records() const noexcept {
+  return max_trace_records_;
+}
+
+std::uint64_t PipelineTelemetry::AllocateTraceId() noexcept {
+  return NextProcessTraceId().fetch_add(1, std::memory_order_relaxed);
 }
 
 void PipelineTelemetry::Reset() {
@@ -194,6 +446,16 @@ PipelineTelemetrySnapshot PipelineTelemetry::Snapshot() const {
   result.transfers.component_input_bytes_host =
       slab->transfers.component_input_bytes_host.load(
           std::memory_order_relaxed);
+
+  result.dropped_traces = slab->traces.dropped.load(std::memory_order_relaxed);
+  result.failed_traces = slab->traces.failed.load(std::memory_order_relaxed);
+  {
+    // The one lock a reading takes, and it guards the record vector alone: no
+    // execution path holds it while running a model, and no scheduler or
+    // session lock is involved, so copying records can never block work.
+    std::scoped_lock lock(slab->traces.mutex);
+    result.traces = slab->traces.records;
+  }
   return result;
 }
 
@@ -203,9 +465,15 @@ PipelineTelemetryPtr MakePipelineTelemetry(
   if (!options.enabled) {
     // Disabled is not a collector that ignores everything: it is no collector
     // at all, which is what makes every recording site one null test.
+    // Validation still runs, so a trace directory supplied without enabling
+    // telemetry is rejected rather than quietly ignored.
+    ValidatePipelineTelemetryOptions(options);
     return nullptr;
   }
-  return std::make_shared<PipelineTelemetry>(manifest);
+  // Idempotent, and repeated here because a Pipeline may be constructed
+  // directly from a package without going through Pipeline::Load.
+  ValidatePipelineTelemetryOptions(options);
+  return std::make_shared<PipelineTelemetry>(options, manifest);
 }
 
 PipelineTelemetrySnapshot SnapshotPipelineTelemetry(
@@ -320,6 +588,25 @@ TelemetryComponentScope::TelemetryComponentScope(
   }
   entry_ = &found->second;
 
+  if (telemetry->tracing()) {
+    // The only allocating work a recorder does before the call, and it is
+    // done here rather than lazily so the prefix exists before the model
+    // runs. A failure to build it disables tracing for this call alone and is
+    // counted as a profiling failure: the call itself still runs and is still
+    // measured.
+    max_trace_records_ = telemetry->max_trace_records();
+    trace_id_ = telemetry->AllocateTraceId();
+    try {
+      component_.assign(component);
+      profile_prefix_ = TraceFilePrefix(
+          telemetry->trace_directory(), component, slab_->epoch, trace_id_);
+    } catch (...) {
+      profile_prefix_.clear();
+      component_.clear();
+      AddCounter(slab_->traces.failed, 1);
+    }
+  }
+
   std::uint64_t host_bytes = 0;
   std::uint64_t device_bytes = 0;
   for (const auto& [name, tensor] : inputs) {
@@ -338,8 +625,8 @@ TelemetryComponentScope::TelemetryComponentScope(
   AddCounter(
       slab_->transfers.component_input_bytes_device_resident, device_bytes);
 
-  // Started last, so the presentation accounting above is not charged to the
-  // component's own duration.
+  // Started last, so neither the presentation accounting above nor the trace
+  // prefix is charged to the component's own duration.
   started_ = Clock::now();
   pending_ = true;
 }
@@ -351,19 +638,84 @@ TelemetryComponentScope::~TelemetryComponentScope() {
   // Unwound without an explicit outcome, which only happens on a path with no
   // catch of its own. It still ended somehow, so it is recorded as a failure
   // rather than dropped.
-  RecordOutcome(entry_->failed_calls);
+  RecordOutcome(entry_->failed_calls, PipelineCallOutcome::failure);
 }
 
-void TelemetryComponentScope::RecordOutcome(TelemetryCounter& bucket) noexcept {
+const std::filesystem::path& TelemetryComponentScope::profile_prefix()
+    const noexcept {
+  return profile_prefix_;
+}
+
+void TelemetryComponentScope::RecordOutcome(
+    TelemetryCounter& bucket,
+    PipelineCallOutcome outcome) noexcept {
   if (!pending_ || entry_ == nullptr) {
     return;
   }
   pending_ = false;
+  // Read before anything else this function does, so trace discovery is never
+  // charged to the component's measured duration.
+  const std::uint64_t duration_ns = ElapsedNanoseconds(started_);
   AddCounter(bucket, 1);
   RecordDuration(
-      entry_->total_duration_ns,
-      entry_->max_duration_ns,
-      ElapsedNanoseconds(started_));
+      entry_->total_duration_ns, entry_->max_duration_ns, duration_ns);
+  if (!profile_prefix_.empty()) {
+    FinalizeTrace(outcome, duration_ns);
+  }
+}
+
+void TelemetryComponentScope::FinalizeTrace(
+    PipelineCallOutcome outcome,
+    std::uint64_t duration_ns) noexcept {
+  bool counted_failure = false;
+  bool reserved_record = false;
+  try {
+    {
+      std::scoped_lock lock(slab_->traces.mutex);
+      if (slab_->traces.records.size() +
+              slab_->traces.pending_records >=
+          max_trace_records_) {
+        AddCounter(slab_->traces.dropped, 1);
+        return;
+      }
+      ++slab_->traces.pending_records;
+      reserved_record = true;
+    }
+
+    const TraceDiscovery discovery = DiscoverTraceFile(profile_prefix_);
+    if (discovery.failed) {
+      AddCounter(slab_->traces.failed, 1);
+      counted_failure = true;
+    }
+    PipelineTraceRecord record;
+    record.epoch = slab_->epoch;
+    record.trace_id = trace_id_;
+    record.component = component_;
+    record.path = discovery.path;
+    record.outcome = outcome;
+    record.duration_ns = duration_ns;
+    record.size_bytes = discovery.size_bytes;
+    record.profiling_failed = discovery.failed;
+
+    std::scoped_lock lock(slab_->traces.mutex);
+    --slab_->traces.pending_records;
+    reserved_record = false;
+    slab_->traces.records.push_back(std::move(record));
+  } catch (...) {
+    // A recorder may never throw into the code it measures, so a failure to
+    // allocate or publish a record is reported as a profiling failure and
+    // nothing more.
+    if (!counted_failure) {
+      AddCounter(slab_->traces.failed, 1);
+    }
+    if (reserved_record) {
+      try {
+        std::scoped_lock lock(slab_->traces.mutex);
+        --slab_->traces.pending_records;
+      } catch (...) {
+      }
+    }
+  }
 }
 
 void TelemetryComponentScope::RecordSuccess(
@@ -372,7 +724,9 @@ void TelemetryComponentScope::RecordSuccess(
     return;
   }
   TelemetryComponentEntry& entry = *entry_;
-  RecordOutcome(entry.successful_calls);
+  // The outcome first, because it is what reads the clock: summing the
+  // returned bytes must not land inside the duration this call is charged.
+  RecordOutcome(entry.successful_calls, PipelineCallOutcome::success);
   AddCounter(entry.output_bytes, TotalBytes(outputs));
 }
 
@@ -387,13 +741,15 @@ void TelemetryComponentScope::RecordCurrentException() noexcept {
     // classification in one place.
     throw;
   } catch (const Error& error) {
-    RecordOutcome(OutcomeBucket(
-        error.code(),
-        entry.cancelled_calls,
-        entry.deadline_exceeded_calls,
-        entry.failed_calls));
+    RecordOutcome(
+        OutcomeBucket(
+            error.code(),
+            entry.cancelled_calls,
+            entry.deadline_exceeded_calls,
+            entry.failed_calls),
+        OutcomeOf(error.code()));
   } catch (...) {
-    RecordOutcome(entry.failed_calls);
+    RecordOutcome(entry.failed_calls, PipelineCallOutcome::failure);
   }
 }
 

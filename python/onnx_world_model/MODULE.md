@@ -44,6 +44,14 @@ expects.
   raising. This is the runtime's own measurement — component calls, stage
   executions, admission waits, and device materializations — and is separate
   from the per-request wall-clock `timings` each generator returns.
+- Forward the pipeline-only `telemetry_trace_directory` and
+  `max_trace_records` arguments the same way, so each component call also
+  writes one ONNX Runtime node trace and publishes one frozen
+  `PipelineTraceRecord` in `telemetry_snapshot.traces`, with a usable path
+  presented as a `pathlib.Path`, a failed trace as `None`, and its outcome as
+  a `PipelineCallOutcome` string. Tracing requires `enable_telemetry` and raises `WorldModelError`
+  without it. `OnnxModel.run` takes the same profiling per call as
+  `profile_prefix` and still returns only the outputs.
 - Keep the low-level `OnnxModel`, `Pipeline`, `PipelineSession`,
   `PipelineSessionSnapshot`, `StageRun`, `CancellationSource`,
   `CancellationToken`, `LatentDynamicsModel`, and `Rollout` APIs available.
@@ -60,7 +68,7 @@ expects.
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, the `DeviceSpec`, `ComponentPlacementSpec`, `PipelineTransfer`, and `PipelineTransferPlan` placement values, device-output options, `Pipeline` with its admission-scheduling limits, its frozen `PipelineSchedulingStats` reading, its opt-in `enable_telemetry` with the frozen `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, and `PipelineTelemetrySnapshot` reading and `reset_telemetry`, its load-time `component_placement`, and its frozen `transfer_plan`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, the `DeviceSpec`, `ComponentPlacementSpec`, `PipelineTransfer`, and `PipelineTransferPlan` placement values, device-output options, `OnnxModel` with its per-call `profile_prefix`, `Pipeline` with its admission-scheduling limits, its frozen `PipelineSchedulingStats` reading, its opt-in `enable_telemetry` with the frozen `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, `PipelineTraceRecord`, and `PipelineTelemetrySnapshot` reading and `reset_telemetry`, its `telemetry_trace_directory` and `max_trace_records` tracing options, its load-time `component_placement`, and its frozen `transfer_plan`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
 | `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
@@ -115,6 +123,10 @@ and the frozen `Pipeline.transfer_plan`,
 `tests/python/test_telemetry.py` covers the `enable_telemetry` argument, the
 shape and immutability of the `Pipeline.telemetry_snapshot` reading, the exact
 counts one single-threaded run produces, and `reset_telemetry`,
+`tests/python/test_trace.py` covers `OnnxModel.run(profile_prefix=...)`, the
+`telemetry_trace_directory` and `max_trace_records` arguments, the frozen
+`PipelineTraceRecord` values a traced run publishes against real ONNX Runtime
+trace files, the retention cap, and the configuration errors,
 `tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
 and `tests/python/test_guided_generation.py` and
 `tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that
