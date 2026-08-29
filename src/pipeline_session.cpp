@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and one shared telemetry collector and reports both of their readings.
+ * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time through the strategy executor stage_executor builds for it, and the Pipeline that hands every session one shared admission scheduler and one shared telemetry collector and reports both of their readings.
  * @agent-public-api: Pipeline::Pipeline, Pipeline::Load, Pipeline::manifest, Pipeline::execution_providers, Pipeline::transfer_plan, Pipeline::precision_report, Pipeline::CreateSession, Pipeline::scheduling_stats, Pipeline::telemetry_snapshot, Pipeline::ResetTelemetry, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::BeginStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid, StageRun move operations and destructor, StageRun::stage, StageRun::done, StageRun::iteration, StageRun::Step, StageRun::Finish, StageRun::RequestCancellation, StageRun::Cancel
- * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary through the file-local MaterializeHost, which is the one device-to-host boundary in this file: it applies exactly the condition Tensor::CopyToCpu() uses to alias instead of copying, so a canonical CPU source is handed back untouched and only a real copy is counted, and the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back; the stage kinds are not listed here at all but read from detail::StageKindDefinitions in stage_registry. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind, its detail::StageExecutionStrategy from detail::FindStageKind, inputs, overrides, options, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target exactly once under the session lock; the kind string is kept for admission and diagnostics while every later dispatch -- the per-step one and the completion one -- switches exhaustively on that resolved strategy, so state_transition, composite, and on_demand cannot drift apart from single_pass, and a stage kind the registry does not define, which manifest validation already rejected, throws ErrorCode::pipeline_manifest here rather than executing as one silent pass. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing. Cancellation is cooperative and travels on PipelineRunOptions::cancellation: StageRun::Begin links the caller's token into the run's own CancellationSource -- copying its deadline and registering a reason-preserving callback whose registration is declared after the source so it is destroyed first -- and then replaces plan.options.cancellation with that internal token, so every downstream call observes both the caller's token and StageRun::RequestCancellation. RequestCancellation only signals that source and never takes the session mutex, which is what lets a second thread stop a step that already holds it. The token is polled at boundaries rather than per element: Step and Finish check before each step, StepStage checks on entry, between the two guidance passes, around guidance combination, and around the state transforms, RunStageComponents checks before and after each component, ApplyConnection checks before any host transform, and the autoregressive step brackets token sampling. Polling is not what enforces a deadline, though: the run's own source arms the copied deadline on the shared process-wide watchdog, so a backend already blocked inside a component pass is claimed at the deadline rather than at the next boundary. A cancelled step throws through the existing failure path, so the run slot is released, the handle closes, and everything already applied stays applied. Admission is layered above all of that and is scheduling only, never batching: Impl holds the Pipeline's shared detail::PipelineScheduler, and RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain each take exactly one stack-scoped detail::PipelineLease before the session mutex, in the documented order CancellationState callback mutex -> scheduler mutex -> session mutex -> ONNX Runtime. BeginStage, a Finish whose run already completed, Cancel, RequestCancellation, and every query and state method take none, so an idle StageRun never holds a permit. Pipeline::scheduling_stats() only reads that same scheduler and returns a detached PipelineSchedulingStats value, so it takes no session lock, blocks no execution, and cannot admit or queue anything; Pipeline::telemetry_snapshot() and Pipeline::ResetTelemetry() read and re-epoch the collector the same way, touching only atomics. Pipeline::transfer_plan() is a pass-through to the package's plan, which was computed while the package was built; Pipeline::precision_report() is a pass-through of the same shape to the package's on-demand report, so it takes no lock, records nothing, and enforces nothing; Pipeline::Load forwards PipelinePlacementOptions to PipelinePackage::Load while the Pipeline(PipelinePackage, scheduling) constructor takes none, because its sessions already exist. A lease is never stored on a run or a session and its destructor is the only release path, so an exception, a cancellation, or a backend failure returns the permit. The stage kind is resolved from the immutable manifest, so admission needs no lock of its own, and no execution peeks at active_run_id before queuing: a queued caller may find a conflicting run once admitted and fail then, which is deliberate. The one window that is not "leave it applied" is the classifier-free guidance scratch state: the unconditional pass temporarily replaces the endpoint map, the position cursors, and the conditioning tensor's existing slot in external_values, and the file-local GuidanceScratch guard restores all three by swap -- static-asserted nothrow -- on every exit, so a cancellation or a backend failure inside that pass can never leave the unconditional conditioning value behind for the next step. Telemetry is layered above admission the same way admission is layered above execution, and it is measurement only: Impl holds the Pipeline's shared detail::PipelineTelemetry, which is null unless the caller enabled it, so every recording site here is one null test. RunStage, StepStage, StageRun::Step, and a draining StageRun::Finish each wrap their work in detail::RecordStageExecution after their lease is granted, so a stage's measured duration excludes queue wait and its outcome is classified by ErrorCode on every path out; an execution that never got a permit is an admission outcome and is deliberately not a stage execution. RunStageComponents brackets the component call itself -- not the input resolution above it -- with detail::TelemetryComponentScope, which records the bytes presented on every attempt and where they lived, classifies the outcome the same way, and supplies that call's ModelRunOptions::profile_file_prefix, which is empty unless this pipeline configured a trace directory; that one call site is the only place a per-run ONNX Runtime trace is ever requested, and Pipeline::Load validates and creates the trace directory before any component model file is opened. StageRun::Impl::StepLocked is the one place a non-terminal step is counted, so every kind's step path and every way of driving it count once and only once, CompleteLocked is the one place a completion is counted, and the public StepStage counts its own step because it bypasses the StageEvent state machine and emits no terminal event. A cached Finish executes nothing and therefore changes nothing. Recording never takes a lock, never allocates, and never calls back into the scheduler, the session, or cancellation, so it is outside the lock order entirely.
+ * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary through the file-local MaterializeHost, which is the one device-to-host boundary in this file: it applies exactly the condition Tensor::CopyToCpu() uses to alias instead of copying, so a canonical CPU source is handed back untouched and only a real copy is counted, and the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back; the stage kinds are not listed here at all but read from detail::StageKindDefinitions in stage_registry. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind and its detail::StageExecutionStrategy from detail::FindStageKind, copies the run's inputs, overrides, and options, and then builds that strategy's detail::StageExecutor, which resolves everything the strategy itself needs -- stored external inputs, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target -- exactly once, under the session lock and before the run claims the slot, so a run that cannot be configured leaves that slot free and a later option change cannot move a target mid-run. The kind string is kept for admission and diagnostics, a stage kind the registry does not define, which manifest validation already rejected, throws ErrorCode::pipeline_manifest here rather than executing as one silent pass, and no strategy body lives in this file at all: state_transition, composite, and on_demand cannot drift apart from single_pass because detail::MakeStageExecutor hands all four the same one-pass executor. An executor reaches back only through StageRun::Impl::SessionHost, the nested detail::StageExecutionHost adapter that publishes exactly the session operations a step performs -- storing external inputs, seeding the engine, resolving the token budget and the iterative target, stepping the stage, reading its cursor and its logits, sampling or taking the arg-max, feeding tokens back, and collecting outputs -- and nothing about the session's mutex, run slot, scheduler, telemetry, snapshots, or SessionState; it is nested inside StageRun::Impl because PipelineSession::Impl is private to a class that befriends StageRun. The strategy state that used to live on the run -- the sampling plan, the generated history, the per-lane end-of-sequence latch, the token budget, the iterative target, and each strategy's last step outputs -- lives on that executor now, still outside SessionState, so a snapshot cannot capture half of an in-flight run. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event: an executor reports that it is complete by returning no event at all, which is the only path into CompleteLocked. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing. Cancellation is cooperative and travels on PipelineRunOptions::cancellation: StageRun::Begin links the caller's token into the run's own CancellationSource -- copying its deadline and registering a reason-preserving callback whose registration is declared after the source so it is destroyed first -- and then replaces plan.options.cancellation with that internal token, so every downstream call observes both the caller's token and StageRun::RequestCancellation. RequestCancellation only signals that source and never takes the session mutex, which is what lets a second thread stop a step that already holds it. The token is polled at boundaries rather than per element: Step and Finish check before each step, StepStage checks on entry, between the two guidance passes, around guidance combination, and around the state transforms, RunStageComponents checks before and after each component, ApplyConnection checks before any host transform, and the autoregressive step brackets token sampling. Polling is not what enforces a deadline, though: the run's own source arms the copied deadline on the shared process-wide watchdog, so a backend already blocked inside a component pass is claimed at the deadline rather than at the next boundary. A cancelled step throws through the existing failure path, so the run slot is released, the handle closes, and everything already applied stays applied. Admission is layered above all of that and is scheduling only, never batching: Impl holds the Pipeline's shared detail::PipelineScheduler, and RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain each take exactly one stack-scoped detail::PipelineLease before the session mutex, in the documented order CancellationState callback mutex -> scheduler mutex -> session mutex -> ONNX Runtime. BeginStage, a Finish whose run already completed, Cancel, RequestCancellation, and every query and state method take none, so an idle StageRun never holds a permit. Pipeline::scheduling_stats() only reads that same scheduler and returns a detached PipelineSchedulingStats value, so it takes no session lock, blocks no execution, and cannot admit or queue anything; Pipeline::telemetry_snapshot() and Pipeline::ResetTelemetry() read and re-epoch the collector the same way, touching only atomics. Pipeline::transfer_plan() is a pass-through to the package's plan, which was computed while the package was built; Pipeline::precision_report() is a pass-through of the same shape to the package's on-demand report, so it takes no lock, records nothing, and enforces nothing; Pipeline::Load forwards PipelinePlacementOptions to PipelinePackage::Load while the Pipeline(PipelinePackage, scheduling) constructor takes none, because its sessions already exist. A lease is never stored on a run or a session and its destructor is the only release path, so an exception, a cancellation, or a backend failure returns the permit. The stage kind is resolved from the immutable manifest, so admission needs no lock of its own, and no execution peeks at active_run_id before queuing: a queued caller may find a conflicting run once admitted and fail then, which is deliberate. The one window that is not "leave it applied" is the classifier-free guidance scratch state: the unconditional pass temporarily replaces the endpoint map, the position cursors, and the conditioning tensor's existing slot in external_values, and the file-local GuidanceScratch guard restores all three by swap -- static-asserted nothrow -- on every exit, so a cancellation or a backend failure inside that pass can never leave the unconditional conditioning value behind for the next step. Telemetry is layered above admission the same way admission is layered above execution, and it is measurement only: Impl holds the Pipeline's shared detail::PipelineTelemetry, which is null unless the caller enabled it, so every recording site here is one null test. RunStage, StepStage, StageRun::Step, and a draining StageRun::Finish each wrap their work in detail::RecordStageExecution after their lease is granted, so a stage's measured duration excludes queue wait and its outcome is classified by ErrorCode on every path out; an execution that never got a permit is an admission outcome and is deliberately not a stage execution. RunStageComponents brackets the component call itself -- not the input resolution above it -- with detail::TelemetryComponentScope, which records the bytes presented on every attempt and where they lived, classifies the outcome the same way, and supplies that call's ModelRunOptions::profile_file_prefix, which is empty unless this pipeline configured a trace directory; that one call site is the only place a per-run ONNX Runtime trace is ever requested, and Pipeline::Load validates and creates the trace directory before any component model file is opened. StageRun::Impl::StepLocked is the one place a non-terminal step is counted and the one place an event is stamped with its stage and its iteration index -- an executor describes only what it did, so no strategy can invent an index or a step count -- so every kind's step path and every way of driving it count once and only once, CompleteLocked is the one place a completion is counted, and the public StepStage counts its own step because it bypasses the StageEvent state machine and emits no terminal event. A cached Finish executes nothing and therefore changes nothing. Recording never takes a lock, never allocates, and never calls back into the scheduler, the session, or cancellation, so it is outside the lock order entirely.
   * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, Fork, and the checkpoint operations touch memory only; they perform no device transfer, no disk access, and no inference.
  */
 
@@ -32,6 +32,7 @@
 #include "onnx_world_model/error.hpp"
 #include "pipeline_scheduler.hpp"
 #include "pipeline_telemetry.hpp"
+#include "stage_executor.hpp"
 #include "stage_registry.hpp"
 
 namespace onnx_world_model {
@@ -3386,23 +3387,100 @@ struct PipelineSession::Impl : SessionState {
 
 // The one state machine behind both execution paths. A StageRun holds one of
 // these; PipelineSession::RunStage begins a run, drains it, and drops it, so
-// full and incremental execution cannot diverge. Everything that used to be a
-// local of the autoregressive loop -- the generated history, the per-lane
-// end-of-sequence latch, the resolved sampling configuration, and the token
-// budget -- lives here, deliberately outside SessionState so that a snapshot
-// never captures half of an in-flight run.
+// full and incremental execution cannot diverge. What a step actually does is
+// not here: each strategy's body lives behind a detail::StageExecutor, and
+// this class owns only what every run has regardless of strategy -- the run's
+// identity and slot, its bindings, its cancellation source, its step count,
+// and its one terminal event.
 struct StageRun::Impl {
+  // The only path from a strategy body back into the session, and deliberately
+  // narrow: it publishes the operations a step performs and nothing about the
+  // session's mutex, run slot, scheduler, telemetry, or snapshot state. It is
+  // nested here because PipelineSession::Impl is private to PipelineSession,
+  // which befriends StageRun. Every method runs with the session lock already
+  // held by the call that is stepping this run.
+  class SessionHost final : public detail::StageExecutionHost {
+   public:
+    explicit SessionHost(PipelineSession::Impl& owner) noexcept
+        : session_(&owner) {}
+
+    void StoreExternalInputs(const NamedTensors& inputs) override {
+      session_->StoreExternalInputs(inputs);
+    }
+
+    void SeedRandomEngine(std::uint64_t seed) override {
+      session_->random_engine.seed(seed);
+    }
+
+    [[nodiscard]] std::size_t MaximumTokens(
+        const PipelineStage& stage,
+        const PipelineRunOptions& options) const override {
+      return session_->MaximumTokens(stage, options);
+    }
+
+    [[nodiscard]] std::size_t InferenceSteps(
+        std::string_view stage_name,
+        const PipelineRunOptions& options) const override {
+      return session_->InferenceSteps(stage_name, options);
+    }
+
+    [[nodiscard]] NamedTensors StepStage(
+        std::string_view stage_name,
+        const NamedTensors& inputs,
+        const NamedTensors& overrides,
+        const PipelineRunOptions& options) override {
+      return session_->StepStage(stage_name, inputs, overrides, options);
+    }
+
+    [[nodiscard]] std::size_t StageIterations(
+        const std::string& stage_name) override {
+      return session_->stage_iterations[stage_name];
+    }
+
+    [[nodiscard]] const Tensor& StageLogits(
+        const PipelineStage& stage) const override {
+      return session_->StageLogits(stage);
+    }
+
+    [[nodiscard]] Tensor SampleTokens(
+        const Tensor& logits,
+        const Json& sampling,
+        const PipelineRunOptions& options,
+        const std::vector<std::vector<std::int64_t>>& history) override {
+      return session_->SampleTokens(logits, sampling, options, history);
+    }
+
+    [[nodiscard]] Tensor GreedyTokens(const Tensor& logits) const override {
+      return session_->GreedyTokens(logits);
+    }
+
+    void SetStageTokenInput(
+        const PipelineStage& stage,
+        const Tensor& tokens) override {
+      session_->SetStageTokenInput(stage, tokens);
+    }
+
+    [[nodiscard]] NamedTensors CollectOutputs() const override {
+      return session_->CollectOutputs();
+    }
+
+   private:
+    PipelineSession::Impl* session_;
+  };
+
+  explicit Impl(std::shared_ptr<PipelineSession::Impl> owner)
+      : session(std::move(owner)), host(*session) {}
+
   std::shared_ptr<PipelineSession::Impl> session;
+  //: The adapter every executor reaches the session through. Declared after
+  //: `session` because it refers to it, and before `executor` so the executor
+  //: is destroyed first.
+  SessionHost host;
   std::uint64_t run_id{0};
   std::string stage_name;
   //: The manifest spelling, kept because admission, telemetry, and every
   //: diagnostic message are stated in terms of the kind a manifest declared.
   std::string stage_kind;
-  //: How this run is stepped, resolved from the stage-kind registry once by
-  //: Begin. Every dispatch below switches on this rather than on the string,
-  //: so the kinds that share one-pass behavior cannot drift apart.
-  detail::StageExecutionStrategy strategy{
-      detail::StageExecutionStrategy::single_pass};
   NamedTensors inputs;
   NamedTensors overrides;
   PipelineRunOptions options;
@@ -3417,26 +3495,18 @@ struct StageRun::Impl {
 
   // The stage's own inputs are bound by the first step that actually runs, and
   // never again, exactly as the old loops passed them only on their first
-  // iteration.
+  // iteration. The executor decides when that happens by taking them from the
+  // per-step context this flag is shared with.
   bool consumed_inputs{false};
   std::size_t emitted_steps{0};
   bool completed{false};
   bool closed{false};
   NamedTensors final_outputs;
-  std::optional<NamedTensors> last_step_outputs;
 
-  // Autoregressive plan, resolved once by Begin.
-  Json sampling;
-  bool do_sample{false};
-  std::set<std::int64_t> eos_tokens;
-  std::size_t maximum_tokens{0};
-  std::vector<std::vector<std::int64_t>> generated;
-  std::vector<bool> finished_lanes;
-  bool stop_requested{false};
-
-  // Iterative plan: the absolute cursor this run drives the stage to, read
-  // once so a later option change cannot move the target mid-run.
-  std::size_t target_iterations{0};
+  //: This run's strategy body and all of its state, built once by Begin.
+  //: Declared last so it is destroyed before the host and the session it
+  //: refers to.
+  std::unique_ptr<detail::StageExecutor> executor;
 
   // Resolves everything the run will need while the caller still holds the
   // session lock, then claims the session's run slot. A failure here leaves
@@ -3454,8 +3524,7 @@ struct StageRun::Impl {
     // the session's run slot and without touching the session.
     options.cancellation.ThrowIfCancellationRequested();
     const PipelineStage& stage = FindStage(owner->manifest(), stage_name);
-    auto plan = std::make_unique<Impl>();
-    plan->session = owner;
+    auto plan = std::make_unique<Impl>(owner);
     plan->stage_name = stage.name;
     plan->stage_kind = stage.kind;
     plan->inputs = inputs;
@@ -3474,42 +3543,20 @@ struct StageRun::Impl {
           ErrorCode::pipeline_manifest,
           "Unknown stage kind '" + stage.kind + "'");
     }
-    plan->strategy = definition->strategy;
 
-    switch (plan->strategy) {
-      case detail::StageExecutionStrategy::autoregressive: {
-        owner->StoreExternalInputs(inputs);
-        const Json stage_options = Json::parse(stage.options_json);
-        plan->sampling = stage_options.value("sampling", Json::object());
-        plan->do_sample =
-            options.integers.contains("do_sample")
-                ? options.integers.at("do_sample") != 0
-                : plan->sampling.value("do_sample", false);
-        if (options.integers.contains("seed")) {
-          owner->random_engine.seed(
-              static_cast<std::uint64_t>(options.integers.at("seed")));
-        }
-        if (stage_options.contains("stop") &&
-            stage_options.at("stop").is_object() &&
-            stage_options.at("stop").contains("eos_token_ids")) {
-          for (const auto& token :
-               stage_options.at("stop").at("eos_token_ids")) {
-            plan->eos_tokens.insert(token.get<std::int64_t>());
-          }
-        }
-        // Measured before the first step replaces the prompt with a single
-        // token, so the budget reflects the prompt this run started from.
-        plan->maximum_tokens = owner->MaximumTokens(stage, options);
-        break;
-      }
-      case detail::StageExecutionStrategy::iterative:
-        plan->target_iterations = owner->InferenceSteps(stage.name, options);
-        break;
-      case detail::StageExecutionStrategy::single_pass:
-        // Nothing to resolve: the one pass reads the stage's inputs and
-        // options where it executes them.
-        break;
-    }
+    // Every strategy resolves its own configuration here -- stored inputs,
+    // sampling, seed, stop tokens, token budget, iterative target -- so a run
+    // that cannot be configured fails before it claims the slot, exactly as
+    // resolving those values inline did. The stage reference stays valid for
+    // the run's lifetime because the manifest is immutable and `session`
+    // holds the package that owns it.
+    plan->executor = detail::MakeStageExecutor(
+        definition->strategy,
+        plan->host,
+        stage,
+        plan->inputs,
+        plan->overrides,
+        plan->options);
 
     plan->run_id = owner->next_run_id++;
     owner->active_run_id = plan->run_id;
@@ -3707,141 +3754,33 @@ struct StageRun::Impl {
   }
 
   [[nodiscard]] StageEvent StepLocked() {
-    const PipelineStage& stage = FindStage(session->manifest(), stage_name);
-    StageEvent event = StepLocked(stage);
-    if (event.kind != StageEventKind::completed) {
-      // The one place a stage step is counted for a run: every kind's step
-      // path returns through here, so draining through RunStage or Finish and
-      // stepping explicitly count identically and none of them counts twice.
-      // A terminal event is a completion instead, counted by CompleteLocked.
-      detail::RecordStageStep(session->telemetry, stage_name);
+    // One binding set per step: the executor takes the run's inputs out of it
+    // the first time it actually executes something, and never again.
+    detail::StageStepContext context(
+        inputs, overrides, options, consumed_inputs);
+    std::optional<StageEvent> event = executor->StepLocked(context);
+    if (!event.has_value()) {
+      // No value is how a strategy reports that it is done, and the only way
+      // a run completes.
+      return CompleteLocked(context);
     }
-    return event;
-  }
-
-  [[nodiscard]] StageEvent StepLocked(const PipelineStage& stage) {
-    // Exhaustive over the registry's strategies, so a new strategy is a
-    // compile error here rather than a silent single pass.
-    switch (strategy) {
-      case detail::StageExecutionStrategy::autoregressive:
-        return AutoregressiveStepLocked(stage);
-      case detail::StageExecutionStrategy::iterative:
-        return IterativeStepLocked(stage);
-      case detail::StageExecutionStrategy::single_pass:
-        return SinglePassStepLocked(stage);
+    // The strategy describes what it did; the run stamps who did it and when,
+    // so a kind cannot report an iteration index of its own invention.
+    if (event->stage.empty()) {
+      event->stage = stage_name;
     }
-    return SinglePassStepLocked(stage);
-  }
-
-  [[nodiscard]] NamedTensors RunInputsLocked() {
-    if (consumed_inputs) {
-      return {};
-    }
-    consumed_inputs = true;
-    return inputs;
-  }
-
-  [[nodiscard]] StageEvent AutoregressiveStepLocked(
-      const PipelineStage& stage) {
-    if (stop_requested || emitted_steps >= maximum_tokens) {
-      return CompleteLocked();
-    }
-    NamedTensors step_outputs = session->StepStage(
-        stage.name, RunInputsLocked(), overrides, options);
-    // Sampling reads the whole logits tensor on the host, so it is bracketed
-    // rather than checked inside its per-token loops.
-    options.cancellation.ThrowIfCancellationRequested();
-    Tensor tokens =
-        do_sample
-            ? session->SampleTokens(
-                  session->StageLogits(stage), sampling, options, generated)
-            : session->GreedyTokens(session->StageLogits(stage));
-    options.cancellation.ThrowIfCancellationRequested();
-    auto mutable_values = std::span(
-        reinterpret_cast<std::int64_t*>(tokens.mutable_bytes().data()),
-        tokens.element_count());
-    if (finished_lanes.empty()) {
-      finished_lanes.assign(mutable_values.size(), false);
-    }
-    const std::int64_t eos = eos_tokens.empty() ? 0 : *eos_tokens.begin();
-    for (std::size_t batch_index = 0;
-         batch_index < mutable_values.size();
-         ++batch_index) {
-      if (finished_lanes[batch_index]) {
-        mutable_values[batch_index] = eos;
-      } else if (eos_tokens.contains(mutable_values[batch_index])) {
-        finished_lanes[batch_index] = true;
-      }
-    }
-    const auto values = tokens.values<std::int64_t>();
-    generated.emplace_back(values.begin(), values.end());
-    session->SetStageTokenInput(stage, tokens);
-    if (!eos_tokens.empty() &&
-        std::ranges::all_of(
-            finished_lanes, [](bool value) { return value; })) {
-      // The old loop broke here; the incremental run reports the stop on the
-      // next Step instead, so every run ends with one completed event.
-      stop_requested = true;
-    }
-
-    StageEvent event;
-    event.kind = StageEventKind::token;
-    event.stage = stage.name;
-    event.iteration = emitted_steps;
-    event.token_ids = std::move(tokens);
-    event.outputs = std::move(step_outputs);
+    event->iteration = emitted_steps;
     ++emitted_steps;
-    return event;
+    // The one place a stage step is counted for a run: every strategy's step
+    // path returns through here, so draining through RunStage or Finish and
+    // stepping explicitly count identically and none of them counts twice.
+    // A terminal event is a completion instead, counted by CompleteLocked.
+    detail::RecordStageStep(session->telemetry, stage_name);
+    return std::move(*event);
   }
 
-  [[nodiscard]] StageEvent IterativeStepLocked(const PipelineStage& stage) {
-    if (session->stage_iterations[stage.name] >= target_iterations) {
-      return CompleteLocked();
-    }
-    NamedTensors step_outputs = session->StepStage(
-        stage.name, RunInputsLocked(), overrides, options);
-    last_step_outputs = step_outputs;
-
-    StageEvent event;
-    event.kind = StageEventKind::iteration;
-    event.stage = stage.name;
-    event.iteration = emitted_steps;
-    event.outputs = std::move(step_outputs);
-    ++emitted_steps;
-    return event;
-  }
-
-  // state_transition, composite, and on_demand all share single_pass's
-  // strategy: exactly one pass, which is what RunStage did for them.
-  [[nodiscard]] StageEvent SinglePassStepLocked(const PipelineStage& stage) {
-    if (emitted_steps > 0) {
-      return CompleteLocked();
-    }
-    NamedTensors step_outputs = session->StepStage(
-        stage.name, RunInputsLocked(), overrides, options);
-    last_step_outputs = step_outputs;
-
-    StageEvent event;
-    event.kind = StageEventKind::transition;
-    event.stage = stage.name;
-    event.iteration = emitted_steps;
-    event.outputs = std::move(step_outputs);
-    ++emitted_steps;
-    return event;
-  }
-
-  [[nodiscard]] StageEvent CompleteLocked() {
-    if (strategy == detail::StageExecutionStrategy::autoregressive) {
-      final_outputs = AutoregressiveResultLocked();
-    } else if (last_step_outputs.has_value()) {
-      // Exactly what the last executed step returned, which is what RunStage
-      // returned for this stage.
-      final_outputs = *last_step_outputs;
-    } else {
-      // A stage that had no work left executed nothing, so its result is the
-      // session's current public outputs.
-      final_outputs = session->CollectOutputs();
-    }
+  [[nodiscard]] StageEvent CompleteLocked(detail::StageStepContext& context) {
+    final_outputs = executor->FinalOutputsLocked(context);
     completed = true;
     ReleaseSlotLocked();
     // Exactly one terminal event per run, however that run was driven, so
@@ -3857,33 +3796,6 @@ struct StageRun::Impl {
     event.outputs = final_outputs;
     event.finished = true;
     return event;
-  }
-
-  // Packs the generated history batch-major, the layout the previous
-  // RunAutoregressive published, and adds it without displacing a manifest
-  // output of the same name.
-  [[nodiscard]] NamedTensors AutoregressiveResultLocked() const {
-    NamedTensors result = session->CollectOutputs();
-    if (generated.empty()) {
-      return result;
-    }
-    const std::size_t batch = generated.front().size();
-    std::vector<std::int64_t> flattened(batch * generated.size());
-    for (std::size_t step = 0; step < generated.size(); ++step) {
-      for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
-        flattened[batch_index * generated.size() + step] =
-            generated[step][batch_index];
-      }
-    }
-    result.emplace(
-        "generated_token_ids",
-        Int64Tensor(
-            {
-                static_cast<std::int64_t>(batch),
-                static_cast<std::int64_t>(generated.size()),
-            },
-            flattened));
-    return result;
   }
 };
 

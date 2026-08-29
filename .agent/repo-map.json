@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-29T03:51:58.073Z",
+  "generatedAt": "2026-08-29T04:35:01.482Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "77e8f248f151ca7cbd7f08fff92e26e319949b0ee45da504d2413ea026673eaa",
+  "sourceFingerprint": "4457684e22cd174e666c08452d3dfe36894fac3da05d90776aa96415351bc2a1",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -548,7 +548,7 @@
     {
       "path": "src/pipeline_session.cpp",
       "kind": "source",
-      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and one shared telemetry collector and reports both of their readings.",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time through the strategy executor stage_executor builds for it, and the Pipeline that hands every session one shared admission scheduler and one shared telemetry collector and reports both of their readings.",
       "publicSymbols": [
         "Pipeline::Pipeline",
         "Pipeline::Load",
@@ -646,6 +646,45 @@
         "onnx_world_model::detail::TelemetryComponentScope",
         "onnx_world_model::detail::TelemetryStageScope",
         "onnx_world_model::detail::RecordStageExecution"
+      ]
+    },
+    {
+      "path": "src/stage_executor.cpp",
+      "kind": "source",
+      "purpose": "Implements the one-pass stage executor -- the strategy single_pass, state_transition, composite, and on_demand all execute through -- and the factory that turns a detail::StageExecutionStrategy into the executor that owns that strategy's per-run state.",
+      "publicSymbols": [
+        "detail::MakeOnePassStageExecutor",
+        "detail::MakeStageExecutor"
+      ]
+    },
+    {
+      "path": "src/stage_executor.hpp",
+      "kind": "source",
+      "purpose": "Declares the internal strategy objects the StageRun state machine steps a stage through -- the narrow StageExecutionHost a strategy may reach the session by, the StageStepContext that hands a run's own inputs to the first step that actually executes, the StageExecutor one strategy body lives behind, and the factory that resolves a detail::StageExecutionStrategy into one of them.",
+      "publicSymbols": [
+        "onnx_world_model::detail::StageExecutionHost",
+        "onnx_world_model::detail::StageStepContext",
+        "onnx_world_model::detail::StageExecutor",
+        "onnx_world_model::detail::MakeStageExecutor",
+        "onnx_world_model::detail::MakeAutoregressiveStageExecutor",
+        "onnx_world_model::detail::MakeIterativeStageExecutor",
+        "onnx_world_model::detail::MakeOnePassStageExecutor"
+      ]
+    },
+    {
+      "path": "src/stage_executor_autoregressive.cpp",
+      "kind": "source",
+      "purpose": "Implements the autoregressive stage executor: the sampling plan, seed, end-of-sequence set, and token budget one run resolves before it starts, the decode-sample-feed-back step it repeats, the per-lane end-of-sequence latch that stops it, and the batch-major generated_token_ids it completes with.",
+      "publicSymbols": [
+        "detail::MakeAutoregressiveStageExecutor"
+      ]
+    },
+    {
+      "path": "src/stage_executor_iterative.cpp",
+      "kind": "source",
+      "purpose": "Implements the iterative stage executor: the absolute scheduler cursor a run drives its stage to, the one scheduler step each StepLocked performs, and the outputs the run completes with.",
+      "publicSymbols": [
+        "detail::MakeIterativeStageExecutor"
       ]
     },
     {

@@ -88,6 +88,13 @@ Within `src/` the runtime is layered:
   with, and the exact option names its manifest options object may carry.
   Manifest validation, admission scheduling, telemetry, and execution all read
   that one list, so they cannot disagree about which kinds exist.
+- `stage_executor` holds one strategy body per execution strategy — the
+  autoregressive decode loop, the iterative scheduler loop, and the one pass
+  that `single_pass`, `state_transition`, `composite`, and `on_demand` share —
+  behind a narrow `StageExecutionHost` interface and a factory that switches
+  exhaustively over `stage_registry`'s strategies. It knows how a stage is
+  stepped and nothing about how a run is admitted, measured, cancelled, or
+  identified.
 - `pipeline_scheduler` is the shared admission controller: the validation of
   its per-kind keys against `stage_registry`, the per-kind permit buckets that
   registry sizes and orders, the
@@ -107,7 +114,8 @@ Within `src/` the runtime is layered:
   collector at all, and without a trace directory it never touches the
   filesystem.
 - `pipeline_session` executes stages, owns per-trajectory state, drives one
-  stage at a time through the `StageRun` state machine, captures or
+  stage at a time through the `StageRun` state machine and the
+  `stage_executor` strategy that machine builds for it, captures or
   restores that state as an in-memory snapshot, materializes every device
   source to the host through one `MaterializeHost` boundary, and defines
   `Pipeline`, which hands every session it creates that one scheduler and that
@@ -126,10 +134,17 @@ Within `src/` the runtime is layered:
   installed.
 - `stage_registry` is the bottom of the internal graph: it depends on nothing
   but the standard library, and `pipeline_manifest_validation`,
-  `pipeline_scheduler`, `pipeline_telemetry`, and `pipeline_session` depend on
+  `pipeline_scheduler`, `pipeline_telemetry`, `stage_executor`, and
+  `pipeline_session` depend on
   it rather than on each other for the stage-kind list. No file outside it may
   restate the set of stage kinds, a kind's allowed option names, or a kind's
   execution strategy.
+- `stage_executor` depends on the public headers and `stage_registry` only. A
+  strategy body reaches its session exclusively through
+  `detail::StageExecutionHost`, which `pipeline_session` implements; nothing
+  in `stage_executor*.cpp` may name `PipelineSession::Impl`, take a lock, or
+  reach the run slot, the admission scheduler, the telemetry collector, or
+  `SessionState`.
 - `pipeline_manifest_validation` receives an already-parsed `PipelineManifest`
   and never parses a raw document; `pipeline.cpp` never re-implements semantic
   checks.
@@ -181,12 +196,16 @@ Generation, using video as the example:
    dataclass.
 
 Every stage runs through one state machine. `BeginStage` resolves the stage
-kind, its `stage_registry` execution strategy, inputs, overrides, options, and
-all autoregressive configuration once and
-returns a `StageRun`; each `Step()` takes the session lock, performs exactly
+kind and its `stage_registry` execution strategy, copies the run's inputs,
+overrides, and options, and builds that strategy's executor — which resolves
+its own configuration, all autoregressive configuration included, exactly once
+and before the run claims the session's slot — and then
+returns a `StageRun`; each `Step()` takes the session lock, asks that executor
+for exactly
 one component pass or scheduler step, and returns a `StageEvent` describing it;
 the run ends with exactly one terminal `completed` event whose outputs are the
-stage's result. `RunStage` and `StageRun` drain the same state machine, so
+stage's result, which is what an executor reports by returning no event at all.
+`RunStage` and `StageRun` drain the same state machine, so
 incremental and all-at-once execution cannot diverge. `RunStage` holds the
 session lock for its entire drain, preserving whole-stage serialization;
 explicit `Step()` releases it between events. Stepping is synchronous: an event

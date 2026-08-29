@@ -33,7 +33,11 @@ latent-dynamics compatibility layer.
 - Execute pipeline stages, including generated inputs, transforms, diffusion
   schedulers, classifier-free guidance, autoregressive decoding, and recurrent
   state lifecycles, through one state machine that a caller can either drain
-  in a single `RunStage` call or step through a `StageRun`.
+  in a single `RunStage` call or step through a `StageRun`. That machine owns
+  a run's identity, slot, bindings, cancellation, step count, and terminal
+  event; what one step of a kind actually does lives behind an internal stage
+  executor instead, reached through a narrow host interface rather than
+  through the session's internals.
 - Stop that execution cooperatively: every boundary polls the run's
   `CancellationToken`, `StageRun::RequestCancellation` signals a step already
   in flight without taking the session lock, one shared process-wide deadline
@@ -87,14 +91,18 @@ latent-dynamics compatibility layer.
 | `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, the connection transfer plan, and the on-demand per-component precision report. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `stage_registry.hpp/.cpp` | The one source of truth for stage kinds: each kind's manifest name, the `StageExecutionStrategy` the stage state machine drives it with, and the exact option names its manifest options object may carry, plus `kStageKindCount` and the non-throwing `FindStageKind`/`StageKindIndex` lookups every other file resolves a kind through. |
+| `stage_executor.hpp/.cpp` | The strategy objects `StageRun` steps a stage through: the narrow `StageExecutionHost` a strategy may reach the session by, the `StageStepContext` that hands a run's own inputs to the first step that actually executes, the `StageExecutor` interface whose absent step event means "complete", the one-pass executor that `single_pass`, `state_transition`, `composite`, and `on_demand` all share, and `MakeStageExecutor`, the exhaustive switch over the registry's strategies that builds one before a run claims the session's slot. |
+| `stage_executor_autoregressive.cpp` | The autoregressive strategy: the sampling plan, seed, end-of-sequence set, and prompt-derived token budget resolved when the run is built, the decode-sample-substitute-feed-back step, the per-lane end-of-sequence latch that requests the stop the next step reports, and the batch-major `generated_token_ids` added to the result without displacing a manifest output of that name. |
+| `stage_executor_iterative.cpp` | The iterative strategy: the absolute scheduler cursor read once when the run is built, the one scheduler step per `StepLocked` while the session's stage cursor is below it, and the last step's outputs -- or the session's current outputs for a stage that was already complete -- as the run's result. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
 | `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the validation of its per-kind keys against `stage_registry`, the per-kind permit buckets that registry sizes and orders, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, the per-stage-kind admission outcome each acquisition records into the telemetry collector, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
 | `pipeline_telemetry.hpp/.cpp` | The opt-in telemetry collector behind `PipelineTelemetryOptions`: the immutable per-epoch counter slab pre-populated from the manifest, the relaxed-atomic counters and their compare-exchange maxima, the RAII component and stage recorders that classify an outcome by `ErrorCode`, the admission and device-transfer hooks, `detail::ValidatePipelineTelemetryOptions` and the trace directory it creates on the cold path, the sanitized unique per-call trace prefix and the `noexcept` discovery that turns the file ONNX Runtime wrote into one capped `PipelineTraceRecord`, the atomic slab publication that makes `Pipeline::ResetTelemetry` a new epoch rather than a barrier, and `detail::SnapshotPipelineTelemetry`, the reading `Pipeline::telemetry_snapshot` returns. |
-| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the `StageRun::Impl` state machine that both `RunStage` and `BeginStage` execute through, its cancellation source and the link into a caller's token, the admission leases every execution takes before the session lock, the telemetry recorders those executions and their component calls are measured by, the snapshot, restore, fork, and named-checkpoint operations over that bundle, the single `MaterializeHost` device-versus-host materialization boundary, and `Pipeline` itself. |
+| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the `StageRun::Impl` state machine that both `RunStage` and `BeginStage` execute through and the nested `SessionHost` adapter that is the only path from a stage executor back into that session, its cancellation source and the link into a caller's token, the admission leases every execution takes before the session lock, the telemetry recorders those executions and their component calls are measured by, the snapshot, restore, fork, and named-checkpoint operations over that bundle, the single `MaterializeHost` device-versus-host materialization boundary, and `Pipeline` itself. |
 
 `cancellation.hpp`, `dynamic_library.hpp`, `ort_backend.hpp`,
 `pipeline_manifest_common.hpp`, `pipeline_manifest_validation.hpp`,
-`pipeline_scheduler.hpp`, `pipeline_telemetry.hpp`, and `stage_registry.hpp`
+`pipeline_scheduler.hpp`, `pipeline_telemetry.hpp`, `stage_executor.hpp`, and
+`stage_registry.hpp`
 are internal: they live in `onnx_world_model::detail` and are not installed.
 
 ## Dependencies
@@ -117,6 +125,7 @@ stage_registry -> pipeline_manifest_validation
 stage_registry -> pipeline_telemetry
 stage_registry -> pipeline_scheduler
 stage_registry -> pipeline_session
+stage_registry -> stage_executor -> pipeline_session
 pipeline_manifest_common -> pipeline_manifest_validation -> pipeline
 ```
 
@@ -126,8 +135,18 @@ telemetry, and the session all read one stage-kind list without a cycle. A
 stage kind exists there or it does not exist at all — its `kStageKindCount`
 sizes every per-kind array in this directory, its order is the order of the
 scheduler's buckets, telemetry's admission entries, and both public per-stage-
-kind maps, and its `StageExecutionStrategy` is what `StageRun::Impl` switches
-on instead of comparing the kind string.
+kind maps, and its `StageExecutionStrategy` is what `MakeStageExecutor`
+switches on instead of comparing the kind string.
+
+`stage_executor` sits between that registry and the session: it declares the
+`StageExecutionHost` a strategy body may reach a session by and implements one
+executor per strategy, and it depends on nothing in `pipeline_session.cpp` —
+only on the public headers and the registry. The dependency runs the other
+way, and it runs through that interface alone: `pipeline_session.cpp`
+implements the host as a class nested in `StageRun::Impl`, so an executor
+cannot see the session's mutex, run slot, admission scheduler, telemetry
+collector, snapshots, or `SessionState`, and nothing in `stage_executor*.cpp`
+takes a lock — `StageRun` holds the session lock across every executor call.
 
 `pipeline_manifest_validation.cpp` never parses raw JSON documents itself; it
 receives an already-populated `PipelineManifest` from `pipeline.cpp`.

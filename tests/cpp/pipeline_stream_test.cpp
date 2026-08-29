@@ -632,6 +632,20 @@ constexpr std::string_view kPassthroughManifest = R"json(
   return document.str();
 }
 
+// Copies one embedded manifest with a field rewritten, which is how a case
+// asserts a stage kind that shares another kind's execution strategy without
+// carrying a second manifest for it.
+void ReplaceOnce(
+    std::string& document,
+    std::string_view marker,
+    std::string_view replacement) {
+  const std::size_t at = document.find(marker);
+  Check(at != std::string::npos, "the copied manifest is as expected");
+  if (at != std::string::npos) {
+    document.replace(at, marker.size(), replacement);
+  }
+}
+
 [[nodiscard]] Pipeline MakeCounterPipeline(std::string_view document) {
   std::unordered_map<std::string, Model> models;
   models.emplace("counter", Model(std::make_shared<IncrementBackend>()));
@@ -931,6 +945,51 @@ int main() {
         "the budget is not recomputed once the token input shrinks");
   }
 
+  // The generated history is added to the stage's result, never over a
+  // manifest output that already carries that name.
+  {
+    std::string document = DecoderManifest(
+        4,
+        R"json({
+          "tokenizer_asset": "tokenizer.json",
+          "sampling": {"do_sample": false},
+          "stop": {"kind": "token_ids", "eos_token_ids": [99]},
+          "max_tokens": {"default": 2, "limit": 8}
+        })json");
+    ReplaceOnce(
+        document,
+        R"("outputs": [{"port": "decoder.logits"}])",
+        R"("outputs": [)"
+        R"({"port": "decoder.logits", "alias": "generated_token_ids"}])");
+
+    const Pipeline pipeline =
+        MakeDecoderPipeline(document, std::make_shared<NextTokenBackend>(4));
+    const std::array<std::int64_t, 1> prompt{0};
+    const NamedTensors inputs{
+        {"text.token_ids", PromptTensor({1, 1}, std::span(prompt))}};
+
+    PipelineSession full = pipeline.CreateSession();
+    const NamedTensors expected = full.RunStage("decode", inputs);
+    Check(
+        expected.at("generated_token_ids").data_type() == DataType::float32,
+        "RunStage keeps the manifest output that claims the name");
+
+    PipelineSession streamed = pipeline.CreateSession();
+    StageRun run = streamed.BeginStage("decode", inputs);
+    const RunTrace trace = Drain(run);
+    Check(
+        std::ranges::count(trace.kinds, StageEventKind::token) == 2,
+        "the run still decodes its whole budget");
+    Check(
+        trace.outputs.at("generated_token_ids").data_type() ==
+            DataType::float32,
+        "a streamed completion does not displace it either");
+    Check(
+        TokenShape(trace.outputs) ==
+            expected.at("generated_token_ids").shape(),
+        "both paths report the same colliding output");
+  }
+
   // Iterative stages report one event per scheduler step and then complete.
   {
     const Pipeline pipeline = MakeCounterPipeline(kIterativeManifest);
@@ -1042,14 +1101,28 @@ int main() {
 
   // composite and on_demand are declared kinds of their own, but they share
   // single_pass's execution strategy, so their streamed shape is the single
-  // pass's. One assertion covers that sharing; on_demand execution is
-  // exercised end to end by the Python image-to-video suite.
-  {
+  // pass's and their completion is the RunStage result. One case covers both
+  // kinds, from a copy of one manifest that changes only the kind; on_demand
+  // execution is exercised end to end by the Python image-to-video suite.
+  for (const std::string_view kind : {"composite", "on_demand"}) {
     std::string document(kPassthroughManifest);
-    const std::string_view single_pass = R"("kind": "single_pass")";
-    const std::size_t at = document.find(single_pass);
-    Check(at != std::string::npos, "the passthrough manifest is as expected");
-    document.replace(at, single_pass.size(), R"("kind": "composite")");
+    ReplaceOnce(
+        document,
+        R"("kind": "single_pass")",
+        R"("kind": ")" + std::string(kind) + R"(")");
+    if (kind == "on_demand") {
+      // The one thing an on_demand stage must declare beyond its kind: a
+      // component presence condition, and the input that satisfies it.
+      ReplaceOnce(
+          document,
+          R"("run_on": "always",)",
+          R"("run_on": "always", "presence": "conditioning",)");
+      ReplaceOnce(
+          document,
+          R"("kind": "external", "required": true)",
+          R"("kind": "external", "required": true,)"
+          R"( "presence": "conditioning")");
+    }
 
     std::unordered_map<std::string, Model> models;
     models.emplace("producer", Model(std::make_shared<PassthroughBackend>()));
@@ -1058,6 +1131,9 @@ int main() {
     const std::array<float, 4> values{1.0F, 2.0F, 3.0F, 4.0F};
     const NamedTensors inputs{
         {"x", Tensor::FromValues<float>({1, 4}, std::span(values))}};
+
+    PipelineSession full = pipeline.CreateSession();
+    const NamedTensors expected = full.RunStage("run", inputs);
 
     PipelineSession streamed = pipeline.CreateSession();
     StageRun run = streamed.BeginStage("run", inputs);
@@ -1068,10 +1144,11 @@ int main() {
                 StageEventKind::transition,
                 StageEventKind::completed,
             },
-        "a composite stage shares the one-pass strategy");
+        "a composite or on_demand stage shares the one-pass strategy");
     Check(
-        trace.outputs.at("produced").values<float>()[3] == 4.0F,
-        "a composite stage returns the one pass it executed");
+        trace.outputs.at("produced").values<float>()[3] ==
+            expected.at("produced").values<float>()[3],
+        "a kind sharing the one-pass strategy matches RunStage");
   }
 
   // The terminal event happens once. Stepping past it is a state error, and
