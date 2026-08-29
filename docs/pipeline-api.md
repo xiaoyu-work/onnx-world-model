@@ -165,6 +165,191 @@ if (stats.queued_executions > stats.active_executions) {
 }
 ```
 
+## Telemetry
+
+Telemetry is opt-in and observability only: it changes what is measured and
+never what is executed, in what order, or with what result. It is off by
+default, and off means the pipeline holds no collector at all rather than one
+that ignores everything, so an unmeasured pipeline pays one pointer test per
+instrumentation site.
+
+```python
+from onnx_world_model import Pipeline
+
+pipeline = Pipeline("output/cosmos3-edge", enable_telemetry=True)
+session = pipeline.create_session()
+session.run_stage("reasoner_prompt", {"input_ids": input_ids})
+
+telemetry = pipeline.telemetry_snapshot
+component = telemetry.components["reasoner_embedding"]
+print(component.successful_calls)                      # 1
+print(component.input_bytes, component.output_bytes)   # exact byte totals
+print(component.total_duration_ns)                     # nanoseconds
+
+stage = telemetry.stages["reasoner_prompt"]
+print(stage.successful_executions, stage.steps, stage.completions)  # 1 1 1
+
+pipeline.reset_telemetry()          # counters restart, epoch advances
+print(pipeline.telemetry_snapshot.epoch)  # 2
+```
+
+`WorldModel` forwards the same option and exposes the same two members:
+
+```python
+from onnx_world_model import WorldModel
+
+model = WorldModel.from_pretrained("output/cosmos3-edge", enable_telemetry=True)
+result = model.text.generate("Describe this scene.")
+print(result.timings)                            # per-request wall clock
+print(model.telemetry_snapshot.stages["reasoner_decode"].steps)  # tokens decoded
+model.reset_telemetry()
+```
+
+The two are different measurements on purpose: `timings` is what one request
+took, while `telemetry_snapshot` is what the runtime underneath did.
+
+### What a reading contains
+
+`PipelineTelemetrySnapshot` is a frozen dataclass; its three mappings are
+read-only views.
+
+| Field | Meaning |
+|---|---|
+| `enabled` | whether this pipeline collects at all |
+| `epoch` | which collection epoch these counters belong to |
+| `components` | `PipelineComponentStats` per manifest component name |
+| `stages` | `PipelineStageStats` per manifest stage name |
+| `admission_by_stage_kind` | `PipelineAdmissionStats` per stage kind |
+| `transfers` | one pipeline-wide `PipelineTransferStats` |
+
+`PipelineComponentStats` — one call is one invocation of that component's
+session from inside a stage execution:
+
+| Field | Meaning |
+|---|---|
+| `successful_calls` | calls that returned outputs |
+| `failed_calls` | calls that raised anything but a cancellation or deadline |
+| `cancelled_calls` | calls that raised `CancelledError` |
+| `deadline_exceeded_calls` | calls that raised `DeadlineExceededError` |
+| `total_duration_ns` | nanoseconds inside the call, every attempt |
+| `max_duration_ns` | the longest single call, in nanoseconds |
+| `input_bytes` | bytes presented to the call, every attempt |
+| `output_bytes` | bytes returned by a successful call |
+
+`PipelineStageStats`:
+
+| Field | Meaning |
+|---|---|
+| `successful_executions` | executions that finished |
+| `failed_executions` | executions that raised anything but a cancellation or deadline |
+| `cancelled_executions` | executions that raised `CancelledError` |
+| `deadline_exceeded_executions` | executions that raised `DeadlineExceededError` |
+| `steps` | non-terminal stage steps that completed |
+| `completions` | terminal `completed` events |
+| `total_execution_duration_ns` | nanoseconds executing, after admission |
+| `max_execution_duration_ns` | the longest single execution, in nanoseconds |
+
+`PipelineAdmissionStats`:
+
+| Field | Meaning |
+|---|---|
+| `queued_acquisitions` | acquisitions that had to wait for a permit |
+| `admitted_acquisitions` | acquisitions that received a permit |
+| `cancelled_while_queued` | queued acquisitions released by a cancel |
+| `deadline_while_queued` | queued acquisitions released by a deadline |
+| `total_wait_ns` | nanoseconds spent in the queue, every outcome |
+| `max_wait_ns` | the longest single queue wait, in nanoseconds |
+
+`PipelineTransferStats`:
+
+| Field | Meaning |
+|---|---|
+| `device_to_host_copies` | materializations the runtime performed |
+| `device_to_host_bytes` | bytes those materializations moved |
+| `component_input_bytes_device_resident` | presented bytes that still lived on a device |
+| `component_input_bytes_host` | presented bytes that already lived on the host |
+
+### How it counts
+
+- **Durations are nanoseconds of wall-clock time,** and byte totals are exact
+  tensor byte sizes. A duration covers every attempt whatever its outcome; a
+  maximum never exceeds its own total.
+- **An execution is one admission lease scope:** one `run_stage`, one
+  `step_stage`, one `StageRun.step`, or one `StageRun.finish` that still has
+  work to drain. `begin_stage`, an idle handle, and a `finish` that returns an
+  already-completed run's cached outputs are not executions and change nothing.
+- **Steps and completions measure stage progress, not API calls.** One
+  `run_stage` of a three-step iterative stage is one execution, three steps,
+  and exactly one completion, and stepping that same stage explicitly is four
+  executions — the fourth produces the terminal event — with the same three
+  steps and the same one completion. A direct `step_stage` bypasses the event
+  state machine, so it counts one step and never a completion.
+- **Outcomes are classified by error code, never by message,** so a
+  cancellation and a deadline are their own counters rather than failures, and
+  the four counters in each group are mutually exclusive.
+- **Stage duration starts after the permit is granted,** so queue wait is
+  reported once, by the admission counters, instead of being folded into the
+  stage.
+- **An unlimited stage kind records no admission at all.** It is admitted
+  without taking a permit, so an unconfigured pipeline reports zeros there
+  while its executions are still measured. An acquisition granted at once is
+  admitted with a zero wait and is not counted as queued; only one that had to
+  wait is. A grant that raced a cancellation counts once, as admitted.
+- **An execution stopped while it was still queued never became an
+  execution.** It is reported by `admission_by_stage_kind` and does not appear
+  in `stages`.
+- **A reading is a detached value,** but deliberately not one atomic instant:
+  each counter is copied individually from a running system, because the
+  alternative is a lock on the execution path. Read it again for a newer
+  moment.
+- **`reset_telemetry()` starts a new epoch rather than editing counters.** An
+  execution already running finishes into the epoch it started in, so its
+  remaining counts land in the previous epoch and are absent from the new one.
+- **Copies share one collector,** so copies of a pipeline report the same
+  counters, and every session, forked session, and `StageRun` created from any
+  of them is counted. A separately constructed pipeline gets its own.
+- **A disabled pipeline reads as `enabled=False`,** epoch `0`, and three empty
+  mappings — nothing was collected, which is different from nothing having
+  happened. An enabled reading always carries every manifest component, every
+  manifest stage, and all six stage kinds, so a key is read without testing for
+  it.
+
+### What telemetry does not report
+
+- **ONNX Runtime per-node traces.** Only ONNX Runtime produces them, and
+  exporting them is not part of this milestone.
+- **Execution-provider peak or current memory.** Only the provider knows it.
+- **Host-to-device bytes.** Uploads happen inside ONNX Runtime when it binds an
+  input, so this runtime cannot measure them and refuses to guess.
+  `component_input_bytes_device_resident` and `component_input_bytes_host` are
+  presentation, not transfer: they say where each component's inputs already
+  lived, and a tensor presented twice is counted twice.
+- **Copies ONNX Runtime makes below the session.** `device_to_host_copies`
+  counts what the session materializes itself. When ONNX Runtime stages a
+  foreign device buffer to the host while binding an input, that copy happens
+  inside the backend and is not counted here.
+- **Aggregation.** There is no sampling, no window, no percentile, no metrics
+  export, and no per-request trace. A snapshot is a set of cumulative counters
+  for one epoch; anything above that belongs to the caller.
+
+The C++ equivalent is `Pipeline::telemetry_snapshot()` and
+`Pipeline::ResetTelemetry()`:
+
+```cpp
+PipelineTelemetryOptions telemetry;
+telemetry.enabled = true;
+Pipeline pipeline = Pipeline::Load("output/cosmos3-edge", {}, {}, {}, telemetry);
+
+const PipelineTelemetrySnapshot snapshot = pipeline.telemetry_snapshot();
+const PipelineStageStats& stage = snapshot.stages.at("reasoner_decode");
+if (stage.steps > 0) {
+  const std::uint64_t average_ns =
+      stage.total_execution_duration_ns / stage.steps;
+  // Nanoseconds per decoded token, this epoch.
+}
+pipeline.ResetTelemetry();
+```
+
 ## Execution providers
 
 Provider names are case-insensitive and may use short names such as `cuda`,
@@ -951,7 +1136,8 @@ Pipeline pipeline = Pipeline::Load(
                      .provider_options = {{"cuda", {{"device_id", "1"}}}},
                  }},
             },
-    });
+    },
+    PipelineTelemetryOptions{.enabled = true});
 
 for (const PipelineTransfer& transfer : pipeline.transfer_plan().transfers) {
   if (transfer.kind != PipelineTransferKind::direct) {
@@ -1070,6 +1256,13 @@ an accurate plan.
 - In-memory session snapshot, restore, fork, and named checkpoints. This is
   in-memory transaction support, not paged KV attention: nothing is serialized
   to disk and nothing crosses a process boundary.
+- Opt-in runtime telemetry: per-component call, byte, and duration counters,
+  per-stage execution, step, and completion counters, per-stage-kind admission
+  wait outcomes, and the device-to-host materializations the runtime performed,
+  read as an immutable snapshot under a reset-able epoch. ONNX Runtime
+  per-node trace export, execution-provider peak memory, exact host-to-device
+  byte counts, and any aggregation, percentile, export, or per-request tracing
+  above cumulative counters are **not** included.
 - Explicit cancellation and deadlines on stage execution and generic model
   execution, enforced at execution boundaries, by one shared process-wide
   deadline watchdog, and inside an ONNX Runtime call at graph-node

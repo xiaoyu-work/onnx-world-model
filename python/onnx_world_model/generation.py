@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Implements the modality-oriented `WorldModel` generation API by mapping text, image, video, and action requests onto the manifest stages of one Mobius pipeline package.
 # @agent-public-api: WorldModel, TextGenerator, TextOutput, ImageGenerator, ImageOutput, VideoGenerator, VideoOutput, ActionGenerator, ActionOutput
-# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything, and the two placement options -- `component_placement` and `allow_unpreferred_providers` -- which are load-time only and never warm, lazily load, offload, evict, or peer-to-peer transfer anything.
+# @agent-invariants: `WorldModel.capabilities` is derived from the stages the loaded package actually declares, so a modality generator raises rather than running an absent stage. Every generator exposes the same `generate()` entry point and returns its own frozen output dataclass. A text request accepts at most one of `image=` or `video=`. `from_pretrained` and `load` are the same constructor. Stage discovery is by manifest kind and `run_on`, never by hard-coded component names. The device_outputs option is forwarded unchanged to the underlying Pipeline, as are the two admission-scheduling options, which cap concurrent executions and never batch anything, the two placement options -- `component_placement` and `allow_unpreferred_providers` -- which are load-time only and never warm, lazily load, offload, evict, or peer-to-peer transfer anything, and `enable_telemetry`, which turns on the pipeline's runtime counters and changes what is measured rather than what is executed. `WorldModel.telemetry_snapshot` and `WorldModel.reset_telemetry` are pass-throughs to that pipeline, and are deliberately distinct from the per-request wall-clock `timings` each generator returns: one measures the runtime, the other measures the request.
 # @agent-side-effects: Loads a pipeline package and its ONNX components, runs ONNX Runtime inference, reads image and video files supplied by the caller, and records per-stage wall-clock timings.
 
 from __future__ import annotations
@@ -16,7 +16,13 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from ._api import ComponentPlacementSpec, Pipeline, PipelineSession, ProviderOptions
+from ._api import (
+    ComponentPlacementSpec,
+    Pipeline,
+    PipelineSession,
+    PipelineTelemetrySnapshot,
+    ProviderOptions,
+)
 from .preprocessing import (
     PreparedWorldInputs,
     RawImage,
@@ -65,6 +71,13 @@ class WorldModel:
     execution providers and session settings each component's ONNX Runtime
     session is built with, and they never warm a session up, load one lazily,
     offload or evict one, or arrange a peer-to-peer transfer.
+
+    ``enable_telemetry`` is forwarded too, and turns on the counters
+    :attr:`telemetry_snapshot` reports. It is off by default, changes what is
+    measured rather than what is executed, and measures the pipeline
+    underneath this API -- component calls, stage executions, admission waits,
+    and device materializations -- rather than the per-request wall-clock
+    ``timings`` each generator already returns.
     """
 
     def __init__(
@@ -85,6 +98,7 @@ class WorldModel:
             Mapping[str, ComponentPlacementSpec | Mapping[str, Any]] | None
         ) = None,
         allow_unpreferred_providers: bool = False,
+        enable_telemetry: bool = False,
     ) -> None:
         runtime = _GenerationRuntime(
             package_path,
@@ -100,6 +114,7 @@ class WorldModel:
             max_concurrent_by_stage_kind=max_concurrent_by_stage_kind,
             component_placement=component_placement,
             allow_unpreferred_providers=allow_unpreferred_providers,
+            enable_telemetry=enable_telemetry,
         )
         self._runtime = runtime
         self.text = TextGenerator(runtime)
@@ -124,6 +139,22 @@ class WorldModel:
     @property
     def execution_providers(self) -> Mapping[str, tuple[str, ...]]:
         return self._runtime.pipeline.execution_providers
+
+    @property
+    def telemetry_snapshot(self) -> PipelineTelemetrySnapshot:
+        """The underlying pipeline's runtime counters right now.
+
+        This is the pipeline's own measurement -- component calls, stage
+        executions, admission waits, and device materializations -- and is
+        separate from the per-request wall-clock ``timings`` each generator
+        returns. A model loaded without ``enable_telemetry`` reports a disabled
+        reading rather than raising.
+        """
+        return self._runtime.pipeline.telemetry_snapshot
+
+    def reset_telemetry(self) -> None:
+        """Starts a new telemetry epoch on the underlying pipeline."""
+        self._runtime.pipeline.reset_telemetry()
 
     @property
     def capabilities(self) -> tuple[str, ...]:

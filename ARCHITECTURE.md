@@ -47,8 +47,8 @@ There is no server, database, or outbound network call at run time.
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
-| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, component placement and connection transfer planning, admission scheduling, staged execution. |
+| Public C++ API | `include/onnx_world_model/` | Installed declarations: `Tensor`, `Error`, `CancellationToken`, `CancellationSource`, `Model`, `Pipeline`, `PipelineSchedulingOptions`, `PipelineSchedulingStats`, `PipelineTelemetryOptions`, `PipelineTelemetrySnapshot`, `ComponentPlacement`, `PipelinePlacementOptions`, `PipelineTransfer`, `PipelineTransferPlan`, `PipelineSession`, `PipelineSessionSnapshot`, `StageRun`, `StageEvent`, `WorldModel`, `Rollout`. |
+| Core library | `src/` | ORT loading, tensor marshalling, cancellation state, manifest parsing and validation, component placement and connection transfer planning, admission scheduling, opt-in telemetry collection, staged execution. |
 | Python binding | `bindings/python_module.cpp` | The `_native` pybind11 module and NumPy-to-`Tensor` conversion. |
 | Python package | `python/onnx_world_model/` | Typed wrappers, preprocessing, media handling, and the modality-oriented generation API. |
 | C++ tests | `tests/cpp/` | Stub-backend tests registered with CTest. |
@@ -85,10 +85,19 @@ Within `src/` the runtime is layered:
   the RAII lease that returns a permit exactly once, and the consistent
   snapshot of that state a `Pipeline` reports. It decides only when an
   execution may start; it never runs, resumes, or inspects one.
+- `pipeline_telemetry` is the shared, opt-in measurement collector: one
+  immutable pre-populated counter slab per epoch, relaxed-atomic counters, the
+  RAII component and stage recorders, the admission and device-transfer hooks,
+  and the atomic slab publication that makes a reset a new epoch rather than a
+  barrier. It records and never reads back, so it changes what is measured and
+  never what is executed; with telemetry disabled a `Pipeline` holds no
+  collector at all.
 - `pipeline_session` executes stages, owns per-trajectory state, drives one
   stage at a time through the `StageRun` state machine, captures or
-  restores that state as an in-memory snapshot, and defines `Pipeline`, which
-  hands every session it creates that one scheduler.
+  restores that state as an in-memory snapshot, materializes every device
+  source to the host through one `MaterializeHost` boundary, and defines
+  `Pipeline`, which hands every session it creates that one scheduler and that
+  one collector.
 - `world_model` provides the fixed latent-dynamics compatibility API.
 
 ## Dependency Rules
@@ -273,6 +282,65 @@ callback, admits nothing, and queues nothing, so observing admission cannot
 perturb it. This is observability for admission only; it reports no timing,
 no throughput, and nothing about batching.
 
+Measurement is a separate, opt-in concern layered above all of that.
+`PipelineTelemetryOptions{enabled}` is off by default, and off means the
+`Pipeline` holds no collector at all: every recording site in the session and
+the scheduler is one null-pointer test, with no lock, allocation, atomic, or
+clock read, so an unmeasured pipeline behaves exactly as every earlier release
+did. When it is on, one collector is shared exactly the way the scheduler is —
+by every copy of that `Pipeline`, its scheduler, every session it creates,
+every fork of those sessions, and every `StageRun` they produce — and a
+separately constructed `Pipeline` gets its own.
+
+The collector owns one immutable counter slab per epoch, pre-populated from the
+manifest with an entry per component, an entry per stage, and an entry per
+stage kind, so a recording thread only ever looks an entry up: it never
+inserts, never rehashes, and never allocates. Counters are relaxed atomics and
+maxima are relaxed compare-exchange loops, and telemetry takes none of the
+runtime's locks and calls back into none of its code, so it sits outside the
+lock order entirely and can neither deadlock nor reorder anything.
+
+What is measured is defined by the same boundaries execution already has. A
+component call is one invocation of a component's session from inside a stage,
+so `Model::Run` called directly by a caller is not one; its duration brackets
+that call, its input bytes count every tensor presented on every attempt, and
+its output bytes count a success. A stage execution is one admission lease
+scope — the same four calls that take one permit — measured from after the
+permit was granted, so queue wait is reported once, by the admission counters,
+rather than folded into the stage. `steps` and `completions` measure stage
+progress instead of API calls: a `StageRun` counts one step per non-terminal
+event however it was driven and exactly one completion when it emits its
+terminal event, while a direct `StepStage` counts one step and never a
+completion because it emits no terminal event at all. Every outcome is
+classified by `ErrorCode`, never by message, so a cancellation and a deadline
+are their own buckets rather than failures, and an execution stopped while it
+was still queued never became an execution and is reported only by admission.
+
+Transfer counters are exact for what a session does itself: every
+device-to-host materialization in a session goes through one `MaterializeHost`
+boundary that counts a real copy and its bytes, and hands a source that is
+already ordinary CPU memory straight back without counting it. A copy ONNX
+Runtime makes below that boundary — staging a foreign device buffer while it
+binds an input — happens inside the backend and is not counted. There is
+deliberately no host-to-device counter, because uploads happen inside ONNX
+Runtime when it binds an input and this runtime cannot measure their byte
+counts without guessing. Component input residency is the honest measure that
+is available, and it is presentation rather than transfer: it says where each
+component's inputs already lived, counting a tensor once per presentation.
+
+`Pipeline::telemetry_snapshot()` returns a detached
+`PipelineTelemetrySnapshot`. Unlike the scheduling reading it is deliberately
+not one atomic instant: each counter is copied individually, because the
+alternative is a lock on the execution path. `Pipeline::ResetTelemetry()`
+publishes a fresh slab under the next epoch rather than clearing counters in
+place, so an execution that is already running finishes into the epoch it
+started in and is intentionally absent from the new one. A disabled or
+moved-from `Pipeline` reads as `enabled == false`, epoch `0`, and empty maps
+rather than throwing. ONNX Runtime per-node traces, execution-provider peak
+memory, and exact host-to-device byte counts are deliberately out of scope:
+each needs data only ONNX Runtime holds, and this runtime reports nothing it
+cannot measure itself.
+
 Named checkpoints are control metadata held on the session beside that
 execution state rather than inside it. A snapshot therefore never carries a
 checkpoint namespace: checkpoints survive stage execution and ordinary
@@ -315,8 +383,10 @@ Python:
   `max_concurrent_executions` and `max_concurrent_by_stage_kind` constructor
   arguments that cap concurrent executions, the keyword-only
   `component_placement` and `allow_unpreferred_providers` constructor
-  arguments that place each component's session, and the read-only
-  `transfer_plan` those produce.
+  arguments that place each component's session, the read-only
+  `transfer_plan` those produce, and the keyword-only `enable_telemetry`
+  constructor argument with the read-only `telemetry_snapshot` and
+  `reset_telemetry()` that report and restart the runtime counters.
 - `onnx_world_model.CancellationSource` and `CancellationToken` — explicit
   cancellation and deadlines, with `CancelledError` and
   `DeadlineExceededError` as the outcomes, both derived from
@@ -341,7 +411,10 @@ C++:
   `Pipeline::Load` and `PipelinePackage::Load` take an optional
   `PipelinePlacementOptions` that places each component's session;
   `Pipeline::transfer_plan` and `PipelinePackage::transfer_plan` read the
-  resulting connection classification.
+  resulting connection classification. `Pipeline`'s constructor and `Load`
+  also take an optional `PipelineTelemetryOptions` that turns runtime
+  measurement on, and `Pipeline::telemetry_snapshot` and
+  `Pipeline::ResetTelemetry` read and restart those counters.
 - `onnx_world_model::PipelineSession::Snapshot`, `Restore`, and `Fork` for
   in-memory session branching, plus `Checkpoint`, `RestoreCheckpoint`,
   `DropCheckpoint`, and `HasCheckpoint` for named in-memory checkpoints.
@@ -415,6 +488,21 @@ and the `onnx-world-model` wheel built by scikit-build-core.
   `Pipeline::scheduling_stats` observes that controller and nothing else: it
   reports admitted and queued counts, never timings or throughput, and reading
   it cannot admit, queue, or block anything.
+- **Telemetry is opt-in, additive, and never authoritative about ORT.**
+  Measurement changes what is observed and never what is executed, in what
+  order, or with what result. Disabled is the default and means no collector
+  at all, so an unmeasured pipeline pays one null test per site; enabled, the
+  collector only ever updates its own relaxed atomics, takes none of the
+  runtime's locks, calls back into none of its code, and can therefore neither
+  deadlock nor perturb admission or execution. An outcome is classified by
+  `ErrorCode`, never by message. A reading is a detached value whose fields are
+  individually current rather than one atomic instant, and a reset publishes a
+  new epoch rather than editing counters, so in-flight work lands in the epoch
+  it started in. Byte totals the runtime measures itself are exact; anything it
+  cannot measure is absent rather than estimated, which is why there is no
+  host-to-device byte counter, no ONNX Runtime per-node trace, and no
+  execution-provider peak memory. Component input residency is presentation,
+  not transfer, and must not be documented as a transfer count.
 - **Placement is load-time, and the transfer plan only describes it.** Which
   execution providers, provider options, graph optimization level, and thread
   counts a component's session is built with is decided once, while that
@@ -497,3 +585,22 @@ not partially implemented anywhere:
 - rewriting execution from the transfer plan. Nothing reads it, so turning
   `device_outputs` on or off changes what the session does while the plan
   keeps describing the same physical placement.
+
+Runtime telemetry covers what this runtime performs itself: component calls,
+stage executions, steps and completions, admission wait outcomes, the
+device-to-host materializations a session makes, and the residency of the
+bytes each component was handed. The following are deliberately out of scope
+in this milestone and are not partially implemented anywhere:
+
+- ONNX Runtime per-node profiling traces and their export, because only ORT
+  produces them;
+- execution-provider peak or current memory, because only the provider knows
+  it;
+- exact host-to-device byte counts, because uploads happen inside ORT when it
+  binds an input. Component input residency reports where the bytes lived when
+  they were presented; it is not an upload count and must not be read as one.
+  A device-to-host copy ORT makes below the session boundary, when it stages a
+  foreign device buffer into a call, is likewise not counted;
+- sampling, aggregation windows, percentiles, export to a metrics system, and
+  per-request tracing. A snapshot is a set of cumulative counters for one
+  epoch, and everything above it belongs to the caller.

@@ -41,6 +41,17 @@ latent-dynamics compatibility layer.
   observes its own cancellation token and deadline. That controller also
   reports its own admitted and queued counts, per stage kind and in total,
   as one consistent snapshot that reading cannot perturb.
+- Measure that execution when, and only when, a caller opts in: one shared
+  telemetry collector per `Pipeline` records per-component call counts, byte
+  totals and durations, per-stage execution, step, and completion counts,
+  per-stage-kind admission wait outcomes, and the device-to-host
+  materializations the session performs, and reports them as an immutable
+  `PipelineTelemetrySnapshot` under a reset-able epoch. Telemetry changes what
+  is measured and never what is executed; with it disabled the `Pipeline`
+  holds no collector and every recording site is one null-pointer test. ONNX
+  Runtime per-node traces, provider peak memory, and exact host-to-device byte
+  counts are deliberately not implemented, because only ONNX Runtime holds
+  that data.
 - Keep `Pipeline` immutable and shareable while `PipelineSession` owns one
   request's mutable state, and let a session capture that state as an
   immutable in-memory `PipelineSessionSnapshot` it can restore or fork from, or
@@ -62,13 +73,14 @@ latent-dynamics compatibility layer.
 | `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, and the connection transfer plan. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
-| `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the supported stage-kind list and its validation, the per-kind permit buckets, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
-| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the `StageRun::Impl` state machine that both `RunStage` and `BeginStage` execute through, its cancellation source and the link into a caller's token, the admission leases every execution takes before the session lock, the snapshot, restore, fork, and named-checkpoint operations over that bundle, the device-versus-host materialization boundaries, and `Pipeline` itself. |
+| `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the supported stage-kind list and its validation, the per-kind permit buckets, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, the per-stage-kind admission outcome each acquisition records into the telemetry collector, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
+| `pipeline_telemetry.hpp/.cpp` | The opt-in telemetry collector behind `PipelineTelemetryOptions`: the immutable per-epoch counter slab pre-populated from the manifest, the relaxed-atomic counters and their compare-exchange maxima, the RAII component and stage recorders that classify an outcome by `ErrorCode`, the admission and device-transfer hooks, the atomic slab publication that makes `Pipeline::ResetTelemetry` a new epoch rather than a barrier, and `detail::SnapshotPipelineTelemetry`, the reading `Pipeline::telemetry_snapshot` returns. |
+| `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the `StageRun::Impl` state machine that both `RunStage` and `BeginStage` execute through, its cancellation source and the link into a caller's token, the admission leases every execution takes before the session lock, the telemetry recorders those executions and their component calls are measured by, the snapshot, restore, fork, and named-checkpoint operations over that bundle, the single `MaterializeHost` device-versus-host materialization boundary, and `Pipeline` itself. |
 
 `cancellation.hpp`, `dynamic_library.hpp`, `ort_backend.hpp`,
-`pipeline_manifest_common.hpp`, `pipeline_manifest_validation.hpp`, and
-`pipeline_scheduler.hpp` are internal: they live in
-`onnx_world_model::detail` and are not installed.
+`pipeline_manifest_common.hpp`, `pipeline_manifest_validation.hpp`,
+`pipeline_scheduler.hpp`, and `pipeline_telemetry.hpp` are internal: they live
+in `onnx_world_model::detail` and are not installed.
 
 ## Dependencies
 
@@ -84,6 +96,8 @@ cancellation -> ort_backend -> model -> world_model
 dynamic_library -> ort_backend       `-> pipeline -> pipeline_session
 cancellation -> pipeline_session
 cancellation -> pipeline_scheduler -> pipeline_session
+pipeline_telemetry -> pipeline_scheduler -> pipeline_session
+pipeline_telemetry -> pipeline_session
 pipeline_manifest_common -> pipeline_manifest_validation -> pipeline
 ```
 
@@ -95,12 +109,19 @@ Its `Stats` is the one const path: it takes the same mutex — which is `mutable
 for exactly that reason — copies counters into stack arrays, tallies the queue,
 and builds its maps only after releasing the lock, so observing admission
 allocates nothing under the lock and cannot block it.
+`pipeline_telemetry.cpp` sits below both: it records and never reads back, it
+uses `SupportedStageKinds()` from `pipeline_scheduler.hpp` for its admission
+keys while `pipeline_scheduler.hpp` includes only `pipeline_telemetry.hpp`, so
+the dependency stays one-way, and it touches nothing but its own atomics.
 
 The one lock order this directory must preserve is
 `CancellationState`'s callback mutex, then the scheduler mutex, then the
 session mutex, then ONNX Runtime. A cancellation registration is therefore
 never created or destroyed while the scheduler mutex is held, and every
 execution takes its admission lease before it takes the session lock.
+Telemetry is outside that order entirely: it takes none of those locks, calls
+back into none of those files, and only ever updates relaxed atomics or loads
+an atomic `shared_ptr`, so it can neither deadlock nor reorder anything.
 
 ## Tests
 
@@ -115,8 +136,9 @@ ctest --preset dev
 `tests/cpp/pipeline_device_test.cpp`,
 `tests/cpp/pipeline_snapshot_test.cpp`,
 `tests/cpp/pipeline_stream_test.cpp`,
-`tests/cpp/pipeline_cancellation_test.cpp`, and
-`tests/cpp/pipeline_scheduler_test.cpp` cover this directory directly;
+`tests/cpp/pipeline_cancellation_test.cpp`,
+`tests/cpp/pipeline_scheduler_test.cpp`, and
+`tests/cpp/pipeline_telemetry_test.cpp` cover this directory directly;
 `tests/cpp/pipeline_test.cpp` is the primary coverage for manifest parsing and
 validation, `tests/cpp/cancellation_test.cpp` is the primary coverage for
 `cancellation.cpp`, `tests/cpp/pipeline_device_test.cpp` is the primary
@@ -126,9 +148,13 @@ coverage for its snapshot, restore, fork, and named-checkpoint operations,
 `tests/cpp/pipeline_stream_test.cpp` is the primary coverage for its
 `StageRun` state machine and the `RunStage` parity that machine guarantees,
 `tests/cpp/pipeline_cancellation_test.cpp` is the primary coverage for
-that machine's cancellation and deadline boundaries, and
+that machine's cancellation and deadline boundaries,
 `tests/cpp/pipeline_scheduler_test.cpp` is the primary coverage for
-`pipeline_scheduler.cpp` and for which calls take an admission lease.
+`pipeline_scheduler.cpp` and for which calls take an admission lease, and
+`tests/cpp/pipeline_telemetry_test.cpp` is the primary coverage for
+`pipeline_telemetry.cpp` and for what each recording site in
+`pipeline_session.cpp` and `pipeline_scheduler.cpp` counts.
 `tests/python/` exercises the same code through the `_native` extension
 module; `tests/python/test_placement.py` is where the load-time placement
-overrides and their rejection cases are exercised end to end.
+overrides and their rejection cases are exercised end to end, and
+`tests/python/test_telemetry.py` is where the telemetry surface is.

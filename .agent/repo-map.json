@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-28T23:14:27.329Z",
+  "generatedAt": "2026-08-29T00:47:25.720Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "55a7ebb8fc0fe6723b619799670d86b3a7b166f184fc588b78de973cadbf2488",
+  "sourceFingerprint": "482067d30b0a476a65b1e8172c6555f7a835fbf65602ef7acfb2117b01d60667",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -112,7 +112,7 @@
     {
       "path": "include/onnx_world_model/pipeline.hpp",
       "kind": "source",
-      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
+      "purpose": "Declares the Mobius pipeline contract: manifest value types, the validated PipelineManifest and PipelinePackage loaders, per-component placement and the conservative transfer plan it produces, the shareable Pipeline with its shared admission-scheduling limits and the PipelineSchedulingStats reading of them, its opt-in telemetry options and the immutable PipelineTelemetrySnapshot reading of the component, stage, admission, and device-boundary counters, the per-trajectory PipelineSession, its in-memory PipelineSessionSnapshot, its named in-memory checkpoints, and the incremental StageRun that reports each step of a stage as a StageEvent.",
       "publicSymbols": [
         "Endpoint",
         "PipelineComponent",
@@ -133,6 +133,12 @@
         "PipelineRunOptions",
         "PipelineSchedulingOptions",
         "PipelineSchedulingStats",
+        "PipelineTelemetryOptions",
+        "PipelineComponentStats",
+        "PipelineStageStats",
+        "PipelineAdmissionStats",
+        "PipelineTransferStats",
+        "PipelineTelemetrySnapshot",
         "Pipeline",
         "PipelineSessionSnapshot",
         "StageEventKind",
@@ -190,14 +196,19 @@
         "PackedImagePreprocessor",
         "PackedVideoPreprocessor",
         "Pipeline",
+        "PipelineAdmissionStats",
+        "PipelineComponentStats",
         "PipelineInputSpec",
         "PipelineOutputSpec",
         "PipelineSchedulingStats",
         "PipelineSession",
         "PipelineSessionSnapshot",
         "PipelineStageSpec",
+        "PipelineStageStats",
+        "PipelineTelemetrySnapshot",
         "PipelineTransfer",
         "PipelineTransferPlan",
+        "PipelineTransferStats",
         "PreparedConditioning",
         "PreparedReasonerInputs",
         "PreparedVideo",
@@ -241,6 +252,11 @@
         "PipelineOutputSpec",
         "PipelineStageSpec",
         "PipelineSchedulingStats",
+        "PipelineComponentStats",
+        "PipelineStageStats",
+        "PipelineAdmissionStats",
+        "PipelineTransferStats",
+        "PipelineTelemetrySnapshot",
         "StepResult",
         "StageEventKind",
         "StageEvent",
@@ -487,7 +503,7 @@
     {
       "path": "src/pipeline_scheduler.cpp",
       "kind": "source",
-      "purpose": "Implements the shared admission controller behind PipelineSchedulingOptions: per-stage-kind permit buckets, an oldest-first work-conserving pump over a FIFO queue of waiters, cancellation- and deadline-aware waiting, the RAII PipelineLease that returns a permit exactly once, and the consistent snapshot of the live admission state that Pipeline::scheduling_stats() reports.",
+      "purpose": "Implements the shared admission controller behind PipelineSchedulingOptions: per-stage-kind permit buckets, an oldest-first work-conserving pump over a FIFO queue of waiters, cancellation- and deadline-aware waiting, the RAII PipelineLease that returns a permit exactly once, the per-stage-kind admission telemetry each acquisition records, and the consistent snapshot of the live admission state that Pipeline::scheduling_stats() reports.",
       "publicSymbols": [
         "detail::SupportedStageKinds",
         "detail::ValidatePipelineSchedulingOptions",
@@ -506,7 +522,7 @@
     {
       "path": "src/pipeline_scheduler.hpp",
       "kind": "source",
-      "purpose": "Declares the internal admission controller a Pipeline shares with every session it creates -- the per-stage-kind permit buckets, the cancellation-aware FIFO waiting queue, the RAII PipelineLease that owns one admitted execution's permit, and the read-only snapshot of that admission state a Pipeline reports as PipelineSchedulingStats.",
+      "purpose": "Declares the internal admission controller a Pipeline shares with every session it creates -- the per-stage-kind permit buckets, the cancellation-aware FIFO waiting queue, the RAII PipelineLease that owns one admitted execution's permit, the read-only snapshot of that admission state a Pipeline reports as PipelineSchedulingStats, and the telemetry collector it records each acquisition's wait outcome into.",
       "publicSymbols": [
         "onnx_world_model::detail::SupportedStageKinds",
         "onnx_world_model::detail::ValidatePipelineSchedulingOptions",
@@ -521,7 +537,7 @@
     {
       "path": "src/pipeline_session.cpp",
       "kind": "source",
-      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and reports that scheduler's live counts.",
+      "purpose": "Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and one shared telemetry collector and reports both of their readings.",
       "publicSymbols": [
         "Pipeline::Pipeline",
         "Pipeline::Load",
@@ -530,6 +546,8 @@
         "Pipeline::transfer_plan",
         "Pipeline::CreateSession",
         "Pipeline::scheduling_stats",
+        "Pipeline::telemetry_snapshot",
+        "Pipeline::ResetTelemetry",
         "PipelineSession move operations and destructor",
         "PipelineSession::RunStage",
         "PipelineSession::BeginStage",
@@ -554,6 +572,60 @@
         "StageRun::Finish",
         "StageRun::RequestCancellation",
         "StageRun::Cancel"
+      ]
+    },
+    {
+      "path": "src/pipeline_telemetry.cpp",
+      "kind": "source",
+      "purpose": "Implements the opt-in telemetry collector behind PipelineTelemetryOptions: the pre-populated per-epoch counter slab, the atomic slab publication that makes ResetTelemetry a new epoch rather than a barrier, the component and stage recorders that classify an outcome by ErrorCode, the admission and device-transfer hooks, and the immutable PipelineTelemetrySnapshot that Pipeline::telemetry_snapshot() reports.",
+      "publicSymbols": [
+        "detail::PipelineTelemetry::PipelineTelemetry",
+        "detail::PipelineTelemetry::slab",
+        "detail::PipelineTelemetry::Reset",
+        "detail::PipelineTelemetry::Snapshot",
+        "detail::MakePipelineTelemetry",
+        "detail::SnapshotPipelineTelemetry",
+        "detail::ResetPipelineTelemetry",
+        "detail::RecordAdmissionQueued",
+        "detail::RecordAdmissionOutcome",
+        "detail::RecordDeviceToHostCopy",
+        "detail::RecordStageStep",
+        "detail::RecordStageCompletion",
+        "detail::TelemetryComponentScope constructor",
+        "destructor",
+        "RecordSuccess and RecordCurrentException",
+        "detail::TelemetryStageScope constructor",
+        "destructor",
+        "RecordSuccess and RecordCurrentException"
+      ]
+    },
+    {
+      "path": "src/pipeline_telemetry.hpp",
+      "kind": "source",
+      "purpose": "Declares the internal opt-in telemetry collector a Pipeline shares with its admission scheduler and with every session it creates -- the immutable per-epoch counter slab, the relaxed-atomic counter helpers, the RAII component and stage recorders, the admission and device-transfer recording hooks, and the epoch reset that publishes a fresh slab.",
+      "publicSymbols": [
+        "onnx_world_model::detail::PipelineTelemetryPtr",
+        "onnx_world_model::detail::TelemetryCounter",
+        "onnx_world_model::detail::AddCounter",
+        "onnx_world_model::detail::RaiseCounterMaximum",
+        "onnx_world_model::detail::TelemetryComponentEntry",
+        "onnx_world_model::detail::TelemetryStageEntry",
+        "onnx_world_model::detail::TelemetryAdmissionEntry",
+        "onnx_world_model::detail::TelemetryTransferEntry",
+        "onnx_world_model::detail::TelemetrySlab",
+        "onnx_world_model::detail::PipelineTelemetry",
+        "onnx_world_model::detail::MakePipelineTelemetry",
+        "onnx_world_model::detail::SnapshotPipelineTelemetry",
+        "onnx_world_model::detail::ResetPipelineTelemetry",
+        "onnx_world_model::detail::TelemetryAdmissionOutcome",
+        "onnx_world_model::detail::RecordAdmissionQueued",
+        "onnx_world_model::detail::RecordAdmissionOutcome",
+        "onnx_world_model::detail::RecordDeviceToHostCopy",
+        "onnx_world_model::detail::RecordStageStep",
+        "onnx_world_model::detail::RecordStageCompletion",
+        "onnx_world_model::detail::TelemetryComponentScope",
+        "onnx_world_model::detail::TelemetryStageScope",
+        "onnx_world_model::detail::RecordStageExecution"
       ]
     },
     {
@@ -650,6 +722,14 @@
       ]
     },
     {
+      "path": "tests/cpp/pipeline_telemetry_test.cpp",
+      "kind": "test",
+      "purpose": "Standalone test executable for opt-in runtime telemetry: the disabled default that collects nothing, per-component call counts, byte totals and durations, outcome classification by ErrorCode, stage execution versus step versus completion counting across RunStage, StepStage, and an incremental StageRun, admission wait outcomes for a constrained stage kind and their absence for an unlimited one, device-to-host materialization counts and component input residency, the epoch reset, and which Pipeline values share a collector.",
+      "publicSymbols": [
+        "main"
+      ]
+    },
+    {
       "path": "tests/cpp/pipeline_test.cpp",
       "kind": "test",
       "purpose": "Standalone test executable for the pipeline layer: manifest parsing and rejection cases, stage execution, guidance, schedulers, and recurrent state, driven by in-process stub backends.",
@@ -734,6 +814,12 @@
       "path": "tests/python/test_scheduling.py",
       "kind": "test",
       "purpose": "Tests the keyword-only max_concurrent_executions and max_concurrent_by_stage_kind arguments on Pipeline and WorldModel -- defaults, accepted values, bool/non-int/negative rejection, unknown and empty stage-kind rejection, that a limited pipeline still runs a stage -- the Pipeline.scheduling_stats reading of the admission scheduler, and that a step or finish stopped by cancellation or a deadline during admission closes its run and leaves the session reusable.",
+      "publicSymbols": []
+    },
+    {
+      "path": "tests/python/test_telemetry.py",
+      "kind": "test",
+      "purpose": "Tests the keyword-only enable_telemetry argument on Pipeline and WorldModel, the Pipeline.telemetry_snapshot reading and its frozen dataclasses and read-only mappings, the counts one single-threaded run produces for components, stages, admission, and device transfers, and the reset_telemetry epoch.",
       "publicSymbols": []
     },
     {

@@ -1,8 +1,8 @@
 /**
  * @agent-file
- * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and reports that scheduler's live counts.
- * @agent-public-api: Pipeline::Pipeline, Pipeline::Load, Pipeline::manifest, Pipeline::execution_providers, Pipeline::transfer_plan, Pipeline::CreateSession, Pipeline::scheduling_stats, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::BeginStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid, StageRun move operations and destructor, StageRun::stage, StageRun::done, StageRun::iteration, StageRun::Step, StageRun::Finish, StageRun::RequestCancellation, StageRun::Cancel
- * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary and then reads only that host tensor; the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind, inputs, overrides, options, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target exactly once under the session lock. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing. Cancellation is cooperative and travels on PipelineRunOptions::cancellation: StageRun::Begin links the caller's token into the run's own CancellationSource -- copying its deadline and registering a reason-preserving callback whose registration is declared after the source so it is destroyed first -- and then replaces plan.options.cancellation with that internal token, so every downstream call observes both the caller's token and StageRun::RequestCancellation. RequestCancellation only signals that source and never takes the session mutex, which is what lets a second thread stop a step that already holds it. The token is polled at boundaries rather than per element: Step and Finish check before each step, StepStage checks on entry, between the two guidance passes, around guidance combination, and around the state transforms, RunStageComponents checks before and after each component, ApplyConnection checks before any host transform, and the autoregressive step brackets token sampling. Polling is not what enforces a deadline, though: the run's own source arms the copied deadline on the shared process-wide watchdog, so a backend already blocked inside a component pass is claimed at the deadline rather than at the next boundary. A cancelled step throws through the existing failure path, so the run slot is released, the handle closes, and everything already applied stays applied. Admission is layered above all of that and is scheduling only, never batching: Impl holds the Pipeline's shared detail::PipelineScheduler, and RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain each take exactly one stack-scoped detail::PipelineLease before the session mutex, in the documented order CancellationState callback mutex -> scheduler mutex -> session mutex -> ONNX Runtime. BeginStage, a Finish whose run already completed, Cancel, RequestCancellation, and every query and state method take none, so an idle StageRun never holds a permit. Pipeline::scheduling_stats() only reads that same scheduler and returns a detached PipelineSchedulingStats value, so it takes no session lock, blocks no execution, and cannot admit or queue anything. Pipeline::transfer_plan() is a pass-through to the package's plan, which was computed while the package was built; Pipeline::Load forwards PipelinePlacementOptions to PipelinePackage::Load while the Pipeline(PipelinePackage, scheduling) constructor takes none, because its sessions already exist. A lease is never stored on a run or a session and its destructor is the only release path, so an exception, a cancellation, or a backend failure returns the permit. The stage kind is resolved from the immutable manifest, so admission needs no lock of its own, and no execution peeks at active_run_id before queuing: a queued caller may find a conflicting run once admitted and fail then, which is deliberate. The one window that is not "leave it applied" is the classifier-free guidance scratch state: the unconditional pass temporarily replaces the endpoint map, the position cursors, and the conditioning tensor's existing slot in external_values, and the file-local GuidanceScratch guard restores all three by swap -- static-asserted nothrow -- on every exit, so a cancellation or a backend failure inside that pass can never leave the unconditional conditioning value behind for the next step.
+ * @agent-purpose: Implements PipelineSession, the per-trajectory execution engine that resolves stage inputs, runs component sessions, and owns recurrent state, diffusion schedulers, guidance, and token sampling, plus its in-memory snapshot, restore, fork, and named-checkpoint operations, the StageRun state machine that drives every stage one step at a time, and the Pipeline that hands every session one shared admission scheduler and one shared telemetry collector and reports both of their readings.
+ * @agent-public-api: Pipeline::Pipeline, Pipeline::Load, Pipeline::manifest, Pipeline::execution_providers, Pipeline::transfer_plan, Pipeline::CreateSession, Pipeline::scheduling_stats, Pipeline::telemetry_snapshot, Pipeline::ResetTelemetry, PipelineSession move operations and destructor, PipelineSession::RunStage, PipelineSession::BeginStage, PipelineSession::StepStage, PipelineSession::outputs, PipelineSession::state, PipelineSession::ReleaseStage, PipelineSession::Reset, PipelineSession::Snapshot, PipelineSession::Restore, PipelineSession::Fork, PipelineSession::Checkpoint, PipelineSession::RestoreCheckpoint, PipelineSession::DropCheckpoint, PipelineSession::HasCheckpoint, PipelineSessionSnapshot::valid, StageRun move operations and destructor, StageRun::stage, StageRun::done, StageRun::iteration, StageRun::Step, StageRun::Finish, StageRun::RequestCancellation, StageRun::Cancel
+ * @agent-invariants: All mutable state lives in the file-local SessionState bundle that PipelineSession::Impl derives from, behind impl_->mutex, so one session serves one request or trajectory and is never shared across threads without that lock. PipelineSession owns that Impl through a shared_ptr and a StageRun holds the same pointer, so a run outlives a moved or destroyed session wrapper. Device storage is preserved end to end: caller inputs, overrides, component outputs, recurrent state, public outputs, and StageEvent outputs keep the producing TensorBuffer, a transform-free connection forwards it unchanged, and external rank adaptation and the reshape transform reuse it through Tensor::FromBuffer because they only relabel axes. Every host-evaluated path -- casts, scheduler steps, guidance combination, packed video and audio finalization, token sampling, and value-reading generated-input programs -- materializes each device source exactly once at its own outer boundary through the file-local MaterializeHost, which is the one device-to-host boundary in this file: it applies exactly the condition Tensor::CopyToCpu() uses to alias instead of copying, so a canonical CPU source is handed back untouched and only a real copy is counted, and the per-element ReadFloat, WriteFloat, ReadInteger, and WriteInteger helpers never transfer. A stage runs its components in dependency order derived from the manifest connections. Unknown stage kinds, generator kinds, scheduler types, and option keys throw rather than falling back. ReleaseStage frees only state whose declared release_after names that stage, and Reset clears every cache plus every named checkpoint so the session can be reused while keeping the current random engine. Snapshot copies the whole SessionState bundle under the lock through Impl::CaptureLocked and records the package shared_ptr; Restore rejects a snapshot from any other PipelinePackage instance with ErrorCode::state, copies every container before taking the lock, and commits by swapping so it cannot leave partial state; Fork restores a fresh session on the same package from that snapshot and keeps that session's empty checkpoint map. Named checkpoints live on PipelineSession::Impl rather than in SessionState, so a snapshot never carries them and Restore leaves the target session's checkpoints alone; Checkpoint captures and publishes under one lock hold, RestoreCheckpoint finds, copies, and swaps a checkpoint under one lock acquisition so it is linearizable with reset and replacement, an empty name throws ErrorCode::invalid_argument, and an unknown name throws ErrorCode::state from both RestoreCheckpoint and DropCheckpoint. StageRun::Impl is the only stage state machine: RunStage drains it under one lock acquisition while BeginStage exposes it one step at a time, so complete runs preserve historical whole-stage serialization without duplicating execution logic. Begin resolves the stage kind, inputs, overrides, options, sampling configuration, seed, end-of-sequence tokens, prompt-derived token budget, and iterative target exactly once under the session lock. Autoregressive, iterative, and single-pass runs emit exactly one terminal completed event whose outputs equal the RunStage result, and every stop condition is reported by the following Step rather than folded into a step event. The run identity -- next_run_id and active_run_id -- is control metadata beside SessionState, one run is active per session at a time, a failing or cancelled run releases the slot without rolling back applied state, and a moved-from handle owns nothing so its destructor cancels nothing. Cancellation is cooperative and travels on PipelineRunOptions::cancellation: StageRun::Begin links the caller's token into the run's own CancellationSource -- copying its deadline and registering a reason-preserving callback whose registration is declared after the source so it is destroyed first -- and then replaces plan.options.cancellation with that internal token, so every downstream call observes both the caller's token and StageRun::RequestCancellation. RequestCancellation only signals that source and never takes the session mutex, which is what lets a second thread stop a step that already holds it. The token is polled at boundaries rather than per element: Step and Finish check before each step, StepStage checks on entry, between the two guidance passes, around guidance combination, and around the state transforms, RunStageComponents checks before and after each component, ApplyConnection checks before any host transform, and the autoregressive step brackets token sampling. Polling is not what enforces a deadline, though: the run's own source arms the copied deadline on the shared process-wide watchdog, so a backend already blocked inside a component pass is claimed at the deadline rather than at the next boundary. A cancelled step throws through the existing failure path, so the run slot is released, the handle closes, and everything already applied stays applied. Admission is layered above all of that and is scheduling only, never batching: Impl holds the Pipeline's shared detail::PipelineScheduler, and RunStage, StepStage, StageRun::Step, and a StageRun::Finish that still has steps to drain each take exactly one stack-scoped detail::PipelineLease before the session mutex, in the documented order CancellationState callback mutex -> scheduler mutex -> session mutex -> ONNX Runtime. BeginStage, a Finish whose run already completed, Cancel, RequestCancellation, and every query and state method take none, so an idle StageRun never holds a permit. Pipeline::scheduling_stats() only reads that same scheduler and returns a detached PipelineSchedulingStats value, so it takes no session lock, blocks no execution, and cannot admit or queue anything; Pipeline::telemetry_snapshot() and Pipeline::ResetTelemetry() read and re-epoch the collector the same way, touching only atomics. Pipeline::transfer_plan() is a pass-through to the package's plan, which was computed while the package was built; Pipeline::Load forwards PipelinePlacementOptions to PipelinePackage::Load while the Pipeline(PipelinePackage, scheduling) constructor takes none, because its sessions already exist. A lease is never stored on a run or a session and its destructor is the only release path, so an exception, a cancellation, or a backend failure returns the permit. The stage kind is resolved from the immutable manifest, so admission needs no lock of its own, and no execution peeks at active_run_id before queuing: a queued caller may find a conflicting run once admitted and fail then, which is deliberate. The one window that is not "leave it applied" is the classifier-free guidance scratch state: the unconditional pass temporarily replaces the endpoint map, the position cursors, and the conditioning tensor's existing slot in external_values, and the file-local GuidanceScratch guard restores all three by swap -- static-asserted nothrow -- on every exit, so a cancellation or a backend failure inside that pass can never leave the unconditional conditioning value behind for the next step. Telemetry is layered above admission the same way admission is layered above execution, and it is measurement only: Impl holds the Pipeline's shared detail::PipelineTelemetry, which is null unless the caller enabled it, so every recording site here is one null test. RunStage, StepStage, StageRun::Step, and a draining StageRun::Finish each wrap their work in detail::RecordStageExecution after their lease is granted, so a stage's measured duration excludes queue wait and its outcome is classified by ErrorCode on every path out; an execution that never got a permit is an admission outcome and is deliberately not a stage execution. RunStageComponents brackets the component call itself -- not the input resolution above it -- with detail::TelemetryComponentScope, which records the bytes presented on every attempt and where they lived, and classifies the outcome the same way. StageRun::Impl::StepLocked is the one place a non-terminal step is counted, so every kind's step path and every way of driving it count once and only once, CompleteLocked is the one place a completion is counted, and the public StepStage counts its own step because it bypasses the StageEvent state machine and emits no terminal event. A cached Finish executes nothing and therefore changes nothing. Recording never takes a lock, never allocates, and never calls back into the scheduler, the session, or cancellation, so it is outside the lock order entirely.
   * @agent-side-effects: May transfer device tensors to CPU at host-transform boundaries, runs ONNX Runtime inference through the shared PipelinePackage sessions, reads scheduler and tokenizer assets from disk, and advances the session's seeded random engine when sampling. Snapshot, Restore, Fork, and the checkpoint operations touch memory only; they perform no device transfer, no disk access, and no inference.
  */
 
@@ -31,6 +31,7 @@
 #include "cancellation.hpp"
 #include "onnx_world_model/error.hpp"
 #include "pipeline_scheduler.hpp"
+#include "pipeline_telemetry.hpp"
 
 namespace onnx_world_model {
 namespace {
@@ -503,13 +504,35 @@ void WriteInteger(
   }
 }
 
+// The one device-to-host boundary in this file. Every host-evaluated path
+// materializes its sources through here, so a real copy is counted exactly
+// once with its byte count, and a source that is already canonical CPU memory
+// is handed back without a copy -- the same condition Tensor::CopyToCpu()
+// applies itself, which is what makes this a measurement rather than a change
+// in behavior. A tensor with no buffer is not host-accessible, so it still
+// reaches CopyToCpu() and still fails there exactly as it did before.
+[[nodiscard]] Tensor MaterializeHost(
+    const detail::PipelineTelemetryPtr& telemetry,
+    const Tensor& source) {
+  if (source.is_host_accessible() && source.device() == TensorDevice{}) {
+    return source;
+  }
+  Tensor host = source.CopyToCpu();
+  detail::RecordDeviceToHostCopy(
+      telemetry, static_cast<std::uint64_t>(host.size_bytes()));
+  return host;
+}
+
 // Materializes the source once and then reads only host memory, so a device
 // tensor crosses the transfer boundary exactly one time per cast.
-Tensor CastTensor(const Tensor& source, DataType target_type) {
+Tensor CastTensor(
+    const detail::PipelineTelemetryPtr& telemetry,
+    const Tensor& source,
+    DataType target_type) {
   if (source.data_type() == target_type) {
     return source;
   }
-  const Tensor host = source.CopyToCpu();
+  const Tensor host = MaterializeHost(telemetry, source);
   Tensor result(target_type, host.shape());
   if (IsIntegral(host.data_type()) && IsIntegral(target_type)) {
     for (std::size_t index = 0; index < host.element_count(); ++index) {
@@ -552,6 +575,7 @@ Tensor CastTensor(const Tensor& source, DataType target_type) {
 }
 
 Tensor EulerStep(
+    const detail::PipelineTelemetryPtr& telemetry,
     const Tensor& state,
     const Tensor& velocity,
     float delta) {
@@ -559,8 +583,8 @@ Tensor EulerStep(
     ExecutionError(
         "Scheduler state and velocity must have identical shapes");
   }
-  const Tensor host_state = state.CopyToCpu();
-  const Tensor host_velocity = velocity.CopyToCpu();
+  const Tensor host_state = MaterializeHost(telemetry, state);
+  const Tensor host_velocity = MaterializeHost(telemetry, velocity);
   Tensor result(host_state.data_type(), host_state.shape());
   for (std::size_t index = 0; index < host_state.element_count(); ++index) {
     WriteFloat(
@@ -573,12 +597,13 @@ Tensor EulerStep(
 }
 
 Tensor EulerStepIndexed(
+    const detail::PipelineTelemetryPtr& telemetry,
     const Tensor& state,
     const Tensor& velocity,
     const Tensor* indexes,
     float delta) {
   if (state.shape() == velocity.shape() && indexes == nullptr) {
-    return EulerStep(state, velocity, delta);
+    return EulerStep(telemetry, state, velocity, delta);
   }
   if (state.shape().size() != 2 || velocity.shape().size() != 2 ||
       state.shape()[1] != velocity.shape()[1] ||
@@ -589,9 +614,9 @@ Tensor EulerStepIndexed(
     ExecutionError(
         "Indexed scheduler update has incompatible state, velocity, or indexes");
   }
-  const Tensor host_state = state.CopyToCpu();
-  const Tensor host_velocity = velocity.CopyToCpu();
-  const Tensor host_indexes = indexes->CopyToCpu();
+  const Tensor host_state = MaterializeHost(telemetry, state);
+  const Tensor host_velocity = MaterializeHost(telemetry, velocity);
+  const Tensor host_indexes = MaterializeHost(telemetry, *indexes);
   Tensor result = host_state;
   const auto rows = host_indexes.values<std::int64_t>();
   const std::size_t width =
@@ -784,9 +809,11 @@ struct PipelineSessionSnapshot::Impl {
 struct PipelineSession::Impl : SessionState {
   Impl(
       std::shared_ptr<const PipelinePackage> pipeline_package,
-      std::shared_ptr<detail::PipelineScheduler> admission)
+      std::shared_ptr<detail::PipelineScheduler> admission,
+      detail::PipelineTelemetryPtr collector)
       : package(std::move(pipeline_package)),
-        admission_scheduler(std::move(admission)) {}
+        admission_scheduler(std::move(admission)),
+        telemetry(std::move(collector)) {}
 
   std::shared_ptr<const PipelinePackage> package;
   // The Pipeline's admission controller, shared by every session that
@@ -794,6 +821,10 @@ struct PipelineSession::Impl : SessionState {
   // same Impl, so incremental and all-at-once execution are admitted by one
   // controller rather than two.
   std::shared_ptr<detail::PipelineScheduler> admission_scheduler;
+  // The Pipeline's telemetry collector, shared the same way and by the same
+  // scheduler, or null when telemetry is disabled -- which is what makes
+  // every recording site in this file a single null test.
+  detail::PipelineTelemetryPtr telemetry;
   mutable std::mutex mutex;
   // Named checkpoints are control metadata, deliberately declared here rather
   // than in SessionState so that capturing, restoring, or forking execution
@@ -1389,6 +1420,7 @@ struct PipelineSession::Impl : SessionState {
   }
 
   [[nodiscard]] static Tensor CombineGuidance(
+      const detail::PipelineTelemetryPtr& telemetry,
       const Tensor& conditional,
       const Tensor& unconditional,
       double scale) {
@@ -1397,8 +1429,9 @@ struct PipelineSession::Impl : SessionState {
       ExecutionError(
           "Conditional and unconditional predictions have different shapes");
     }
-    const Tensor host_conditional = conditional.CopyToCpu();
-    const Tensor host_unconditional = unconditional.CopyToCpu();
+    const Tensor host_conditional = MaterializeHost(telemetry, conditional);
+    const Tensor host_unconditional =
+        MaterializeHost(telemetry, unconditional);
     Tensor result(conditional.data_type(), conditional.shape());
     for (std::size_t index = 0;
          index < host_conditional.element_count();
@@ -1777,11 +1810,11 @@ struct PipelineSession::Impl : SessionState {
     const auto sigmas = SchedulerSigmas(stage_name, options);
     // Each operand crosses to the host once here; row selection and scattering
     // reuse these tensors throughout the complete scheduler step.
-    const Tensor host_state = state.CopyToCpu();
-    const Tensor host_velocity = velocity.CopyToCpu();
+    const Tensor host_state = MaterializeHost(telemetry, state);
+    const Tensor host_velocity = MaterializeHost(telemetry, velocity);
     std::optional<Tensor> host_indexes;
     if (indexes != nullptr) {
-      host_indexes = indexes->CopyToCpu();
+      host_indexes = MaterializeHost(telemetry, *indexes);
     }
     const Tensor* host_index_values =
         host_indexes.has_value() ? &*host_indexes : nullptr;
@@ -1963,7 +1996,7 @@ struct PipelineSession::Impl : SessionState {
         const std::size_t axis_stride = batch * length;
         // Cursor tracking needs the values on the host; the override itself
         // is returned unchanged so a device tensor stays on its device.
-        const Tensor host_value = value->CopyToCpu();
+        const Tensor host_value = MaterializeHost(telemetry, *value);
         const auto positions = host_value.values<std::int64_t>();
         std::vector<std::int64_t> cursors(batch, 0);
         for (std::size_t batch_index = 0;
@@ -2065,7 +2098,7 @@ struct PipelineSession::Impl : SessionState {
         }
         // The token sequence and the vision grid each cross to the host once
         // for the whole batch loop below.
-        const Tensor host_sequence = sequence->CopyToCpu();
+        const Tensor host_sequence = MaterializeHost(telemetry, *sequence);
         const auto ids = host_sequence.values<std::int64_t>();
         const auto image_features =
             endpoint_values.find("reasoner_vision_encoder.image_features");
@@ -2079,7 +2112,8 @@ struct PipelineSession::Impl : SessionState {
                                       DataType::int64 &&
                                   grid_value->second.element_count() == 3;
         const Tensor host_grid =
-            grid_present ? grid_value->second.CopyToCpu() : Tensor{};
+            grid_present ? MaterializeHost(telemetry, grid_value->second)
+                         : Tensor{};
         for (std::size_t batch_index = 0;
              batch_index < batch;
              ++batch_index) {
@@ -2383,7 +2417,7 @@ struct PipelineSession::Impl : SessionState {
           ExecutionError(
               "MSE loss indexes require int64 timestep-token indexes");
         }
-        const Tensor host_indexes = index_tensor->CopyToCpu();
+        const Tensor host_indexes = MaterializeHost(telemetry, *index_tensor);
         const auto token_indexes =
             host_indexes.values<std::int64_t>();
         std::vector<std::int64_t> values(token_indexes.size());
@@ -2544,7 +2578,7 @@ struct PipelineSession::Impl : SessionState {
 
     const DataType target_type =
         manifest().Input(connection.target).data_type;
-    const Tensor host_packed = packed.CopyToCpu();
+    const Tensor host_packed = MaterializeHost(telemetry, packed);
     Tensor result(
         target_type, {batch, channels, frames, height, width});
     for (std::int64_t batch_index = 0; batch_index < batch; ++batch_index) {
@@ -2608,7 +2642,7 @@ struct PipelineSession::Impl : SessionState {
     const std::int64_t channels = packed.shape()[1];
     const DataType target_type =
         manifest().Input(connection.target).data_type;
-    const Tensor host_packed = packed.CopyToCpu();
+    const Tensor host_packed = MaterializeHost(telemetry, packed);
     Tensor result(target_type, {batch, channels, frames});
     for (std::int64_t batch_index = 0; batch_index < batch; ++batch_index) {
       for (std::int64_t frame = 0; frame < frames; ++frame) {
@@ -2644,7 +2678,7 @@ struct PipelineSession::Impl : SessionState {
     options.cancellation.ThrowIfCancellationRequested();
     if (*connection.transform == "cast") {
       return CastTensor(
-          source, manifest().Input(connection.target).data_type);
+          telemetry, source, manifest().Input(connection.target).data_type);
     }
     if (*connection.transform == "reshape") {
       const Json parameters = Json::parse(connection.parameters_json);
@@ -2729,6 +2763,7 @@ struct PipelineSession::Impl : SessionState {
               : iteration->second,
           steps - 1);
       return EulerStepIndexed(
+          telemetry,
           current,
           source,
           indexes,
@@ -2917,8 +2952,23 @@ struct PipelineSession::Impl : SessionState {
         model_inputs.emplace(spec.name, std::move(value));
       }
       options.cancellation.ThrowIfCancellationRequested();
-      NamedTensors model_outputs = package->Component(component.name)
-                                       .Run(model_inputs, options.cancellation);
+      // The one place a component call is measured. It brackets the model
+      // call itself rather than the input resolution above it, and it records
+      // what was presented -- byte totals and where those bytes lived -- for
+      // every attempt, whatever the outcome.
+      detail::TelemetryComponentScope telemetry_scope(
+          telemetry, component.name, model_inputs);
+      NamedTensors model_outputs;
+      try {
+        model_outputs = package->Component(component.name)
+                            .Run(model_inputs, options.cancellation);
+      } catch (...) {
+        // Classified by the ErrorCode the failure carries, so a cancellation
+        // and a deadline are reported as themselves rather than as failures.
+        telemetry_scope.RecordCurrentException();
+        throw;
+      }
+      telemetry_scope.RecordSuccess(model_outputs);
       for (auto& [name, tensor] : model_outputs) {
         // Component outputs keep whatever storage the backend produced, so a
         // device-backed output flows to the next component untouched.
@@ -3012,6 +3062,7 @@ struct PipelineSession::Impl : SessionState {
         combined.emplace(
             name,
             CombineGuidance(
+                telemetry,
                 conditional_outputs.at(name),
                 produced->second,
                 guidance.scale));
@@ -3078,7 +3129,7 @@ struct PipelineSession::Impl : SessionState {
     if (per_batch < vocabulary) {
       ExecutionError("Logits tensor has an invalid shape");
     }
-    const Tensor host_logits = logits.CopyToCpu();
+    const Tensor host_logits = MaterializeHost(telemetry, logits);
     std::vector<std::int64_t> tokens(batch);
     for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
       const std::size_t begin =
@@ -3136,7 +3187,7 @@ struct PipelineSession::Impl : SessionState {
     }
 
     std::vector<std::int64_t> tokens(batch);
-    const Tensor host_logits = logits.CopyToCpu();
+    const Tensor host_logits = MaterializeHost(telemetry, logits);
     for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
       const std::size_t begin =
           batch_index * per_batch + per_batch - vocabulary;
@@ -3495,13 +3546,20 @@ struct StageRun::Impl {
     // One Step() is one execution, so it takes one permit -- before the
     // session lock, in the documented lock order -- and returns it when this
     // scope ends, whether the step produced an event or threw. A handle
-    // sitting idle between Step() calls therefore holds nothing.
+    // sitting idle between Step() calls therefore holds nothing. The
+    // measured execution starts after the permit is granted, so queue wait is
+    // reported by admission telemetry rather than folded into the stage.
     try {
       const detail::PipelineLease lease = AcquireLease();
-      std::scoped_lock lock(session->mutex);
-      EnsureActiveLocked();
-      options.cancellation.ThrowIfCancellationRequested();
-      return StepLocked();
+      return detail::RecordStageExecution(
+          session->telemetry,
+          stage_name,
+          [this] {
+            std::scoped_lock lock(session->mutex);
+            EnsureActiveLocked();
+            options.cancellation.ThrowIfCancellationRequested();
+            return StepLocked();
+          });
     } catch (...) {
       // The session keeps everything the run already applied, exactly as a
       // failing RunStage left it; only the run slot and this handle close.
@@ -3529,10 +3587,16 @@ struct StageRun::Impl {
     }
     try {
       // One permit covers the whole remaining drain, matching RunStage: the
-      // steps of one stage are not admitted individually.
+      // steps of one stage are not admitted individually. The drain is also
+      // one measured execution, for the same reason.
       const detail::PipelineLease lease = AcquireLease();
-      std::scoped_lock lock(session->mutex);
-      return FinishLocked();
+      return detail::RecordStageExecution(
+          session->telemetry,
+          stage_name,
+          [this] {
+            std::scoped_lock lock(session->mutex);
+            return FinishLocked();
+          });
     } catch (...) {
       // AcquireLease can itself observe cancellation while queued. Closing
       // here keeps that path identical to cancellation inside FinishLocked.
@@ -3605,6 +3669,18 @@ struct StageRun::Impl {
 
   [[nodiscard]] StageEvent StepLocked() {
     const PipelineStage& stage = FindStage(session->manifest(), stage_name);
+    StageEvent event = StepLocked(stage);
+    if (event.kind != StageEventKind::completed) {
+      // The one place a stage step is counted for a run: every kind's step
+      // path returns through here, so draining through RunStage or Finish and
+      // stepping explicitly count identically and none of them counts twice.
+      // A terminal event is a completion instead, counted by CompleteLocked.
+      detail::RecordStageStep(session->telemetry, stage_name);
+    }
+    return event;
+  }
+
+  [[nodiscard]] StageEvent StepLocked(const PipelineStage& stage) {
     if (stage_kind == "autoregressive") {
       return AutoregressiveStepLocked(stage);
     }
@@ -3725,6 +3801,11 @@ struct StageRun::Impl {
     }
     completed = true;
     ReleaseSlotLocked();
+    // Exactly one terminal event per run, however that run was driven, so
+    // this is one completion whether RunStage drained it, Finish drained it,
+    // or the caller stepped to the end. A Finish that returns an already
+    // completed run's cached outputs never reaches here.
+    detail::RecordStageCompletion(session->telemetry, stage_name);
 
     StageEvent event;
     event.kind = StageEventKind::completed;
@@ -3836,22 +3917,31 @@ void StageRun::Cancel() noexcept {
 
 Pipeline::Pipeline(
     PipelinePackage package,
-    PipelineSchedulingOptions scheduling)
+    PipelineSchedulingOptions scheduling,
+    PipelineTelemetryOptions telemetry)
     : package_(std::make_shared<const PipelinePackage>(std::move(package))),
-      scheduler_(detail::MakePipelineScheduler(scheduling)) {}
+      // Built before the scheduler, because the scheduler records its own
+      // admission outcomes into it. Null when telemetry is disabled, which is
+      // the whole disabled implementation.
+      telemetry_(
+          detail::MakePipelineTelemetry(telemetry, package_->manifest())),
+      scheduler_(detail::MakePipelineScheduler(scheduling, telemetry_)) {}
 
 Pipeline Pipeline::Load(
     const std::filesystem::path& directory,
     const RuntimeOptions& options,
     const PipelineSchedulingOptions& scheduling,
-    const PipelinePlacementOptions& placement) {
+    const PipelinePlacementOptions& placement,
+    const PipelineTelemetryOptions& telemetry) {
   // Checked before a single component file is opened, so a misspelled stage
   // kind fails immediately rather than after a full package load. Placement is
   // checked the same way, inside PipelinePackage::Load, once the manifest
   // exists to check the component names against.
   detail::ValidatePipelineSchedulingOptions(scheduling);
   return Pipeline(
-      PipelinePackage::Load(directory, options, placement), scheduling);
+      PipelinePackage::Load(directory, options, placement),
+      scheduling,
+      telemetry);
 }
 
 const PipelineManifest& Pipeline::manifest() const noexcept {
@@ -3868,19 +3958,29 @@ const PipelineTransferPlan& Pipeline::transfer_plan() const noexcept {
 }
 
 PipelineSession Pipeline::CreateSession() const {
-  return PipelineSession(package_, scheduler_);
+  return PipelineSession(package_, scheduler_, telemetry_);
 }
 
 PipelineSchedulingStats Pipeline::scheduling_stats() const {
   return detail::SnapshotSchedulingStats(scheduler_);
 }
 
+PipelineTelemetrySnapshot Pipeline::telemetry_snapshot() const {
+  return detail::SnapshotPipelineTelemetry(telemetry_);
+}
+
+void Pipeline::ResetTelemetry() {
+  detail::ResetPipelineTelemetry(telemetry_);
+}
+
 PipelineSession::PipelineSession(
     std::shared_ptr<const PipelinePackage> package,
-    std::shared_ptr<detail::PipelineScheduler> scheduler)
+    std::shared_ptr<detail::PipelineScheduler> scheduler,
+    std::shared_ptr<detail::PipelineTelemetry> telemetry)
     : impl_(std::make_shared<Impl>(
           std::move(package),
-          std::move(scheduler))) {}
+          std::move(scheduler),
+          std::move(telemetry))) {}
 
 PipelineSession::PipelineSession(PipelineSession&&) noexcept = default;
 
@@ -3902,11 +4002,13 @@ NamedTensors PipelineSession::RunStage(
     const PipelineRunOptions& options) {
   const detail::PipelineLease lease =
       impl_->AcquireStageLease(stage, options.cancellation);
-  std::scoped_lock lock(impl_->mutex);
-  impl_->EnsureNoActiveRunLocked("run a stage");
-  auto run = StageRun::Impl::Begin(
-      impl_, stage, inputs, overrides, options);
-  return run->FinishLocked();
+  return detail::RecordStageExecution(impl_->telemetry, stage, [&] {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->EnsureNoActiveRunLocked("run a stage");
+    auto run = StageRun::Impl::Begin(
+        impl_, stage, inputs, overrides, options);
+    return run->FinishLocked();
+  });
 }
 
 StageRun PipelineSession::BeginStage(
@@ -3928,9 +4030,16 @@ NamedTensors PipelineSession::StepStage(
   // One direct step is one execution, admitted like any other.
   const detail::PipelineLease lease =
       impl_->AcquireStageLease(stage, options.cancellation);
-  std::scoped_lock lock(impl_->mutex);
-  impl_->EnsureNoActiveRunLocked("step a stage directly");
-  return impl_->StepStage(stage, inputs, overrides, options);
+  return detail::RecordStageExecution(impl_->telemetry, stage, [&] {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->EnsureNoActiveRunLocked("step a stage directly");
+    NamedTensors outputs = impl_->StepStage(stage, inputs, overrides, options);
+    // A direct step bypasses the StageEvent state machine, so it is counted
+    // here rather than by StageRun; it emits no terminal event, so it is
+    // never a completion.
+    detail::RecordStageStep(impl_->telemetry, stage);
+    return outputs;
+  });
 }
 
 NamedTensors PipelineSession::outputs() const {
@@ -4059,8 +4168,10 @@ PipelineSession PipelineSession::Fork() const {
   }
   const PipelineSessionSnapshot snapshot = Snapshot();
   // A fork belongs to the same Pipeline, so it competes for the same permits
-  // rather than escaping the configured ceiling.
-  PipelineSession forked(snapshot.impl_->package, impl_->admission_scheduler);
+  // rather than escaping the configured ceiling, and it records into the same
+  // telemetry collector rather than starting a second one.
+  PipelineSession forked(
+      snapshot.impl_->package, impl_->admission_scheduler, impl_->telemetry);
   forked.Restore(snapshot);
   // The fork deliberately keeps its freshly constructed, empty checkpoint
   // map: a snapshot carries execution state, and checkpoint names are the

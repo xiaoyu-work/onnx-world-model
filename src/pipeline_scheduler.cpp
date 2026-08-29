@@ -1,14 +1,16 @@
 /**
  * @agent-file
- * @agent-purpose: Implements the shared admission controller behind PipelineSchedulingOptions: per-stage-kind permit buckets, an oldest-first work-conserving pump over a FIFO queue of waiters, cancellation- and deadline-aware waiting, the RAII PipelineLease that returns a permit exactly once, and the consistent snapshot of the live admission state that Pipeline::scheduling_stats() reports.
+ * @agent-purpose: Implements the shared admission controller behind PipelineSchedulingOptions: per-stage-kind permit buckets, an oldest-first work-conserving pump over a FIFO queue of waiters, cancellation- and deadline-aware waiting, the RAII PipelineLease that returns a permit exactly once, the per-stage-kind admission telemetry each acquisition records, and the consistent snapshot of the live admission state that Pipeline::scheduling_stats() reports.
  * @agent-public-api: detail::SupportedStageKinds, detail::ValidatePipelineSchedulingOptions, detail::MakePipelineScheduler, detail::PipelineScheduler::PipelineScheduler, detail::PipelineScheduler::Acquire, detail::PipelineScheduler::ReleasePermit, detail::PipelineScheduler::Stats, detail::SnapshotSchedulingStats, detail::PipelineLease constructors, destructor, move operations and Release, detail::AcquireExecutionLease
- * @agent-invariants: Admission scheduling only: nothing here merges, splits, reorders, or preempts work, and no execution is ever started or resumed by this file. Limits are fixed at construction, so `limit` is read without the mutex while `active_` and every bucket's `active` are touched only under it. An acquire whose kind has neither a global nor a per-kind limit returns an inert lease without locking or allocating. Every other acquire enqueues a shared waiter and immediately pumps under the same lock hold, so an eligible caller is granted before it ever waits and no later waiter of the same kind can pass an earlier one; the pump skips a waiter whose bucket is full, so a full kind never blocks a different eligible kind, and stops as soon as the global limit is reached, because nothing behind that point can be granted either. Cancellation ordering is the whole safety argument: the token is polled before the ticket is taken, the registration is created only after the waiter is enqueued and only with the scheduler mutex released, the callback takes the scheduler mutex and marks the waiter cancelled only if it was not already granted, and the registration is destroyed with the scheduler mutex released, so an inline callback from an already-cancelled token cannot self-deadlock and ~CancellationRegistration cannot wait for a callback that wants a lock this thread holds. A cancellation that raced a grant is detected by re-polling after the registration is gone, and the permit is released before the throw. The one path with no lease to unwind -- registering or waiting itself failing -- unregisters first and then abandons the ticket, returning the permit if the pump granted it while that thread was already unwinding, so even that path cannot leak one. PipelineLease::Release decrements the global count and the bucket exactly once, pumps, and notifies only the waiters that pump granted. Stats reads rather than mutates: it takes the same mutex, copies the global count, the queue depth, and every bucket count into stack arrays, tallies the queue by bucket pointer, and then builds its maps with the lock released, so it allocates nothing while holding it, never blocks admission for longer than those reads, and reports one internally consistent moment. Its per-kind maps always carry all six SupportedStageKinds() names, and a queued waiter with no bucket is counted in the total only. A moved-from Pipeline has no scheduler, and SnapshotSchedulingStats answers that with the same all-zero shape instead of throwing.
+ * @agent-invariants: Admission scheduling only: nothing here merges, splits, reorders, or preempts work, and no execution is ever started or resumed by this file. Limits are fixed at construction, so `limit` is read without the mutex while `active_` and every bucket's `active` are touched only under it. An acquire whose kind has neither a global nor a per-kind limit returns an inert lease without locking or allocating, and records no telemetry at all, because it takes no permit and therefore has no admission outcome. Every other acquire enqueues a shared waiter and immediately pumps under the same lock hold, so an eligible caller is granted before it ever waits and no later waiter of the same kind can pass an earlier one; the pump skips a waiter whose bucket is full, so a full kind never blocks a different eligible kind, and stops as soon as the global limit is reached, because nothing behind that point can be granted either. Cancellation ordering is the whole safety argument: the token is polled before the ticket is taken, the registration is created only after the waiter is enqueued and only with the scheduler mutex released, the callback takes the scheduler mutex and marks the waiter cancelled only if it was not already granted, and the registration is destroyed with the scheduler mutex released, so an inline callback from an already-cancelled token cannot self-deadlock and ~CancellationRegistration cannot wait for a callback that wants a lock this thread holds. A cancellation that raced a grant is detected by re-polling after the registration is gone, and the permit is released before the throw. The one path with no lease to unwind -- registering or waiting itself failing -- unregisters first and then abandons the ticket, returning the permit if the pump granted it while that thread was already unwinding, so even that path cannot leak one. Telemetry is recorded and never read: an acquisition granted under the enqueue-and-pump hold is recorded as admitted with a zero wait and never as queued, only the path that goes on to wait counts as queued and starts the wait timer, an acquisition that leaves the queue without a permit is classified by the reason its own token holds so the counter and the thrown ErrorCode always agree, and a grant that raced a cancellation is recorded once, as admitted, before the re-poll can unwind it. Recording happens with the scheduler mutex released wherever the structure allows and never allocates, takes no other lock, and never calls back into this scheduler, so it cannot deadlock or perturb admission; the abandon path deliberately records no outcome, which is why the three outcome counters sum to at most `queued_acquisitions`. PipelineLease::Release decrements the global count and the bucket exactly once, pumps, and notifies only the waiters that pump granted. Stats reads rather than mutates: it takes the same mutex, copies the global count, the queue depth, and every bucket count into stack arrays, tallies the queue by bucket pointer, and then builds its maps with the lock released, so it allocates nothing while holding it, never blocks admission for longer than those reads, and reports one internally consistent moment. Its per-kind maps always carry all six SupportedStageKinds() names, and a queued waiter with no bucket is counted in the total only; that same waiter has no telemetry key either, so its admission is not recorded. A moved-from Pipeline has no scheduler, and SnapshotSchedulingStats answers that with the same all-zero shape instead of throwing.
  * @agent-side-effects: Blocks the calling thread while a permit is unavailable, and runs its own waiter-removal callback on whichever thread cancels -- an application thread or the shared deadline watchdog.
  */
 
 #include "pipeline_scheduler.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -17,6 +19,20 @@
 #include "onnx_world_model/error.hpp"
 
 namespace onnx_world_model::detail {
+namespace {
+
+//: How long an acquisition sat in the queue, in nanoseconds. Only the waiting
+//: path calls it; an immediate grant reports a zero wait without reading the
+//: clock a second time.
+[[nodiscard]] std::uint64_t WaitedNanoseconds(
+    std::chrono::steady_clock::time_point queued_at) noexcept {
+  const auto waited = std::chrono::steady_clock::now() - queued_at;
+  const auto nanoseconds =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count();
+  return nanoseconds <= 0 ? 0 : static_cast<std::uint64_t>(nanoseconds);
+}
+
+}  // namespace
 
 const std::array<std::string_view, 6>& SupportedStageKinds() noexcept {
   static const std::array<std::string_view, 6> kinds{
@@ -56,8 +72,11 @@ void ValidatePipelineSchedulingOptions(
   }
 }
 
-PipelineScheduler::PipelineScheduler(const PipelineSchedulingOptions& options)
-    : global_limit_(options.max_concurrent_executions) {
+PipelineScheduler::PipelineScheduler(
+    const PipelineSchedulingOptions& options,
+    PipelineTelemetryPtr telemetry)
+    : global_limit_(options.max_concurrent_executions),
+      telemetry_(std::move(telemetry)) {
   ValidatePipelineSchedulingOptions(options);
   const auto& kinds = SupportedStageKinds();
   for (std::size_t index = 0; index < kinds.size(); ++index) {
@@ -85,6 +104,17 @@ StageKindPermits* PipelineScheduler::BucketFor(
     return nullptr;
   }
   return &kinds_[static_cast<std::size_t>(found - kinds.begin())];
+}
+
+std::size_t PipelineScheduler::KindIndex(
+    const StageKindPermits* bucket) const noexcept {
+  if (bucket == nullptr) {
+    // No key to record under. Every recording site treats an index this large
+    // as "nothing to record", so an unexecutable stage kind held back only by
+    // the global limit is admitted normally and simply not counted.
+    return kinds_.size();
+  }
+  return static_cast<std::size_t>(bucket - kinds_.data());
 }
 
 void PipelineScheduler::PumpLocked() {
@@ -214,6 +244,9 @@ PipelineLease PipelineScheduler::Acquire(
     const CancellationToken& cancellation) {
   StageKindPermits* bucket = BucketFor(kind);
   if (Unlimited(bucket)) {
+    // The fast path stays first and records nothing: an unconstrained kind
+    // takes no permit, so it has no admission outcome to report. Its stage
+    // execution is still measured, by the session.
     return {};
   }
   // Polled before a ticket is taken, so a token that is already cancelled --
@@ -221,8 +254,10 @@ PipelineLease PipelineScheduler::Acquire(
   // position at all.
   cancellation.ThrowIfCancellationRequested();
 
+  const std::size_t kind_index = KindIndex(bucket);
   auto waiter = std::make_shared<Waiter>();
   waiter->bucket = bucket;
+  bool admitted_immediately = false;
   {
     std::scoped_lock lock(mutex_);
     queue_.push_back(waiter);
@@ -230,10 +265,21 @@ PipelineLease PipelineScheduler::Acquire(
     // never blocks, and a caller that does not fit is already behind every
     // earlier waiter of its own kind.
     PumpLocked();
-    if (waiter->granted) {
-      return PipelineLease(shared_from_this(), bucket);
-    }
+    admitted_immediately = waiter->granted;
   }
+  if (admitted_immediately) {
+    // Granted without ever waiting, so it is admitted with a zero wait and is
+    // deliberately not counted as queued. Recorded with the mutex released,
+    // because nothing but permit bookkeeping belongs under it.
+    RecordAdmissionOutcome(
+        telemetry_, kind_index, TelemetryAdmissionOutcome::admitted, 0);
+    return PipelineLease(shared_from_this(), bucket);
+  }
+
+  // Past this point the acquisition really is waiting, which is the one thing
+  // `queued_acquisitions` means.
+  RecordAdmissionQueued(telemetry_, kind_index);
+  const auto queued_at = std::chrono::steady_clock::now();
 
   // Created only after the waiter is queued and only with the scheduler mutex
   // released. A token that is already cancelled runs this callback inline, on
@@ -256,7 +302,9 @@ PipelineLease PipelineScheduler::Acquire(
     // Registering or waiting failed outright, which leaves a ticket nobody
     // will ever consume. Unregister first -- the mutex is already released
     // here -- and then give the ticket up, returning the permit if the pump
-    // granted it while this thread was unwinding.
+    // granted it while this thread was unwinding. This path records no
+    // outcome, which is why the three outcome counters sum to at most
+    // `queued_acquisitions` rather than exactly to it.
     registration.reset();
     AbandonWaiter(waiter);
     throw;
@@ -265,7 +313,17 @@ PipelineLease PipelineScheduler::Acquire(
   // its callback runs, and that callback wants this same mutex.
   registration.reset();
 
+  const std::uint64_t waited_ns = WaitedNanoseconds(queued_at);
   if (!granted) {
+    // The token holds the reason, so the counter follows the same authority
+    // the thrown ErrorCode does rather than guessing from context.
+    RecordAdmissionOutcome(
+        telemetry_,
+        kind_index,
+        cancellation.reason() == CancellationReason::deadline_exceeded
+            ? TelemetryAdmissionOutcome::deadline_exceeded
+            : TelemetryAdmissionOutcome::cancelled,
+        waited_ns);
     cancellation.ThrowIfCancellationRequested();
     // Only reachable if a claimed reason vanished, which the one-way latch
     // makes impossible; reporting it beats waiting forever.
@@ -274,6 +332,11 @@ PipelineLease PipelineScheduler::Acquire(
         "Pipeline execution was removed from the admission queue");
   }
 
+  // Recorded once, here, before the race below can unwind: a grant that won
+  // against a cancellation was still a grant, so it is admitted rather than
+  // also being counted as a queued cancellation.
+  RecordAdmissionOutcome(
+      telemetry_, kind_index, TelemetryAdmissionOutcome::admitted, waited_ns);
   PipelineLease lease(shared_from_this(), bucket);
   // The grant may have won a race against a cancellation that was already
   // claimed. Re-polling after the registration is gone is what makes the
@@ -284,8 +347,9 @@ PipelineLease PipelineScheduler::Acquire(
 }
 
 std::shared_ptr<PipelineScheduler> MakePipelineScheduler(
-    const PipelineSchedulingOptions& options) {
-  return std::make_shared<PipelineScheduler>(options);
+    const PipelineSchedulingOptions& options,
+    PipelineTelemetryPtr telemetry) {
+  return std::make_shared<PipelineScheduler>(options, std::move(telemetry));
 }
 
 PipelineLease::PipelineLease(

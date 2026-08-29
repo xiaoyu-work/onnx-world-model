@@ -1,7 +1,7 @@
 # @agent-file
 # @agent-purpose: Wraps the `_native` extension in typed Python classes: it locates the ONNX Runtime library, maps manifest JSON to input, output, and stage specs, and exposes the generic model, pipeline, per-component placement and its transfer plan, incremental stage run, cancellation, and latent-dynamics APIs.
-# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
-# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
+# @agent-public-api: DeviceSpec, TensorSpec, ComponentPlacementSpec, TransferKind, PipelineTransfer, PipelineTransferPlan, ModelMetadata, PipelineInputSpec, PipelineOutputSpec, PipelineStageSpec, PipelineSchedulingStats, PipelineComponentStats, PipelineStageStats, PipelineAdmissionStats, PipelineTransferStats, PipelineTelemetrySnapshot, StepResult, StageEventKind, StageEvent, StageRun, CancellationReasonName, CancellationToken, CancellationSource, ProviderOptionValue, ProviderOptions, available_execution_providers, register_execution_provider_library, supported_pipeline_capabilities, OnnxModel, Pipeline, WorldModelPipeline, PipelineSession, PipelineSessionSnapshot, LatentDynamicsModel, LegacyWorldModel, Rollout
+# @agent-invariants: `ONNX_RUNTIME_LIBRARY_PATH` overrides library discovery and must point at an existing file; otherwise the library is found inside the installed `onnxruntime` wheel. Device outputs are opt-in and require the matching EP library to be registered first. All spec dataclasses are frozen. `WorldModelPipeline` and `LegacyWorldModel` are compatibility aliases that must keep pointing at `Pipeline` and `LatentDynamicsModel`. `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind` are admission scheduling only -- never batching -- and are forwarded to the native constructor unchanged, which is the sole authority on which stage-kind names are legal; the two read-only properties echo the accepted values and the per-kind mapping is exposed as an immutable view. `Pipeline.scheduling_stats` is the matching observability read: it converts one native dictionary into a frozen `PipelineSchedulingStats` whose two per-kind mappings are read-only views that always carry all six executable stage kinds, it counts permits rather than executions so an unlimited pipeline reports zeros, and it is a detached value that never updates itself. `Pipeline`'s `enable_telemetry` is opt-in observability of the same shape: it is forwarded unchanged to the native constructor, which rejects anything that is not a real bool, and `telemetry_snapshot` freezes one native dictionary into a `PipelineTelemetrySnapshot` of frozen component, stage, admission, and transfer values whose three mappings are read-only views. A disabled pipeline reads as `enabled=False`, epoch `0`, and empty mappings rather than raising; an enabled one always carries every manifest component, every manifest stage, and all six stage kinds. The reading is detached but deliberately not one atomic instant, `reset_telemetry` starts a new epoch rather than editing counters in place, and telemetry changes what is measured and never what is executed. `Pipeline`'s `component_placement` and `allow_unpreferred_providers` are load-time only and exist on `Pipeline` and `WorldModel` alone, never on `OnnxModel` or `LatentDynamicsModel`; `_placement_arguments` accepts a `ComponentPlacementSpec` or an equivalent mapping interchangeably and drops a field left at `None` so it inherits the pipeline-wide value rather than overriding it with a null, and every component-name and provider rule is enforced in C++ rather than duplicated here. `Pipeline.transfer_plan` is the matching inspection read: it freezes one native dictionary into a `PipelineTransferPlan` of frozen `PipelineTransfer` values computed while the package loaded, it is the configured physical plan rather than the effective one, and nothing in this milestone executes from it. A `TensorSpec.device` is `None` when the backend does not report placement and never takes part in tensor validation. `PipelineSession.run` preserves manifest stage order, rejects duplicate or unknown stage names, and releases each stage after running it. A `PipelineSessionSnapshot` is only produced by `PipelineSession.snapshot`; native package identity is the sole authority for restore compatibility. The named-checkpoint methods forward names to the native session unchanged and hold no Python-side checkpoint state, so empty and unknown names surface as `WorldModelError` from the native layer. A `StageRun` is only produced by `PipelineSession.begin_stage`, holds a strong reference to its session, yields exactly one `StageEvent` with `finished` set and then stops iterating, and closes idempotently through `close`, the context manager, and a best-effort destructor; `iter_stage` starts its run eagerly and closes it in a `finally`, so an early `break` releases the session only when the generator is closed or collected. A `CancellationToken` is only produced by `CancellationSource.token`; `cancellation` and `timeout` are mutually exclusive on every call that accepts them, a `timeout` is validated as a finite non-negative number of seconds, and `PipelineSession.run` builds its timeout source once so one absolute deadline covers the whole stage sequence. `CancellationToken.wait` and `CancellationSource.wait` block without polling and release the GIL, so another Python thread can still cancel; a deadline releases them through the shared native watchdog rather than at the next boundary. `StageRun.request_cancellation` signals work already running and takes no session lock, while `close` waits for the lock and only releases the run slot; neither rolls anything back.
 # @agent-side-effects: Reads `pipeline.json` from the package directory, loads ONNX Runtime and explicitly registered EP libraries, reads the `ONNX_RUNTIME_LIBRARY_PATH` environment variable, and preloads pip-installed CUDA libraries with `ctypes.CDLL` into the global namespace.
 
 from __future__ import annotations
@@ -183,6 +183,143 @@ class PipelineSchedulingStats:
     queued_executions: int
     active_by_stage_kind: Mapping[str, int]
     queued_by_stage_kind: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class PipelineComponentStats:
+    """What one manifest component's model calls did in this epoch.
+
+    A call is one invocation of that component's session from inside a stage
+    execution. The four outcome counters are mutually exclusive and are
+    classified by the error the call raised rather than by its message, so a
+    cancellation and a deadline are reported as themselves. Durations cover
+    every attempt; ``successful_calls`` and ``output_bytes`` cover successes
+    only, and ``input_bytes`` counts what was presented on every attempt.
+    """
+
+    successful_calls: int
+    failed_calls: int
+    cancelled_calls: int
+    deadline_exceeded_calls: int
+    #: Wall-clock nanoseconds inside the component call itself, summed over
+    #: every attempt. It excludes input resolution and admission queue wait.
+    total_duration_ns: int
+    max_duration_ns: int
+    #: Exact byte totals from the tensors themselves. A tensor presented to
+    #: two components, or twice to one, is counted once per presentation.
+    input_bytes: int
+    output_bytes: int
+
+
+@dataclass(frozen=True)
+class PipelineStageStats:
+    """What one manifest stage did in this epoch.
+
+    An execution is one admission lease scope: one ``run_stage``, one
+    ``step_stage``, one ``StageRun.step``, or one ``StageRun.finish`` that
+    still had work to drain. ``begin_stage``, an idle handle, and a ``finish``
+    that returns an already-completed run's cached outputs are not executions
+    and change nothing here. An execution stopped while it was still queued
+    for admission never became an execution either; it is reported by
+    :class:`PipelineAdmissionStats` instead.
+
+    ``steps`` and ``completions`` measure stage progress rather than API
+    calls, so one ``run_stage`` of an autoregressive stage is a single
+    execution with many steps and exactly one completion. A direct
+    ``step_stage`` bypasses the event state machine, so it counts one step and
+    never a completion.
+    """
+
+    successful_executions: int
+    failed_executions: int
+    cancelled_executions: int
+    deadline_exceeded_executions: int
+    steps: int
+    completions: int
+    #: Wall-clock nanoseconds measured from after the admission permit was
+    #: granted, so queue wait is reported once, by the admission counters.
+    total_execution_duration_ns: int
+    max_execution_duration_ns: int
+
+
+@dataclass(frozen=True)
+class PipelineAdmissionStats:
+    """What admission did to one stage kind in this epoch.
+
+    These are queue outcomes rather than permit counts. A stage kind capped by
+    neither the global limit nor its own is admitted without a permit and is
+    deliberately not counted here at all, so an unlimited pipeline reports
+    zeros however much work runs through it while
+    :class:`PipelineStageStats` still measures those executions.
+    """
+
+    #: Acquisitions that had to wait. An acquisition granted at once is not
+    #: queued and appears only in ``admitted_acquisitions``.
+    queued_acquisitions: int
+    #: Acquisitions that received a permit, immediately or after waiting. A
+    #: grant that raced a cancellation is counted here once and never also as
+    #: a queued cancellation.
+    admitted_acquisitions: int
+    cancelled_while_queued: int
+    deadline_while_queued: int
+    #: Nanoseconds spent in the queue, for every outcome. An immediate grant
+    #: contributes nothing.
+    total_wait_ns: int
+    max_wait_ns: int
+
+
+@dataclass(frozen=True)
+class PipelineTransferStats:
+    """What crossed the device boundary in this epoch.
+
+    The copy counters are exact for the materializations the runtime performs
+    itself -- a cast, a scheduler step, a guidance combination, a generated
+    input program, a packed video or audio finalization, or token sampling. A
+    source that is already ordinary CPU memory is handed over without a copy
+    and is never counted, and neither is a copy ONNX Runtime makes below that
+    boundary while staging a foreign device buffer into a session.
+
+    There is deliberately no host-to-device counter: uploads happen inside
+    ONNX Runtime when it binds an input, so the runtime cannot measure their
+    byte counts and refuses to guess. The two residency fields are the honest
+    measure available, and they are presentation rather than transfer: they
+    say where each component's inputs already lived, counting a tensor once
+    per presentation.
+    """
+
+    device_to_host_copies: int
+    device_to_host_bytes: int
+    component_input_bytes_device_resident: int
+    component_input_bytes_host: int
+
+
+@dataclass(frozen=True)
+class PipelineTelemetrySnapshot:
+    """One immutable reading of a pipeline's telemetry counters.
+
+    ``enabled`` is ``False`` for a pipeline built without
+    ``enable_telemetry``; such a reading carries epoch ``0`` and three empty
+    mappings, because nothing was ever collected. An enabled reading always
+    carries every manifest component, every manifest stage, and all six
+    executable stage kinds, so a key can be read without testing for it, and
+    all three mappings are read-only views.
+
+    The reading is detached and never updates itself, but it is deliberately
+    not one atomic instant: each counter is copied individually from a live
+    system, because the alternative is a lock on the execution path.
+
+    ``epoch`` starts at ``1`` and advances by one on every
+    :meth:`Pipeline.reset_telemetry`. Work already running when the reset
+    happened finishes into the previous epoch and is intentionally absent
+    here.
+    """
+
+    enabled: bool
+    epoch: int
+    components: Mapping[str, PipelineComponentStats]
+    stages: Mapping[str, PipelineStageStats]
+    admission_by_stage_kind: Mapping[str, PipelineAdmissionStats]
+    transfers: PipelineTransferStats
 
 
 @dataclass(frozen=True)
@@ -648,6 +785,82 @@ def _scheduling_stats(payload: Mapping[str, Any]) -> PipelineSchedulingStats:
     )
 
 
+def _component_stats(payload: Mapping[str, Any]) -> PipelineComponentStats:
+    return PipelineComponentStats(
+        successful_calls=int(payload["successful_calls"]),
+        failed_calls=int(payload["failed_calls"]),
+        cancelled_calls=int(payload["cancelled_calls"]),
+        deadline_exceeded_calls=int(payload["deadline_exceeded_calls"]),
+        total_duration_ns=int(payload["total_duration_ns"]),
+        max_duration_ns=int(payload["max_duration_ns"]),
+        input_bytes=int(payload["input_bytes"]),
+        output_bytes=int(payload["output_bytes"]),
+    )
+
+
+def _stage_stats(payload: Mapping[str, Any]) -> PipelineStageStats:
+    return PipelineStageStats(
+        successful_executions=int(payload["successful_executions"]),
+        failed_executions=int(payload["failed_executions"]),
+        cancelled_executions=int(payload["cancelled_executions"]),
+        deadline_exceeded_executions=int(
+            payload["deadline_exceeded_executions"]
+        ),
+        steps=int(payload["steps"]),
+        completions=int(payload["completions"]),
+        total_execution_duration_ns=int(payload["total_execution_duration_ns"]),
+        max_execution_duration_ns=int(payload["max_execution_duration_ns"]),
+    )
+
+
+def _admission_stats(payload: Mapping[str, Any]) -> PipelineAdmissionStats:
+    return PipelineAdmissionStats(
+        queued_acquisitions=int(payload["queued_acquisitions"]),
+        admitted_acquisitions=int(payload["admitted_acquisitions"]),
+        cancelled_while_queued=int(payload["cancelled_while_queued"]),
+        deadline_while_queued=int(payload["deadline_while_queued"]),
+        total_wait_ns=int(payload["total_wait_ns"]),
+        max_wait_ns=int(payload["max_wait_ns"]),
+    )
+
+
+def _telemetry_snapshot(payload: Mapping[str, Any]) -> PipelineTelemetrySnapshot:
+    """Freezes one native telemetry reading into its typed value."""
+    transfers = payload["transfers"]
+    return PipelineTelemetrySnapshot(
+        enabled=bool(payload["enabled"]),
+        epoch=int(payload["epoch"]),
+        components=MappingProxyType(
+            {
+                name: _component_stats(stats)
+                for name, stats in payload["components"].items()
+            }
+        ),
+        stages=MappingProxyType(
+            {
+                name: _stage_stats(stats)
+                for name, stats in payload["stages"].items()
+            }
+        ),
+        admission_by_stage_kind=MappingProxyType(
+            {
+                kind: _admission_stats(stats)
+                for kind, stats in payload["admission_by_stage_kind"].items()
+            }
+        ),
+        transfers=PipelineTransferStats(
+            device_to_host_copies=int(transfers["device_to_host_copies"]),
+            device_to_host_bytes=int(transfers["device_to_host_bytes"]),
+            component_input_bytes_device_resident=int(
+                transfers["component_input_bytes_device_resident"]
+            ),
+            component_input_bytes_host=int(
+                transfers["component_input_bytes_host"]
+            ),
+        ),
+    )
+
+
 class Pipeline:
     """A validated Mobius pipeline package with shareable model sessions.
 
@@ -678,6 +891,12 @@ class Pipeline:
     the component sessions are still being built. It never warms a session up,
     loads one lazily, offloads or evicts one, or arranges a peer-to-peer
     transfer.
+
+    ``enable_telemetry`` turns on the runtime counters
+    :attr:`telemetry_snapshot` reports. It is off by default, and off means no
+    collector at all rather than a collector that ignores everything, so the
+    default costs one pointer test per instrumentation site. It changes what
+    is measured and never what is executed.
     """
 
     def __init__(
@@ -698,6 +917,7 @@ class Pipeline:
             Mapping[str, ComponentPlacementSpec | Mapping[str, Any]] | None
         ) = None,
         allow_unpreferred_providers: bool = False,
+        enable_telemetry: bool = False,
     ) -> None:
         package = Path(package_path)
         with (package / "pipeline.json").open(encoding="utf-8") as file:
@@ -722,6 +942,7 @@ class Pipeline:
             stage_kind_limits,
             placement,
             allow_unpreferred_providers,
+            enable_telemetry,
         )
         # Recorded only after the native constructor accepted them, so these
         # report the limits actually in force rather than what was requested.
@@ -729,6 +950,7 @@ class Pipeline:
         self._max_concurrent_by_stage_kind: Mapping[str, int] = MappingProxyType(
             stage_kind_limits
         )
+        self._telemetry_enabled = enable_telemetry
         self._transfer_plan = _transfer_plan(self._core.transfer_plan)
         self._manifest: dict[str, Any] = self._document["manifest"]
         components = {
@@ -841,6 +1063,33 @@ class Pipeline:
         of them is counted. Reading admits, queues, and blocks nothing.
         """
         return _scheduling_stats(self._core.scheduling_stats)
+
+    @property
+    def telemetry_enabled(self) -> bool:
+        """Whether this pipeline collects telemetry at all."""
+        return self._telemetry_enabled
+
+    @property
+    def telemetry_snapshot(self) -> PipelineTelemetrySnapshot:
+        """This pipeline's runtime counters right now, as a detached value.
+
+        Copies of one pipeline share a collector, so they report the same
+        counters, and every session, forked session, and :class:`StageRun`
+        created from any of them is counted. A pipeline built without
+        ``enable_telemetry`` reports a disabled reading rather than raising.
+        Reading takes no session or scheduler lock and blocks no execution.
+        """
+        return _telemetry_snapshot(self._core.telemetry_snapshot)
+
+    def reset_telemetry(self) -> None:
+        """Starts a new telemetry epoch with every counter back at zero.
+
+        This is not a barrier: an execution that is already running finishes
+        into the epoch it started in, so its remaining counts land in the
+        previous epoch and are absent from the new one. Resetting a pipeline
+        that collects nothing does nothing.
+        """
+        self._core.reset_telemetry()
 
     def create_session(self) -> PipelineSession:
         return PipelineSession(self, self._core.create_session())

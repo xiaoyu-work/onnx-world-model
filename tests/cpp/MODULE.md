@@ -52,6 +52,20 @@ Runtime library and no real ONNX model.
   separately constructed `Pipeline` shares the ceiling. Every "it is queued"
   claim there is synchronized on `Pipeline::scheduling_stats`, never on a wait
   that timed out.
+- Cover opt-in runtime telemetry in its own executable: the disabled default
+  that collects nothing and reads as `enabled=false` with empty maps, the
+  fully pre-populated idle reading of an enabled pipeline, per-component call
+  counts, exact byte totals and durations, outcome classification by
+  `ErrorCode` for a failure, a cancellation, and a deadline, execution versus
+  step versus completion counts across `RunStage`, `StepStage`, and an
+  incremental `StageRun`, a cached `Finish` that changes nothing, admission
+  wait outcomes for a constrained stage kind — an immediate grant, a queued
+  grant, a queued cancellation, and a queued deadline — and their complete
+  absence for an unlimited one, one host materialization per device source
+  with its exact byte count, component input residency, the epoch reset, and
+  which `Pipeline` values share a collector. No check there asserts an
+  absolute duration: a duration is compared only against zero and a maximum
+  only against its own total.
 
 ## Key Files
 
@@ -66,12 +80,17 @@ Runtime library and no real ONNX model.
 | `pipeline_stream_test.cpp` | `pipeline_stream_test` | `PipelineSession::BeginStage` and `StageRun`: greedy, sampled, and per-lane early-stopping autoregressive parity with `RunStage`, the once-only token budget, iterative and single-pass parity, one terminal `StageEvent`, `Finish` after partial stepping, the active-run exclusions, cancellation and destruction, failure without rollback, moved handles, session move and destruction safety, and device-preserving event outputs. |
 | `pipeline_cancellation_test.cpp` | `pipeline_cancellation_test` | `StageRun::RequestCancellation` interrupting a `Finish` that holds the session lock, an external `CancellationSource`, no extra component pass after a cancellation between steps, partial state surviving, `deadline_exceeded` versus `cancelled`, an expired deadline never claiming the run slot, a stale handle not releasing a newer run, session reuse with a fresh token, a reused cancelled token failing immediately, direct `StepStage` honoring its token, a `~20 ms` deadline unblocking a `RunStage` and a `Step` whose backend is parked on `WaitForCancellation` with no polling at all, exception-safe restoration of the classifier-free guidance scratch state when the unconditional pass is cancelled, `Model::Run`'s cancellable overload, and no device materialization from cancelling. |
 | `pipeline_scheduler_test.cpp` | `pipeline_scheduler_test` | `PipelineSchedulingOptions` through the public API only: the unlimited default admitting three sessions at once, a global ceiling of two that is reached but never exceeded and drains work-conservingly, a per-kind ceiling of one that serializes `single_pass` while an uncapped `state_transition` still enters, a queued execution cancelled or stopped by its deadline without reaching the backend and without leaving its queue position behind, a queued `StageRun::Step` cancelled and a queued `StageRun::Finish` stopped by its deadline each closing the handle and releasing the session's active-run slot so the same session immediately accepts a `Snapshot`, a fresh `BeginStage`, and a `RunStage`, a stale handle's `Cancel` not releasing a newer run's slot, a permit returned after a backend failure, `BeginStage` and an idle handle holding nothing while `Step`, `Finish`, and `StepStage` each hold one, a completed `Finish` returning its cached result without admission, the `PipelineSchedulingStats` reading -- all six stage kinds always present, zeros for an unlimited pipeline, the admitted and queued counts under a ceiling, and a drain back to zero -- which is also what every queued-request claim in the file synchronizes on, a copied and a forked session sharing the ceiling while two separately constructed `Pipeline`s do not, unknown, empty, and wrong-case stage-kind keys rejected with `invalid_argument`, and a limit of zero meaning unlimited. |
+| `pipeline_telemetry_test.cpp` | `pipeline_telemetry_test` | `PipelineTelemetryOptions` and `Pipeline::telemetry_snapshot` through the public API only: a disabled pipeline reading as `enabled=false`, epoch `0`, empty maps, and zero transfers even after running a stage, and resetting one changing nothing; an enabled pipeline starting at epoch `1` already carrying every manifest component, every manifest stage, and all six stage kinds at zero; one component call's exact input and output byte totals and its positive duration; `failed_calls`, `cancelled_calls`, and `deadline_exceeded_calls` chosen by the `ErrorCode` a stub backend throws, with the matching stage bucket, the presented bytes still counted, and no step or completion; one `RunStage` of a one-pass stage as one execution, one step, and one completion and of a three-step iterative stage as one execution, three steps, and one completion; four `Step` calls as four executions with three steps and one completion; one `Step` plus a draining `Finish` as two executions; a `Finish` on a completed run changing nothing; two direct `StepStage` calls as two executions and two steps with no completion; no admission counters at all for an unlimited kind whose executions are still measured; an immediate grant admitted with a zero wait and not queued; a gated second execution counted as one queued acquisition, two admissions, and a positive wait; a queued cancellation and a queued deadline each counted as their own outcome, with a positive wait and no stage execution because they never got a permit; exactly one device-to-host copy with its exact byte count for a cast connection, with host and device-resident presentation totals; a reset advancing the epoch, zeroing every counter, keeping the maps populated, and continuing to collect; a `Pipeline` copy and a forked session sharing the collector while a separately constructed `Pipeline` does not; a moved-from `Pipeline` reporting the disabled reading; and a returned reading never updating itself. |
 
 Each file is a self-contained `main()` with local `Check` and `CheckThrows`
 helpers (and `CheckThrowsMessage` where a message is asserted, or
 `CheckThrowsCode`, `CheckThrowsState`, and `CheckThrowsInvalidArgument` where a
 specific `ErrorCode` is asserted), a file-local
-`failures` counter, and a non-zero exit code on failure. There is no
+`failures` counter, and a non-zero exit code on failure.
+`pipeline_telemetry_test.cpp` additionally keeps its checks in one
+`RunTelemetryChecks()` that `main` calls inside a `try`, so an unexpected
+`Error` -- an embedded manifest the file got wrong, say -- is reported as a
+failure instead of aborting the process with no message. There is no
 third-party test framework; a new test is a new check inside an existing
 `main()`, or a new executable added to the
 `foreach(test_name IN ITEMS ...)` list in the root `CMakeLists.txt`.
@@ -97,8 +116,11 @@ third-party test framework; a new test is a new check inside an existing
   overrides the cancellable `Run`, signals that it entered, waits to be
   released, and only then checks its token, and
   `pipeline_scheduler_test.cpp` uses one shared `Gate` with `GatedBackend`,
-  which records the concurrency peak per component before parking. It never
-  infers "this request is still queued" from a wait that timed out: it polls
+  which records the concurrency peak per component before parking, and
+  `pipeline_telemetry_test.cpp` uses the same shape for its admission checks:
+  a smaller shared `Gate` with its own `GatedBackend`, plus a `CountingBackend`
+  whose shared failure cell makes the next call throw a chosen `ErrorCode` and
+  its own `FakeDeviceBuffer` with a `DeviceCopyCounter`. Neither infers "this request is still queued" from a wait that timed out: it polls
   `Pipeline::scheduling_stats().queued_executions` until the queue holds
   exactly the expected number, bounded by a five-second budget, so the
   scheduler's own published state is the synchronization point and a broken
@@ -118,7 +140,8 @@ third-party test framework; a new test is a new check inside an existing
   directory and ORT library path as `argv[1]` and `argv[2]`.
 - `cancellation_test.cpp`, `pipeline_device_test.cpp`,
   `pipeline_snapshot_test.cpp`, `pipeline_stream_test.cpp`,
-  `pipeline_cancellation_test.cpp`, and `pipeline_scheduler_test.cpp` take no
+  `pipeline_cancellation_test.cpp`, `pipeline_scheduler_test.cpp`, and
+  `pipeline_telemetry_test.cpp` take no
   arguments and touch no filesystem: they build each `PipelinePackage` in
   memory from an embedded manifest string.
 

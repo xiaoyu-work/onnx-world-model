@@ -101,6 +101,20 @@ materializes each device operand once at its own boundary and then reads only
 host memory. A public output can therefore be device-only, so call
 `Tensor::CopyToCpu()` before `bytes()` or `values<T>()`.
 
+Every one of those materializations goes through a single boundary inside the
+session, so a pipeline with telemetry enabled counts each real copy once, with
+its byte total, in
+`PipelineTelemetrySnapshot::transfers.device_to_host_copies` and
+`device_to_host_bytes`. A source that is already ordinary CPU memory is handed
+back without a copy and is never counted. There is deliberately no
+host-to-device counter: uploads happen inside ONNX Runtime when it binds an
+input, so this runtime cannot measure them. What it can measure exactly is
+where each component's inputs lived when they were presented, which is what
+`component_input_bytes_device_resident` and `component_input_bytes_host`
+report; that is presentation rather than transfer, so a tensor presented twice
+is counted twice. See
+[Telemetry](pipeline-api.md#telemetry) for the full contract.
+
 ## Latent dynamics
 
 `LatentDynamicsModel` preserves the original fixed single-graph contract:
@@ -125,15 +139,18 @@ rollout.reset(batch_size=1)
 
 This fixed API does not accept a cancellation token in this milestone; use
 `Pipeline` and `PipelineSession` when a call must be interruptible. It also
-takes no concurrency limits and no placement: `max_concurrent_executions`,
-`max_concurrent_by_stage_kind`, `component_placement`, and
-`allow_unpreferred_providers` are pipeline-only options, so `OnnxModel` and
-`LatentDynamicsModel` do not accept them.
+takes no concurrency limits, no placement, and no telemetry:
+`max_concurrent_executions`, `max_concurrent_by_stage_kind`,
+`component_placement`, `allow_unpreferred_providers`, and `enable_telemetry`
+are pipeline-only options, so `OnnxModel` and `LatentDynamicsModel` do not
+accept them. A `Model::Run` a caller makes directly is not a pipeline
+component call and is never counted by pipeline telemetry.
 
 ## Pipeline
 
 For package-level tensor and stage execution — including the admission
 scheduling that caps concurrent executions, the `scheduling_stats` reading of
-it, the per-component `component_placement` overrides, and the `transfer_plan`
+it, the opt-in `enable_telemetry` and the `telemetry_snapshot` reading of it,
+the per-component `component_placement` overrides, and the `transfer_plan`
 they produce — see the
 [Pipeline API](pipeline-api.md).

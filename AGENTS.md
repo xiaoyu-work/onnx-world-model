@@ -76,22 +76,26 @@ ctest --preset dev
 ctest --preset dev -R pipeline_test
 ```
 
-Expected baseline: `ctest` reports 9 of 9 passing; `pytest` reports 185 passed
-and 20 skipped. The skips are tests whose fixtures require the optional
+Expected baseline: `ctest` reports 10 of 10 passing; `pytest` reports 203
+passed and 20 skipped. The skips are tests whose fixtures require the optional
 `mobius` exporter. `tests/python/test_guided_generation.py` needs the optional
 `onnx_ir` package, which also gates the package fixtures in
 `tests/python/test_pipeline_snapshot.py`,
 `tests/python/test_pipeline_stream.py`,
 `tests/python/test_cancellation.py`,
-`tests/python/test_scheduling.py`, and
-`tests/python/test_placement.py`.
+`tests/python/test_scheduling.py`,
+`tests/python/test_placement.py`, and
+`tests/python/test_telemetry.py`.
 
-`pipeline_scheduler_test` is the one concurrent CTest executable. Run it
-repeatedly after changing `src/pipeline_scheduler.cpp`, `src/cancellation.cpp`,
-or any call site that takes an admission lease:
+`pipeline_scheduler_test` and `pipeline_telemetry_test` are the concurrent
+CTest executables. Run them repeatedly after changing
+`src/pipeline_scheduler.cpp`, `src/pipeline_telemetry.cpp`,
+`src/cancellation.cpp`, or any call site that takes an admission lease or
+records telemetry:
 
 ```console
 ctest --preset dev -R pipeline_scheduler_test --repeat until-fail:20
+ctest --preset dev -R pipeline_telemetry_test --repeat until-fail:20
 ```
 
 Run the placement tests repeatedly after changing component placement, the

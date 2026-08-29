@@ -35,6 +35,15 @@ expects.
   same controller and returns a frozen `PipelineSchedulingStats` with the
   admitted and queued counts, in total and per stage kind. `OnnxModel` and
   `LatentDynamicsModel` do not accept them, because they are not pipelines.
+- Forward the pipeline-only `enable_telemetry` switch from `Pipeline` and
+  `WorldModel` to the native layer, which rejects anything that is not a real
+  bool, and expose the resulting counters as the frozen
+  `Pipeline.telemetry_snapshot` and `WorldModel.telemetry_snapshot`, with
+  `reset_telemetry()` on both to start a new epoch. A pipeline that was not
+  asked to collect reads as `enabled=False` with empty mappings rather than
+  raising. This is the runtime's own measurement — component calls, stage
+  executions, admission waits, and device materializations — and is separate
+  from the per-request wall-clock `timings` each generator returns.
 - Keep the low-level `OnnxModel`, `Pipeline`, `PipelineSession`,
   `PipelineSessionSnapshot`, `StageRun`, `CancellationSource`,
   `CancellationToken`, `LatentDynamicsModel`, and `Rollout` APIs available.
@@ -51,7 +60,7 @@ expects.
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Public package surface; re-exports only, with a sorted `__all__`. |
-| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, the `DeviceSpec`, `ComponentPlacementSpec`, `PipelineTransfer`, and `PipelineTransferPlan` placement values, device-output options, `Pipeline` with its admission-scheduling limits, its frozen `PipelineSchedulingStats` reading, its load-time `component_placement`, and its frozen `transfer_plan`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
+| `_api.py` | ORT and EP library discovery/registration, `_native` wrappers, manifest spec dataclasses, the `DeviceSpec`, `ComponentPlacementSpec`, `PipelineTransfer`, and `PipelineTransferPlan` placement values, device-output options, `Pipeline` with its admission-scheduling limits, its frozen `PipelineSchedulingStats` reading, its opt-in `enable_telemetry` with the frozen `PipelineComponentStats`, `PipelineStageStats`, `PipelineAdmissionStats`, `PipelineTransferStats`, and `PipelineTelemetrySnapshot` reading and `reset_telemetry`, its load-time `component_placement`, and its frozen `transfer_plan`, `PipelineSession` with its `PipelineSessionSnapshot`, named-checkpoint, and incremental `begin_stage`/`iter_stage` methods, the `StageEvent` value type and the `StageRun` iterator, the `CancellationSource` and `CancellationToken` wrappers and the shared `cancellation`/`timeout` argument handling, latent-dynamics API. |
 | `media.py` | Image and video decoding, grid-aligned resizing, and patch-token packing. |
 | `preprocessing.py` | Chat templating, tokenization, latent-token packing, and reasoner and world-model input assembly. |
 | `generation.py` | `WorldModel` plus the text, image, video, and action generators and their output dataclasses. |
@@ -103,6 +112,9 @@ the shape and immutability of the `Pipeline.scheduling_stats` reading,
 `tests/python/test_placement.py` covers the `component_placement` and
 `allow_unpreferred_providers` arguments, the `DeviceSpec` a CPU port reports,
 and the frozen `Pipeline.transfer_plan`,
+`tests/python/test_telemetry.py` covers the `enable_telemetry` argument, the
+shape and immutability of the `Pipeline.telemetry_snapshot` reading, the exact
+counts one single-threaded run produces, and `reset_telemetry`,
 `tests/python/test_preprocessing.py` covers `preprocessing.py` and `media.py`,
 and `tests/python/test_guided_generation.py` and
 `tests/python/test_image_to_video_smoke.py` cover `generation.py`. Tests that

@@ -103,6 +103,19 @@ C++ API ───────────────┤                  │
   reason for every non-direct one. The plan is inspection only: nothing
   executes from it, and warm-up, lazy loading, offload and eviction, and
   peer-to-peer transfers are not included.
+- Runtime telemetry is opt-in and observability only. Pass
+  `enable_telemetry=True` to `Pipeline` or `WorldModel` and
+  `pipeline.telemetry_snapshot` reports, for one epoch, per-component call
+  counts, byte totals and durations, per-stage execution, step, and completion
+  counts, per-stage-kind admission wait outcomes, and the device-to-host
+  materializations the runtime performed. Outcomes are classified by error
+  code, so a cancellation and a deadline are their own counters rather than
+  failures. `reset_telemetry()` starts a new epoch. It is off by default, and
+  off means no collector at all rather than one that ignores everything.
+  ONNX Runtime per-node traces, provider peak memory, and exact
+  host-to-device byte counts are not included, because only ONNX Runtime holds
+  that data; component input residency reports where each component's inputs
+  already lived and is not an upload count.
 - `LatentDynamicsModel` and `Rollout` preserve the original fixed
   latent-dynamics API.
 - Generic ONNX and latent-dynamics APIs are documented in
@@ -133,10 +146,12 @@ headers. Offline builds can set `ONNXRUNTIME_INCLUDE_DIR` and
 Version 0.2 introduces the device-aware `TensorBuffer` ABI, version 0.3
 adds the cancellation surface — a `CancellationToken` member on
 `PipelineRunOptions`, a virtual cancellable `ModelBackend::Run`, and
-`StageRun::RequestCancellation` — and version 0.5 changes the `Pipeline`
+`StageRun::RequestCancellation` — version 0.5 changes the `Pipeline`
 layout by giving it a shared admission scheduler and a defaulted
 `PipelineSchedulingOptions` parameter on its constructor and on
-`Pipeline::Load`. C++ applications built against an earlier version must be
+`Pipeline::Load`, and version 0.7 changes that layout again by adding a shared
+telemetry collector with a defaulted `PipelineTelemetryOptions` parameter on
+both. C++ applications built against an earlier version must be
 recompiled when upgrading; source that already compiled keeps compiling,
 because every new parameter is defaulted.
 
@@ -271,4 +286,11 @@ Low-level tensor and stage execution is documented in the
   this change; it would additionally need request compatibility keys, tensor
   concatenation and result splitting, per-lane recurrent state and RNG
   streams, and a KV-cache manager that can admit and evict lanes mid-stage.
+- Opt-in runtime telemetry: per-component call, byte, and duration counters,
+  per-stage execution, step, and completion counters, per-stage-kind admission
+  wait outcomes, and the device-to-host materializations the runtime performed,
+  reported as an immutable snapshot under a reset-able epoch. ONNX Runtime
+  per-node trace export, execution-provider peak memory, exact host-to-device
+  byte counts, and any aggregation, percentile, export, or per-request tracing
+  above cumulative counters are **not** included.
 - Fixed-step stochastic FlowMatch schedules are not yet supported.

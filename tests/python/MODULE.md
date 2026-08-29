@@ -44,6 +44,15 @@ package, including the compiled `_native` extension, through its public API.
   transfer per connection for an all-CPU package, and a
   `device_outputs_enabled` flag that mirrors the constructor without rewriting
   any kind.
+- Verify the opt-in telemetry surface on `Pipeline` and `WorldModel`: the
+  disabled default and what a disabled reading says, the non-bool
+  `enable_telemetry` rejection, the fully populated idle reading, the frozen
+  dataclasses and read-only mappings of a detached snapshot, the exact
+  execution, step, completion, call, and byte counts one single-threaded run
+  produces, the admission counters an unlimited and a constrained kind report,
+  the `reset_telemetry` epoch, and which pipelines share a collector. Nothing
+  here asserts a duration magnitude or timing between threads; those belong to
+  `tests/cpp/pipeline_telemetry_test.cpp`.
 - Verify the preprocessing and media layers against explicit reference
   implementations of the runtime tensor layouts.
 - Verify classifier-free guidance and the image-to-video entry point.
@@ -60,6 +69,7 @@ package, including the compiled `_native` extension, through its public API.
 | `test_cancellation.py` | `CancellationSource`, `CancellationToken`, the blocking `wait` on both and the GIL release around it, the `CancelledError` and `DeadlineExceededError` hierarchy, `StageRun.request_cancellation`, and the `cancellation` and `timeout` arguments on `PipelineSession` and `OnnxModel`, using a counter package built with `onnx_ir`. |
 | `test_scheduling.py` | `Pipeline`'s `max_concurrent_executions` and `max_concurrent_by_stage_kind`: unlimited defaults, accepted values and the read-only properties that echo them, the copied caller mapping, bool, non-integer, and negative rejection, unknown, empty, and wrong-case stage kinds, `WorldModel`'s keyword-only forwarding, the `scheduling_stats` reading — all six stage kinds present in both mappings, a frozen dataclass over read-only mappings, a detached value rather than a live view, zeros for an unlimited pipeline, and a limited pipeline settling back to zero active and zero queued after an execution — and — under a configured limit, where a stage kind takes a queue ticket — a `StageRun.step` cancelled and a `StageRun.finish` past its deadline failing during admission while still closing the run and returning the session's run slot, on a counter package built with `onnx_ir`. |
 | `test_placement.py` | `Pipeline`'s `component_placement` and `allow_unpreferred_providers`: the `ComponentPlacementSpec` and plain-mapping forms, provider and provider-option overrides, the binding's `TypeError`/`ValueError` shape checks — a mapping per component, a provider list that is not a bare string, string provider names, scalar option values, an unknown placement key, and non-bool, non-integer, and negative thread counts — the native `WorldModelError` rules for an unknown or empty component name, a repeated provider, and options for a provider a component does not run on, the `DeviceSpec` a CPU port reports through `ModelMetadata`, and the frozen `Pipeline.transfer_plan`: one `direct`, bind-eligible, reasonless transfer for the all-CPU package, a stable identical value, and a `device_outputs_enabled` flag that mirrors the constructor without rewriting a kind. `WorldModel`, `OnnxModel`, and `LatentDynamicsModel` are checked by signature, on a two-component package built with `onnx_ir`. |
+| `test_telemetry.py` | `Pipeline`'s `enable_telemetry`: the off-by-default reading — `enabled=False`, epoch `0`, empty mappings, zero transfers — the no-op reset of a disabled pipeline, the `TypeError` for a non-bool switch, the fully populated idle reading with all six stage kinds, a frozen detached snapshot over read-only mappings, one `run_stage` as one execution, one step, and one completion, exact component call and byte totals, zero device materializations for a CPU-only package, an incremental run counting each `step` as its own execution with the terminal one adding the completion, a cached `finish` changing nothing, a direct `step_stage` counting a step and never a completion, no admission counters for an unlimited kind and an immediate grant for a constrained one, the `reset_telemetry` epoch, a forked session sharing the collector while a separate `Pipeline` does not, `WorldModel`'s keyword-only forwarding checked by signature, and the exported dataclasses, on a counter package built with `onnx_ir`. |
 | `test_preprocessing.py` | `preprocessing.py` and `media.py`, including latent-token round trips. |
 | `test_guided_generation.py` | Classifier-free guidance on graphs synthesized with `onnx_ir`. |
 | `test_image_to_video_smoke.py` | The `tools/image_to_video_smoke.py` dry run and generation path. |
@@ -76,8 +86,8 @@ package, including the compiled `_native` extension, through its public API.
     without it;
   - `onnx_ir` — required by `test_guided_generation.py`, and by the package
     fixtures in `test_pipeline_snapshot.py`, `test_pipeline_stream.py`,
-    `test_cancellation.py`, `test_scheduling.py`, and `test_placement.py`,
-    which call
+    `test_cancellation.py`, `test_scheduling.py`, `test_placement.py`, and
+    `test_telemetry.py`, which call
     `pytest.importorskip` so the rest of those modules still runs;
   - an exported image-to-video package — guards the generation test in
     `test_image_to_video_smoke.py` with `skipif`.
@@ -85,8 +95,8 @@ package, including the compiled `_native` extension, through its public API.
 Fixtures that build a package in `tmp_path` need no exporter and no network, so
 `test_preprocessing.py`, `test_guided_generation.py`,
 `test_pipeline_snapshot.py`, `test_pipeline_stream.py`,
-`test_cancellation.py`, `test_scheduling.py`, and `test_placement.py` always
-run.
+`test_cancellation.py`, `test_scheduling.py`, `test_placement.py`, and
+`test_telemetry.py` always run.
 
 ## Tests
 
