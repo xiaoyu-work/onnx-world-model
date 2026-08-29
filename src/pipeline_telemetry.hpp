@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Declares the internal opt-in telemetry collector a Pipeline shares with its admission scheduler and with every session it creates -- the immutable per-epoch counter slab, the relaxed-atomic counter helpers, the per-epoch trace-record state, the RAII component and stage recorders, the admission and device-transfer recording hooks, the trace-configuration validation the loader runs before any model file is opened, and the epoch reset that publishes a fresh slab.
  * @agent-public-api: onnx_world_model::detail::PipelineTelemetryPtr, onnx_world_model::detail::TelemetryCounter, onnx_world_model::detail::AddCounter, onnx_world_model::detail::RaiseCounterMaximum, onnx_world_model::detail::TelemetryComponentEntry, onnx_world_model::detail::TelemetryStageEntry, onnx_world_model::detail::TelemetryAdmissionEntry, onnx_world_model::detail::TelemetryTransferEntry, onnx_world_model::detail::TelemetryTraceState, onnx_world_model::detail::TelemetrySlab, onnx_world_model::detail::PipelineTelemetry, onnx_world_model::detail::ValidatePipelineTelemetryOptions, onnx_world_model::detail::MakePipelineTelemetry, onnx_world_model::detail::SnapshotPipelineTelemetry, onnx_world_model::detail::ResetPipelineTelemetry, onnx_world_model::detail::TelemetryAdmissionOutcome, onnx_world_model::detail::RecordAdmissionQueued, onnx_world_model::detail::RecordAdmissionOutcome, onnx_world_model::detail::RecordDeviceToHostCopy, onnx_world_model::detail::RecordStageStep, onnx_world_model::detail::RecordStageCompletion, onnx_world_model::detail::TelemetryComponentScope, onnx_world_model::detail::TelemetryStageScope, onnx_world_model::detail::RecordStageExecution
- * @agent-invariants: Telemetry is opt-in: a null collector makes each counter site one branch with no lock, allocation, atomic, or clock read. Enabled recorders hold one immutable-keyed atomic slab for their whole operation; reset serializes only cold slab publication, so epochs never regress and in-flight work stays in its original epoch. Counter outcomes are classified by ErrorCode and never change execution. Tracing is the only filesystem path: process-namespaced, process-wide IDs make prefixes unique; record capacity is reserved before discovery; calls past the cap are dropped without scanning; concurrent record order is unspecified and trace_id is the start-order key.
+ * @agent-invariants: Telemetry is opt-in: a null collector makes each counter site one branch with no lock, allocation, atomic, or clock read. Enabled recorders hold one immutable-keyed atomic slab for their whole operation; reset serializes only cold slab publication, so epochs never regress and in-flight work stays in its original epoch. The admission array is sized by detail::kStageKindCount and keyed by a stage kind's index in detail::StageKindDefinitions(), so telemetry states no stage-kind list of its own and cannot disagree with the scheduler or with manifest validation. Counter outcomes are classified by ErrorCode and never change execution. Tracing is the only filesystem path: process-namespaced, process-wide IDs make prefixes unique; record capacity is reserved before discovery; calls past the cap are dropped without scanning; concurrent record order is unspecified and trace_id is the start-order key.
  * @agent-side-effects: none beyond mutating its own counters for the counter paths; a traced component call additionally reads its configured trace directory to find the file ONNX Runtime wrote and allocates one record for it, and validation may create that directory.
  */
 
@@ -26,6 +26,7 @@
 
 #include "onnx_world_model/error.hpp"
 #include "onnx_world_model/pipeline.hpp"
+#include "stage_registry.hpp"
 
 namespace onnx_world_model::detail {
 
@@ -149,8 +150,8 @@ struct TelemetrySlab {
   std::uint64_t epoch{0};
   TelemetryEntryMap<TelemetryComponentEntry> components;
   TelemetryEntryMap<TelemetryStageEntry> stages;
-  //: One entry per SupportedStageKinds() name, in that order.
-  std::array<TelemetryAdmissionEntry, 6> admission;
+  //: One entry per StageKindDefinitions() entry, in that order.
+  std::array<TelemetryAdmissionEntry, kStageKindCount> admission;
   TelemetryTransferEntry transfers;
   //: Empty and untouched unless a trace directory was configured.
   TelemetryTraceState traces;

@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Implements the opt-in telemetry collector behind PipelineTelemetryOptions: the pre-populated per-epoch counter slab, the atomic slab publication that makes ResetTelemetry a new epoch rather than a barrier, the component and stage recorders that classify an outcome by ErrorCode, the admission and device-transfer hooks, the per-run ONNX Runtime trace prefix, its file discovery and record retention, and the immutable PipelineTelemetrySnapshot that Pipeline::telemetry_snapshot() reports.
  * @agent-public-api: detail::ValidatePipelineTelemetryOptions, detail::PipelineTelemetry::PipelineTelemetry, detail::PipelineTelemetry::slab, detail::PipelineTelemetry::tracing, detail::PipelineTelemetry::trace_directory, detail::PipelineTelemetry::max_trace_records, detail::PipelineTelemetry::AllocateTraceId, detail::PipelineTelemetry::Reset, detail::PipelineTelemetry::Snapshot, detail::MakePipelineTelemetry, detail::SnapshotPipelineTelemetry, detail::ResetPipelineTelemetry, detail::RecordAdmissionQueued, detail::RecordAdmissionOutcome, detail::RecordDeviceToHostCopy, detail::RecordStageStep, detail::RecordStageCompletion, detail::TelemetryComponentScope constructor, destructor, profile_prefix, RecordSuccess and RecordCurrentException, detail::TelemetryStageScope constructor, destructor, RecordSuccess and RecordCurrentException
- * @agent-invariants: Observability never changes execution and every recorder is noexcept. Counter slabs are pre-populated, use relaxed atomics, and stay alive across epoch resets. Trace prefixes combine a process-lifetime nonce, process-wide ID, epoch, component, and pid; discovery accepts exactly one non-empty matching JSON file. Record slots are reserved before discovery, so the cap cannot be exceeded and dropped calls require no directory scan. Concurrent vector order is unspecified, trace_id recovers start order, and filesystem failures affect telemetry only.
+ * @agent-invariants: Observability never changes execution and every recorder is noexcept. Counter slabs are pre-populated, use relaxed atomics, and stay alive across epoch resets. The per-stage-kind admission entries are sized, ordered, named, and bounds-checked entirely from detail::StageKindDefinitions() and detail::kStageKindCount, so an out-of-range kind index records nothing and this file repeats no stage-kind list. Trace prefixes combine a process-lifetime nonce, process-wide ID, epoch, component, and pid; discovery accepts exactly one non-empty matching JSON file. Record slots are reserved before discovery, so the cap cannot be exceeded and dropped calls require no directory scan. Concurrent vector order is unspecified, trace_id recovers start order, and filesystem failures affect telemetry only.
  * @agent-side-effects: none beyond mutating its own counters on the counter paths: no I/O, no device work, and no call back into scheduler, session, or cancellation code. Validation may create the configured trace directory, and a traced call reads that directory's entries and one file size to publish its record.
  */
 
@@ -11,7 +11,7 @@
 #include <random>
 #include <system_error>
 
-#include "pipeline_scheduler.hpp"
+#include "stage_registry.hpp"
 
 #if defined(_WIN32)
 #include <process.h>
@@ -419,7 +419,7 @@ PipelineTelemetrySnapshot PipelineTelemetry::Snapshot() const {
   // Every executable stage kind gets an entry whether or not admission ever
   // constrained it, exactly as the scheduling reading does, so a caller reads
   // a kind without testing for its key first.
-  const auto& kinds = SupportedStageKinds();
+  const auto& kinds = StageKindDefinitions();
   for (std::size_t index = 0; index < kinds.size(); ++index) {
     const TelemetryAdmissionEntry& entry = slab->admission[index];
     PipelineAdmissionStats stats;
@@ -433,7 +433,8 @@ PipelineTelemetrySnapshot PipelineTelemetry::Snapshot() const {
         entry.deadline_while_queued.load(std::memory_order_relaxed);
     stats.total_wait_ns = entry.total_wait_ns.load(std::memory_order_relaxed);
     stats.max_wait_ns = entry.max_wait_ns.load(std::memory_order_relaxed);
-    result.admission_by_stage_kind.emplace(std::string(kinds[index]), stats);
+    result.admission_by_stage_kind.emplace(
+        std::string(kinds[index].name), stats);
   }
 
   result.transfers.device_to_host_copies =
@@ -497,7 +498,7 @@ void ResetPipelineTelemetry(const PipelineTelemetryPtr& telemetry) {
 void RecordAdmissionQueued(
     const PipelineTelemetryPtr& telemetry,
     std::size_t kind_index) noexcept {
-  if (telemetry == nullptr || kind_index >= SupportedStageKinds().size()) {
+  if (telemetry == nullptr || kind_index >= kStageKindCount) {
     return;
   }
   const std::shared_ptr<TelemetrySlab> slab = telemetry->slab();
@@ -509,7 +510,7 @@ void RecordAdmissionOutcome(
     std::size_t kind_index,
     TelemetryAdmissionOutcome outcome,
     std::uint64_t wait_ns) noexcept {
-  if (telemetry == nullptr || kind_index >= SupportedStageKinds().size()) {
+  if (telemetry == nullptr || kind_index >= kStageKindCount) {
     return;
   }
   const std::shared_ptr<TelemetrySlab> slab = telemetry->slab();

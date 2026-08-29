@@ -41,6 +41,7 @@ add_library(
   src/pipeline_scheduler.cpp
   src/pipeline_session.cpp
   src/pipeline_telemetry.cpp
+  src/stage_registry.cpp
   src/tensor.cpp
   src/world_model.cpp
 )

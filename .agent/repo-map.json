@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-29T03:31:38.835Z",
+  "generatedAt": "2026-08-29T03:51:58.073Z",
   "generatedBy": "check-agent-readability@1.1.0",
-  "sourceFingerprint": "2ac15a8c335a8cfdb56afbb676c90072c490cf45e219537c268e1f70d43093f6",
+  "sourceFingerprint": "77e8f248f151ca7cbd7f08fff92e26e319949b0ee45da504d2413ea026673eaa",
   "modules": [
     {
       "path": "include/onnx_world_model",
@@ -518,7 +518,6 @@
       "kind": "source",
       "purpose": "Implements the shared admission controller behind PipelineSchedulingOptions: per-stage-kind permit buckets, an oldest-first work-conserving pump over a FIFO queue of waiters, cancellation- and deadline-aware waiting, the RAII PipelineLease that returns a permit exactly once, the per-stage-kind admission telemetry each acquisition records, and the consistent snapshot of the live admission state that Pipeline::scheduling_stats() reports.",
       "publicSymbols": [
-        "detail::SupportedStageKinds",
         "detail::ValidatePipelineSchedulingOptions",
         "detail::MakePipelineScheduler",
         "detail::PipelineScheduler::PipelineScheduler",
@@ -537,7 +536,6 @@
       "kind": "source",
       "purpose": "Declares the internal admission controller a Pipeline shares with every session it creates -- the per-stage-kind permit buckets, the cancellation-aware FIFO waiting queue, the RAII PipelineLease that owns one admitted execution's permit, the read-only snapshot of that admission state a Pipeline reports as PipelineSchedulingStats, and the telemetry collector it records each acquisition's wait outcome into.",
       "publicSymbols": [
-        "onnx_world_model::detail::SupportedStageKinds",
         "onnx_world_model::detail::ValidatePipelineSchedulingOptions",
         "onnx_world_model::detail::MakePipelineScheduler",
         "onnx_world_model::detail::StageKindPermits",
@@ -648,6 +646,29 @@
         "onnx_world_model::detail::TelemetryComponentScope",
         "onnx_world_model::detail::TelemetryStageScope",
         "onnx_world_model::detail::RecordStageExecution"
+      ]
+    },
+    {
+      "path": "src/stage_registry.cpp",
+      "kind": "source",
+      "purpose": "Defines the six stage kinds this runtime executes -- their manifest names, their execution strategies, and their allowed manifest option names -- and the non-throwing lookups every other file resolves a kind through.",
+      "publicSymbols": [
+        "detail::StageKindDefinitions",
+        "detail::FindStageKind",
+        "detail::StageKindIndex"
+      ]
+    },
+    {
+      "path": "src/stage_registry.hpp",
+      "kind": "source",
+      "purpose": "Declares the one internal registry of the stage kinds this runtime executes -- each kind's manifest name, the execution strategy the stage state machine drives it with, and the exact option names its manifest options object may carry -- so manifest validation, admission scheduling, telemetry, and execution all read the same list instead of repeating it.",
+      "publicSymbols": [
+        "onnx_world_model::detail::kStageKindCount",
+        "onnx_world_model::detail::StageExecutionStrategy",
+        "onnx_world_model::detail::StageKindDefinition",
+        "onnx_world_model::detail::StageKindDefinitions",
+        "onnx_world_model::detail::FindStageKind",
+        "onnx_world_model::detail::StageKindIndex"
       ]
     },
     {

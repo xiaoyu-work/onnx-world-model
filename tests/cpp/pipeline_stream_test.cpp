@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Standalone test executable for the incremental stage API: it holds PipelineSession::BeginStage, StageRun stepping, and StageEvent reporting to exact parity with RunStage across every stage kind, and covers the run slot's exclusion, cancellation, failure, and ownership rules.
  * @agent-public-api: main
- * @agent-invariants: Registered with CTest as pipeline_stream_test; it counts failures through local Check, CheckThrowsCode, and CheckThrowsState helpers and returns a non-zero exit code when any check fails. Every component is a stub ModelBackend and every PipelinePackage is built in memory from an embedded manifest string, so the run needs no ONNX Runtime library, no ONNX model, and no filesystem access. Parity assertions always compare a RunStage session against a BeginStage session created from the same Pipeline, because equality of the two paths is the contract this file exists to protect. CountingDeviceBuffer is a non-host-accessible TensorBuffer whose shared copy counter asserts that a StageEvent carries device outputs without materializing them.
+ * @agent-invariants: Registered with CTest as pipeline_stream_test; it counts failures through local Check, CheckThrowsCode, and CheckThrowsState helpers and returns a non-zero exit code when any check fails. Every component is a stub ModelBackend and every PipelinePackage is built in memory from an embedded manifest string -- one case from a copy of one that changes only the stage kind, so a kind sharing another kind's execution strategy is asserted without a second manifest -- so the run needs no ONNX Runtime library, no ONNX model, and no filesystem access. Parity assertions always compare a RunStage session against a BeginStage session created from the same Pipeline, because equality of the two paths is the contract this file exists to protect. CountingDeviceBuffer is a non-host-accessible TensorBuffer whose shared copy counter asserts that a StageEvent carries device outputs without materializing them.
  * @agent-side-effects: Writes failure descriptions to stderr.
  */
 
@@ -1038,6 +1038,40 @@ int main() {
         trace.outputs.at("produced").values<float>()[3] ==
             expected.at("produced").values<float>()[3],
         "streamed single pass matches RunStage");
+  }
+
+  // composite and on_demand are declared kinds of their own, but they share
+  // single_pass's execution strategy, so their streamed shape is the single
+  // pass's. One assertion covers that sharing; on_demand execution is
+  // exercised end to end by the Python image-to-video suite.
+  {
+    std::string document(kPassthroughManifest);
+    const std::string_view single_pass = R"("kind": "single_pass")";
+    const std::size_t at = document.find(single_pass);
+    Check(at != std::string::npos, "the passthrough manifest is as expected");
+    document.replace(at, single_pass.size(), R"("kind": "composite")");
+
+    std::unordered_map<std::string, Model> models;
+    models.emplace("producer", Model(std::make_shared<PassthroughBackend>()));
+    const Pipeline pipeline = Pipeline(PipelinePackage(
+        {}, PipelineManifest::Parse(document), std::move(models)));
+    const std::array<float, 4> values{1.0F, 2.0F, 3.0F, 4.0F};
+    const NamedTensors inputs{
+        {"x", Tensor::FromValues<float>({1, 4}, std::span(values))}};
+
+    PipelineSession streamed = pipeline.CreateSession();
+    StageRun run = streamed.BeginStage("run", inputs);
+    const RunTrace trace = Drain(run);
+    Check(
+        trace.kinds ==
+            std::vector<StageEventKind>{
+                StageEventKind::transition,
+                StageEventKind::completed,
+            },
+        "a composite stage shares the one-pass strategy");
+    Check(
+        trace.outputs.at("produced").values<float>()[3] == 4.0F,
+        "a composite stage returns the one pass it executed");
   }
 
   // The terminal event happens once. Stepping past it is a state error, and

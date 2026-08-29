@@ -1,8 +1,8 @@
 /**
  * @agent-file
  * @agent-purpose: Declares the internal admission controller a Pipeline shares with every session it creates -- the per-stage-kind permit buckets, the cancellation-aware FIFO waiting queue, the RAII PipelineLease that owns one admitted execution's permit, the read-only snapshot of that admission state a Pipeline reports as PipelineSchedulingStats, and the telemetry collector it records each acquisition's wait outcome into.
- * @agent-public-api: onnx_world_model::detail::SupportedStageKinds, onnx_world_model::detail::ValidatePipelineSchedulingOptions, onnx_world_model::detail::MakePipelineScheduler, onnx_world_model::detail::StageKindPermits, onnx_world_model::detail::PipelineScheduler, onnx_world_model::detail::PipelineLease, onnx_world_model::detail::AcquireExecutionLease, onnx_world_model::detail::SnapshotSchedulingStats
- * @agent-invariants: Internal header that is not installed, so only the opaque PipelineScheduler pointer appears in the public Pipeline. This is admission scheduling and nothing else: it decides how many executions are inside the runtime at once and in what order queued ones enter, and it never merges, splits, reorders, or preempts the work. The configured limits are fixed when the scheduler is created and never change, so a bucket's limit is read without the mutex while its active count is read and written only under it; the bucket array is sized once from SupportedStageKinds(), so a resolved bucket pointer stays valid for the scheduler's lifetime. A stage kind whose global and per-kind limits are both zero is unlimited and takes the fast path: no mutex, no allocation, an inert lease, and no telemetry at all, which is why an unlimited Pipeline reports no admission counts while its executions are still measured. Every other acquire enqueues a shared waiter and then pumps, so a caller that is immediately eligible never blocks and a caller that is not cannot be overtaken by a later waiter of its own kind; the pump scans in ticket order, skips a waiter whose kind bucket is full so a different eligible kind still enters, and stops at the first point where the global limit is reached. A lease decrements the global and per-kind counts exactly once, pumps, and notifies only the waiters it granted, so no exception, cancellation, or backend failure can leak a permit. Stats() is the only const reader, which is why the mutex is mutable: it takes that mutex, copies the global count, the queue depth, and every bucket's count, and tallies the queue by bucket, so one reading is internally consistent and observing admission cannot change it. Telemetry is recorded rather than read: an acquisition granted without waiting counts as admitted with no wait and is never counted as queued, only the path that actually waits starts a wait timer and counts as queued, and a grant that races a cancellation is recorded once, as admitted, because the permit really was granted. Lock order is CancellationState's callback mutex, then the scheduler mutex, then the session mutex, then ONNX Runtime; a registration is therefore never created or destroyed while the scheduler mutex is held, no callback ever runs model or user code, and telemetry recording -- atomic counter updates only -- takes none of those locks and is therefore ordered against nothing.
+ * @agent-public-api: onnx_world_model::detail::ValidatePipelineSchedulingOptions, onnx_world_model::detail::MakePipelineScheduler, onnx_world_model::detail::StageKindPermits, onnx_world_model::detail::PipelineScheduler, onnx_world_model::detail::PipelineLease, onnx_world_model::detail::AcquireExecutionLease, onnx_world_model::detail::SnapshotSchedulingStats
+ * @agent-invariants: Internal header that is not installed, so only the opaque PipelineScheduler pointer appears in the public Pipeline. This is admission scheduling and nothing else: it decides how many executions are inside the runtime at once and in what order queued ones enter, and it never merges, splits, reorders, or preempts the work. The stage kinds it accepts are not declared here: they are exactly detail::StageKindDefinitions() from stage_registry, which is also what manifest validation accepts, because a limit for a kind no manifest can declare would silently never apply. The configured limits are fixed when the scheduler is created and never change, so a bucket's limit is read without the mutex while its active count is read and written only under it; the bucket array is sized once by detail::kStageKindCount and ordered by the registry, so a resolved bucket pointer stays valid for the scheduler's lifetime and its index is the same key telemetry records under. A stage kind whose global and per-kind limits are both zero is unlimited and takes the fast path: no mutex, no allocation, an inert lease, and no telemetry at all, which is why an unlimited Pipeline reports no admission counts while its executions are still measured. Every other acquire enqueues a shared waiter and then pumps, so a caller that is immediately eligible never blocks and a caller that is not cannot be overtaken by a later waiter of its own kind; the pump scans in ticket order, skips a waiter whose kind bucket is full so a different eligible kind still enters, and stops at the first point where the global limit is reached. A lease decrements the global and per-kind counts exactly once, pumps, and notifies only the waiters it granted, so no exception, cancellation, or backend failure can leak a permit. Stats() is the only const reader, which is why the mutex is mutable: it takes that mutex, copies the global count, the queue depth, and every bucket's count, and tallies the queue by bucket, so one reading is internally consistent and observing admission cannot change it. Telemetry is recorded rather than read: an acquisition granted without waiting counts as admitted with no wait and is never counted as queued, only the path that actually waits starts a wait timer and counts as queued, and a grant that races a cancellation is recorded once, as admitted, because the permit really was granted. Lock order is CancellationState's callback mutex, then the scheduler mutex, then the session mutex, then ONNX Runtime; a registration is therefore never created or destroyed while the scheduler mutex is held, no callback ever runs model or user code, and telemetry recording -- atomic counter updates only -- takes none of those locks and is therefore ordered against nothing.
  * @agent-side-effects: Acquire blocks the calling thread while it waits for a permit, and it registers a cancellation callback that another thread -- including the shared deadline watchdog -- runs to remove that waiter.
  */
 
@@ -19,17 +19,12 @@
 #include "onnx_world_model/cancellation.hpp"
 #include "onnx_world_model/pipeline.hpp"
 #include "pipeline_telemetry.hpp"
+#include "stage_registry.hpp"
 
 namespace onnx_world_model::detail {
 
-//: The exact stage kinds this runtime executes, and therefore the only legal
-//: keys of PipelineSchedulingOptions::max_concurrent_by_stage_kind. It
-//: mirrors the set pipeline_manifest_validation.cpp accepts, because a limit
-//: for a kind no manifest can declare would silently never apply.
-[[nodiscard]] const std::array<std::string_view, 6>&
-SupportedStageKinds() noexcept;
-
 //: Rejects an empty or unknown per-kind key with ErrorCode::invalid_argument.
+//: The keys it accepts are exactly the StageKindDefinitions() names.
 //: Pipeline::Load calls this before it opens a single component file, so a
 //: misspelled stage kind fails fast rather than after a package load.
 void ValidatePipelineSchedulingOptions(
@@ -132,7 +127,7 @@ class PipelineScheduler
   //: The bucket for `kind`, or null for a kind this runtime does not execute.
   //: The array is fixed at construction, so the returned pointer is stable.
   [[nodiscard]] StageKindPermits* BucketFor(std::string_view kind) noexcept;
-  //: `bucket`'s index into SupportedStageKinds(), which is the key telemetry
+  //: `bucket`'s index into StageKindDefinitions(), which is the key telemetry
   //: records admission under. A waiter with no bucket -- a stage kind this
   //: runtime does not execute -- has no key, so it returns the array size and
   //: every recording site treats that as "nothing to record".
@@ -162,9 +157,9 @@ class PipelineScheduler
   //: Ordered by arrival, oldest at the front: the pump's scan order is this
   //: order, which is what makes admission FIFO within one stage kind.
   std::deque<std::shared_ptr<Waiter>> queue_;
-  //: One entry per SupportedStageKinds() name, in that order. Never resized,
-  //: so element addresses are stable for the scheduler's lifetime.
-  std::array<StageKindPermits, 6> kinds_;
+  //: One entry per StageKindDefinitions() entry, in that order. Never
+  //: resized, so element addresses are stable for the scheduler's lifetime.
+  std::array<StageKindPermits, kStageKindCount> kinds_;
 };
 
 //: Validates `options` and returns the scheduler that enforces them, wired to
@@ -195,7 +190,7 @@ class PipelineScheduler
 
 //: One reading of `scheduler`'s admission state, or the all-zero reading a
 //: moved-from Pipeline reports. Both per-kind maps always carry every name in
-//: SupportedStageKinds(), so a caller never has to test for a key.
+//: StageKindDefinitions(), so a caller never has to test for a key.
 [[nodiscard]] PipelineSchedulingStats SnapshotSchedulingStats(
     const std::shared_ptr<PipelineScheduler>& scheduler);
 

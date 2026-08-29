@@ -83,8 +83,14 @@ Within `src/` the runtime is layered:
   `pipeline_manifest_validation` checks the
   parsed manifest's semantics; `pipeline_manifest_common` holds the checks both
   share.
-- `pipeline_scheduler` is the shared admission controller: the supported
-  stage-kind list and its validation, the per-kind permit buckets, the
+- `stage_registry` is the one source of truth for stage kinds: each kind's
+  manifest name, the execution strategy the stage state machine drives it
+  with, and the exact option names its manifest options object may carry.
+  Manifest validation, admission scheduling, telemetry, and execution all read
+  that one list, so they cannot disagree about which kinds exist.
+- `pipeline_scheduler` is the shared admission controller: the validation of
+  its per-kind keys against `stage_registry`, the per-kind permit buckets that
+  registry sizes and orders, the
   cancellation- and deadline-aware FIFO queue with its oldest-eligible pump,
   the RAII lease that returns a permit exactly once, and the consistent
   snapshot of that state a `Pipeline` reports. It decides only when an
@@ -118,6 +124,12 @@ Within `src/` the runtime is layered:
   `detail::CreateOrtBackend`.
 - `src/` internal headers live in `onnx_world_model::detail` and are not
   installed.
+- `stage_registry` is the bottom of the internal graph: it depends on nothing
+  but the standard library, and `pipeline_manifest_validation`,
+  `pipeline_scheduler`, `pipeline_telemetry`, and `pipeline_session` depend on
+  it rather than on each other for the stage-kind list. No file outside it may
+  restate the set of stage kinds, a kind's allowed option names, or a kind's
+  execution strategy.
 - `pipeline_manifest_validation` receives an already-parsed `PipelineManifest`
   and never parses a raw document; `pipeline.cpp` never re-implements semantic
   checks.
@@ -159,15 +171,18 @@ Generation, using video as the example:
    each component's inputs from external values, generated-input programs,
    transforms, defaults, and recurrent state, then runs the component through
    ONNX Runtime.
-5. Stage kinds drive control flow: `single_pass`, `autoregressive`, `iterative`
-   with a diffusion scheduler, and `state_transition`.
+5. Stage kinds drive control flow, but only through their registered execution
+   strategy: `autoregressive` decodes one token per step, `iterative` runs one
+   diffusion-scheduler step per step, and `single_pass`, `state_transition`,
+   `composite`, and `on_demand` all execute as exactly one pass.
 6. `ReleaseStage` frees state whose declared `release_after` names that stage;
    `outputs()` collects the manifest's public outputs.
 7. The generator unpacks latent tokens and returns a modality-specific output
    dataclass.
 
 Every stage runs through one state machine. `BeginStage` resolves the stage
-kind, inputs, overrides, options, and all autoregressive configuration once and
+kind, its `stage_registry` execution strategy, inputs, overrides, options, and
+all autoregressive configuration once and
 returns a `StageRun`; each `Step()` takes the session lock, performs exactly
 one component pass or scheduler step, and returns a `StageEvent` describing it;
 the run ends with exactly one terminal `completed` event whose outputs are the

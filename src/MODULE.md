@@ -86,15 +86,16 @@ latent-dynamics compatibility layer.
 | `world_model.cpp` | `WorldModel` contract enforcement and `Rollout` recurrent state. |
 | `pipeline.cpp` | `pipeline.json` parsing, per-component placement resolution and validation, `PipelinePackage` loading, the connection transfer plan, and the on-demand per-component precision report. |
 | `pipeline_manifest_common.hpp/.cpp` | JSON field, token, and portable-name checks shared by parsing and validation. |
+| `stage_registry.hpp/.cpp` | The one source of truth for stage kinds: each kind's manifest name, the `StageExecutionStrategy` the stage state machine drives it with, and the exact option names its manifest options object may carry, plus `kStageKindCount` and the non-throwing `FindStageKind`/`StageKindIndex` lookups every other file resolves a kind through. |
 | `pipeline_manifest_validation.hpp/.cpp` | Semantic validation of a parsed manifest: dataflow, programs, stage options, capabilities, state lifecycles. |
-| `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the supported stage-kind list and its validation, the per-kind permit buckets, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, the per-stage-kind admission outcome each acquisition records into the telemetry collector, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
+| `pipeline_scheduler.hpp/.cpp` | The shared admission controller behind `PipelineSchedulingOptions`: the validation of its per-kind keys against `stage_registry`, the per-kind permit buckets that registry sizes and orders, the cancellation- and deadline-aware FIFO queue with its oldest-eligible pump, the RAII `detail::PipelineLease`, the per-stage-kind admission outcome each acquisition records into the telemetry collector, and `detail::SnapshotSchedulingStats`, the consistent reading of that state `Pipeline::scheduling_stats` returns. |
 | `pipeline_telemetry.hpp/.cpp` | The opt-in telemetry collector behind `PipelineTelemetryOptions`: the immutable per-epoch counter slab pre-populated from the manifest, the relaxed-atomic counters and their compare-exchange maxima, the RAII component and stage recorders that classify an outcome by `ErrorCode`, the admission and device-transfer hooks, `detail::ValidatePipelineTelemetryOptions` and the trace directory it creates on the cold path, the sanitized unique per-call trace prefix and the `noexcept` discovery that turns the file ONNX Runtime wrote into one capped `PipelineTraceRecord`, the atomic slab publication that makes `Pipeline::ResetTelemetry` a new epoch rather than a barrier, and `detail::SnapshotPipelineTelemetry`, the reading `Pipeline::telemetry_snapshot` returns. |
 | `pipeline_session.cpp` | `PipelineSession::Impl`, the staged execution engine, all per-trajectory state in one `SessionState` bundle, the `StageRun::Impl` state machine that both `RunStage` and `BeginStage` execute through, its cancellation source and the link into a caller's token, the admission leases every execution takes before the session lock, the telemetry recorders those executions and their component calls are measured by, the snapshot, restore, fork, and named-checkpoint operations over that bundle, the single `MaterializeHost` device-versus-host materialization boundary, and `Pipeline` itself. |
 
 `cancellation.hpp`, `dynamic_library.hpp`, `ort_backend.hpp`,
 `pipeline_manifest_common.hpp`, `pipeline_manifest_validation.hpp`,
-`pipeline_scheduler.hpp`, and `pipeline_telemetry.hpp` are internal: they live
-in `onnx_world_model::detail` and are not installed.
+`pipeline_scheduler.hpp`, `pipeline_telemetry.hpp`, and `stage_registry.hpp`
+are internal: they live in `onnx_world_model::detail` and are not installed.
 
 ## Dependencies
 
@@ -112,8 +113,21 @@ cancellation -> pipeline_session
 cancellation -> pipeline_scheduler -> pipeline_session
 pipeline_telemetry -> pipeline_scheduler -> pipeline_session
 pipeline_telemetry -> pipeline_session
+stage_registry -> pipeline_manifest_validation
+stage_registry -> pipeline_telemetry
+stage_registry -> pipeline_scheduler
+stage_registry -> pipeline_session
 pipeline_manifest_common -> pipeline_manifest_validation -> pipeline
 ```
+
+`stage_registry` is the bottom of that graph: it depends on nothing but the
+standard library, which is what lets manifest validation, the scheduler,
+telemetry, and the session all read one stage-kind list without a cycle. A
+stage kind exists there or it does not exist at all — its `kStageKindCount`
+sizes every per-kind array in this directory, its order is the order of the
+scheduler's buckets, telemetry's admission entries, and both public per-stage-
+kind maps, and its `StageExecutionStrategy` is what `StageRun::Impl` switches
+on instead of comparing the kind string.
 
 `pipeline_manifest_validation.cpp` never parses raw JSON documents itself; it
 receives an already-populated `PipelineManifest` from `pipeline.cpp`.
@@ -124,9 +138,9 @@ for exactly that reason — copies counters into stack arrays, tallies the queue
 and builds its maps only after releasing the lock, so observing admission
 allocates nothing under the lock and cannot block it.
 `pipeline_telemetry.cpp` sits below both: it records and never reads back, it
-uses `SupportedStageKinds()` from `pipeline_scheduler.hpp` for its admission
-keys while `pipeline_scheduler.hpp` includes only `pipeline_telemetry.hpp`, so
-the dependency stays one-way, and its counter paths touch nothing but their own
+takes its admission keys from `StageKindDefinitions()` in `stage_registry.hpp`
+rather than from the scheduler, so the two agree without depending on each
+other, and its counter paths touch nothing but their own
 atomics. Its one exception is tracing, which is explicit about being different:
 it takes a trace mutex that guards only its record vector, allocates one record
 per traced call, and reads the configured trace directory to find the file ONNX

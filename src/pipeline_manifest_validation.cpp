@@ -2,7 +2,7 @@
  * @agent-file
  * @agent-purpose: Validates the semantics of a parsed Mobius PipelineManifest: dataflow acyclicity, endpoint and dtype agreement, transform and generator programs, stage options, capabilities, and recurrent state lifecycles.
  * @agent-public-api: FindComponent, RequireEndpoint, SupportedCapabilityNames, ValidateManifest
- * @agent-invariants: This pass runs on an already-parsed manifest and never mutates it; every violation throws ErrorCode::pipeline_manifest. Transform and generator kinds, stage option keys, and capability names are closed sets, so an unknown or unsupported value is rejected here instead of silently selecting a fallback. Non-recurrent connections must form an acyclic graph, and every declared capability must appear in SupportedCapabilityNames.
+ * @agent-invariants: This pass runs on an already-parsed manifest and never mutates it; every violation throws ErrorCode::pipeline_manifest. Transform and generator kinds, stage option keys, and capability names are closed sets, so an unknown or unsupported value is rejected here instead of silently selecting a fallback. The stage kinds and their allowed option names are not one of this file's sets: both are read from detail::StageKindDefinitions in stage_registry, so validation, admission scheduling, telemetry, and execution cannot disagree about which kinds exist. Non-recurrent connections must form an acyclic graph, and every declared capability must appear in SupportedCapabilityNames.
  * @agent-side-effects: none
  */
 
@@ -25,6 +25,7 @@
 
 #include "onnx_world_model/error.hpp"
 #include "pipeline_manifest_common.hpp"
+#include "stage_registry.hpp"
 
 namespace onnx_world_model::detail {
 namespace {
@@ -392,53 +393,18 @@ void ValidateProgramParameters(
   }
 }
 
-const std::set<std::string>& AllowedStageOptions(std::string_view kind) {
-  static const std::unordered_map<std::string, std::set<std::string>> options{
-      {"single_pass", {}},
-      {
-          "autoregressive",
-          {
-              "tokenizer_asset",
-              "sampling",
-              "stop",
-              "max_tokens",
-              "state_names",
-          },
-      },
-      {
-          "iterative",
-          {
-              "scheduler",
-              "guidance",
-              "conditioning",
-              "default_steps",
-              "timestep",
-              "state_inputs",
-              "initial_state_inputs",
-              "prediction_type",
-              "packed_modalities",
-          },
-      },
-      {
-          "state_transition",
-          {"state_names", "max_steps", "stop"},
-      },
-      {"composite", {"stages"}},
-      {"on_demand", {"presence"}},
-  };
-  const auto found = options.find(std::string(kind));
-  if (found == options.end()) {
-    Fail("Unknown stage kind '" + std::string(kind) + "'");
-  }
-  return found->second;
-}
-
 void ValidateStageOptions(const PipelineStage& stage) {
   const Json options = Json::parse(stage.options_json);
-  const auto& allowed = AllowedStageOptions(stage.kind);
+  // The stage-kind registry owns both the set of kinds and each kind's option
+  // names, so this file states neither.
+  const StageKindDefinition* definition = FindStageKind(stage.kind);
+  if (definition == nullptr) {
+    Fail("Unknown stage kind '" + stage.kind + "'");
+  }
   for (const auto& [name, value] : options.items()) {
     (void)value;
-    if (!allowed.contains(name)) {
+    if (std::ranges::find(definition->allowed_options, name) ==
+        definition->allowed_options.end()) {
       Fail(
           "Stage '" + stage.name + "' has unknown option '" + name + "'");
     }
@@ -835,19 +801,13 @@ void ValidateManifest(const PipelineManifest& manifest) {
   }
   CheckUnique(component_names, "Component name", true);
 
-  static const std::unordered_set<std::string> stage_kinds{
-      "single_pass",
-      "autoregressive",
-      "iterative",
-      "state_transition",
-      "composite",
-      "on_demand",
-  };
   std::vector<std::string> stage_names;
   std::unordered_set<std::string> staged_components;
   for (const auto& stage : manifest.stages()) {
     ValidateToken(stage.name, "Stage name");
-    if (!stage_kinds.contains(stage.kind)) {
+    // The registry is the only list of executable stage kinds; a kind absent
+    // from it is rejected here rather than discovered at execution time.
+    if (FindStageKind(stage.kind) == nullptr) {
       Fail("Unknown stage kind '" + stage.kind + "'");
     }
     static const std::unordered_set<std::string> phases{
